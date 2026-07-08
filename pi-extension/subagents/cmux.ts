@@ -804,7 +804,7 @@ export function createSurface(name: string): string {
     if (!parentPaneId) throw new Error("HERDR_PANE_ID not set");
     const splitOut = execFileSync(
       "herdr",
-      ["pane", "split", parentPaneId, "--direction", "down", "--no-focus", "--cwd", process.cwd()],
+      ["pane", "split", parentPaneId, "--direction", "right", "--no-focus", "--cwd", process.cwd()],
       { encoding: "utf8" },
     );
     const newPaneId = parseHerdrPaneId(splitOut);
