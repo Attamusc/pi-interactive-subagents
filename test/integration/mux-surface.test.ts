@@ -58,8 +58,8 @@ for (const backend of backends) {
       env = createTestEnv(backend);
     });
 
-    after(() => {
-      cleanupTestEnv(env);
+    after(async () => {
+      await cleanupTestEnv(env);
       restoreBackend(prevMux);
     });
 
@@ -70,11 +70,11 @@ for (const backend of backends) {
       focusSurface(backend, anchor);
       await waitForFocusedSurface(backend, anchor, 10_000);
 
-      const childA = createTrackedSurface(env, "focus-child-a");
+      const childA = await createTrackedSurface(env, "focus-child-a");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
-      const childB = createTrackedSurface(env, "focus-child-b");
+      const childB = await createTrackedSurface(env, "focus-child-b");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
@@ -88,8 +88,8 @@ for (const backend of backends) {
 
       const markerA = uniqueId();
       const markerB = uniqueId();
-      sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
-      sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
+      await sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
+      await sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
 
       await Promise.all([
         waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
@@ -99,11 +99,11 @@ for (const backend of backends) {
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {
-      const surface = createTrackedSurface(env, "echo-test");
+      const surface = await createTrackedSurface(env, "echo-test");
       await sleep(1000);
 
       const marker = uniqueId();
-      sendCommand(surface, `echo "MARKER_${marker}"`);
+      await sendCommand(surface, `echo "MARKER_${marker}"`);
       await sleep(1500);
 
       const screen = readScreen(surface, 50);
@@ -112,17 +112,17 @@ for (const backend of backends) {
         `Expected screen to contain MARKER_${marker}. Got:\n${screen}`,
       );
 
-      closeSurface(surface);
+      await closeSurface(surface);
       untrackSurface(env, surface);
     });
 
     it("preserves shell special characters in echo output", async () => {
-      const surface = createTrackedSurface(env, "escape-test");
+      const surface = await createTrackedSurface(env, "escape-test");
       await sleep(1000);
 
       const marker = uniqueId();
       // Single-quoted string — $ and " are literal inside single quotes
-      sendCommand(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
+      await sendCommand(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
       await sleep(1500);
 
       const screen = readScreen(surface, 50);
@@ -138,14 +138,14 @@ for (const backend of backends) {
     });
 
     it("sends a long command via script file without truncation", async () => {
-      const surface = createTrackedSurface(env, "long-cmd-test");
+      const surface = await createTrackedSurface(env, "long-cmd-test");
       await sleep(1000);
 
       const marker = uniqueId();
       const longValue = "X".repeat(500);
       const command = `echo "LONG_${marker}_${longValue}_END"`;
 
-      sendLongCommand(surface, command);
+      await sendLongCommand(surface, command);
       await sleep(2000);
 
       const screen = readScreen(surface, 50);
@@ -160,11 +160,11 @@ for (const backend of backends) {
     });
 
     it("reads screen asynchronously", async () => {
-      const surface = createTrackedSurface(env, "async-read-test");
+      const surface = await createTrackedSurface(env, "async-read-test");
       await sleep(1000);
 
       const marker = uniqueId();
-      sendCommand(surface, `echo "ASYNC_${marker}"`);
+      await sendCommand(surface, `echo "ASYNC_${marker}"`);
       await sleep(1500);
 
       const screen = await readScreenAsync(surface, 50);
@@ -175,14 +175,14 @@ for (const backend of backends) {
     });
 
     it("manages multiple surfaces concurrently", async () => {
-      const s1 = createTrackedSurface(env, "multi-1");
-      const s2 = createTrackedSurface(env, "multi-2");
+      const s1 = await createTrackedSurface(env, "multi-1");
+      const s2 = await createTrackedSurface(env, "multi-2");
       await sleep(1500);
 
       const m1 = uniqueId();
       const m2 = uniqueId();
-      sendCommand(s1, `echo "S1_${m1}"`);
-      sendCommand(s2, `echo "S2_${m2}"`);
+      await sendCommand(s1, `echo "S1_${m1}"`);
+      await sendCommand(s2, `echo "S2_${m2}"`);
       await sleep(1500);
 
       const screen1 = readScreen(s1, 50);
@@ -193,13 +193,13 @@ for (const backend of backends) {
     });
 
     it("writes output to a file and verifies via surface", async () => {
-      const surface = createTrackedSurface(env, "file-test");
+      const surface = await createTrackedSurface(env, "file-test");
       await sleep(1000);
 
       const marker = uniqueId();
       const filePath = `/tmp/pi-mux-test-${marker}.txt`;
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      await sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
 
       await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
       const content = await waitForFile(filePath, 10_000, new RegExp(`FILE_${marker}`));
@@ -212,7 +212,7 @@ for (const backend of backends) {
     });
 
     it("delivers Escape as byte 27 to the target surface", async () => {
-      const surface = createTrackedSurface(env, "escape-byte-test");
+      const surface = await createTrackedSurface(env, "escape-byte-test");
       await sleep(1000);
 
       const marker = uniqueId();
@@ -231,7 +231,7 @@ for (const backend of backends) {
         "});";
       const command = `node -e ${JSON.stringify(nodeProgram)}`;
 
-      sendLongCommand(surface, command);
+      await sendLongCommand(surface, command);
       await waitForScreen(surface, /ESC_READY/, 15_000, 50);
 
       sendEscape(surface);

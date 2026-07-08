@@ -27,6 +27,8 @@ import {
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
   parseHerdrPaneId,
+  parseHerdrSocketResponse,
+  extractHerdrReadText,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -1367,6 +1369,55 @@ describe("parseHerdrPaneId", () => {
   });
   it("returns null when the envelope lacks result.pane.pane_id", () => {
     assert.equal(parseHerdrPaneId('{"id":"x","result":{"type":"pane_info"}}'), null);
+  });
+});
+
+describe("parseHerdrSocketResponse", () => {
+  it("returns the result payload from a JSON-RPC success envelope", () => {
+    const raw = '{"id":"p1","result":{"type":"ok"}}\n';
+    assert.deepEqual(parseHerdrSocketResponse("pane.close", raw), { type: "ok" });
+  });
+  it("extracts pane_info result for split/rename", () => {
+    const raw =
+      '{"id":"p1","result":{"type":"pane_info","pane":{"pane_id":"w2:p5"}}}';
+    assert.deepEqual(parseHerdrSocketResponse("pane.split", raw), {
+      type: "pane_info",
+      pane: { pane_id: "w2:p5" },
+    });
+  });
+  it("picks the response line when stray lines precede it", () => {
+    const raw = 'not json\n{"event":"noise"}\n{"id":"p1","result":{"type":"ok"}}\n';
+    assert.deepEqual(parseHerdrSocketResponse("pane.send_text", raw), { type: "ok" });
+  });
+  it("throws on a JSON-RPC error envelope with the herdr message", () => {
+    const raw =
+      '{"id":"","error":{"code":"invalid_request","message":"missing field `source`"}}';
+    assert.throws(
+      () => parseHerdrSocketResponse("pane.read", raw),
+      /herdr pane\.read failed: missing field `source`/,
+    );
+  });
+  it("throws when no JSON-RPC response line is present", () => {
+    assert.throws(
+      () => parseHerdrSocketResponse("pane.list", "garbage output\n"),
+      /herdr pane\.list returned no JSON-RPC response/,
+    );
+  });
+});
+
+describe("extractHerdrReadText", () => {
+  it("extracts terminal text from a pane_read result", () => {
+    const result = {
+      type: "pane_read",
+      read: { pane_id: "w2:p5", source: "visible", format: "text", text: "line1\nline2\n" },
+    };
+    assert.equal(extractHerdrReadText(result), "line1\nline2\n");
+  });
+  it("throws when the result lacks read.text", () => {
+    assert.throws(
+      () => extractHerdrReadText({ type: "pane_read", read: {} }),
+      /herdr pane\.read returned unexpected shape/,
+    );
   });
 });
 describe("commands", () => {

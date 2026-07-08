@@ -1,7 +1,8 @@
 import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
+import { connect } from "node:net";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
@@ -788,33 +789,156 @@ export function parseHerdrPaneId(stdout: string): string | null {
     // Not JSON — accept only if it already looks like a bare pane id (forward-compat).
     return /^w\d+:p\d+$/.test(trimmed) ? trimmed : null;
   }
-  const obj = parsed as { error?: { message?: string }; result?: { pane?: { pane_id?: unknown } } };
+  const obj = parsed as { error?: { message?: string }; result?: unknown };
   if (obj?.error) {
     throw new Error(`herdr pane split failed: ${obj.error.message ?? JSON.stringify(obj.error)}`);
   }
-  const paneId = obj?.result?.pane?.pane_id;
+  return paneIdFromResult(obj?.result);
+}
+
+/** Extract `.pane.pane_id` from a herdr structural result payload (split/get/rename). */
+function paneIdFromResult(result: unknown): string | null {
+  const paneId = (result as { pane?: { pane_id?: unknown } })?.pane?.pane_id;
   return typeof paneId === "string" && paneId.length > 0 ? paneId : null;
 }
 
-export function createSurface(name: string): string {
+// ---------------------------------------------------------------------------
+// herdr control socket (JSON-RPC over Unix socket)
+//
+// herdr operations previously shelled out via `execFileSync("herdr", ...)`,
+// costing ~123ms per call (process + Mach-O load + herdr's own socket round
+// trip). Talking to the socket directly is ~1ms. The CLI subcommands map to
+// JSON-RPC methods (e.g. `herdr pane send-text` -> `pane.send_text`). Method
+// and param names below are verified empirically against herdr 0.7.1.
+// ---------------------------------------------------------------------------
+
+const HERDR_SOCKET_TIMEOUT_MS = 5000;
+
+function herdrSocketPath(): string {
+  return process.env.HERDR_SOCKET_PATH || join(homedir(), ".config", "herdr", "herdr.sock");
+}
+
+/**
+ * Send a single JSON-RPC request to the herdr control socket and return the
+ * `result` payload. Opens one connection per call (connect-per-call). Throws on
+ * socket errors, timeouts, or JSON-RPC error envelopes.
+ */
+async function herdrSocketCall(
+  method: string,
+  params: Record<string, unknown>,
+): Promise<unknown> {
+  const socketPath = herdrSocketPath();
+  const id = `pi-sub-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const payload = JSON.stringify({ id, method, params }) + "\n";
+
+  const raw = await new Promise<string>((resolve, reject) => {
+    let data = "";
+    let settled = false;
+    const socket = connect({ path: socketPath });
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    socket.setTimeout(HERDR_SOCKET_TIMEOUT_MS);
+    socket.on("connect", () => {
+      socket.write(payload);
+    });
+    socket.on("data", (chunk) => {
+      data += chunk.toString();
+      // herdr replies with a single newline-terminated JSON-RPC line. Resolve as
+      // soon as we have it — waiting for the socket to close adds ~100ms because
+      // herdr delays connection teardown.
+      if (data.includes("\n")) {
+        socket.destroy();
+        finish(() => resolve(data));
+      }
+    });
+    socket.on("end", () => finish(() => resolve(data)));
+    socket.on("close", () => finish(() => resolve(data)));
+    socket.on("timeout", () => {
+      socket.destroy();
+      finish(() =>
+        reject(new Error(`herdr ${method} timed out after ${HERDR_SOCKET_TIMEOUT_MS}ms`)),
+      );
+    });
+    socket.on("error", (err) => {
+      socket.destroy();
+      finish(() => reject(new Error(`herdr ${method} socket error: ${err.message}`)));
+    });
+  });
+
+  return parseHerdrSocketResponse(method, raw);
+}
+
+/**
+ * Parse a herdr JSON-RPC response and return its `result`. herdr replies with a
+ * single newline-terminated envelope; this picks the line carrying result/error
+ * and ignores any stray lines. Throws on error envelopes. Exported for testing.
+ */
+export function parseHerdrSocketResponse(method: string, raw: string): unknown {
+  const lines = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  let envelope: { result?: unknown; error?: { code?: string; message?: string } } | undefined;
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj && (obj.result !== undefined || obj.error !== undefined)) {
+        envelope = obj;
+        break;
+      }
+    } catch {
+      // Skip non-JSON lines.
+    }
+  }
+  if (!envelope) {
+    throw new Error(`herdr ${method} returned no JSON-RPC response: ${raw.trim().slice(0, 200)}`);
+  }
+  if (envelope.error) {
+    throw new Error(
+      `herdr ${method} failed: ${envelope.error.message ?? JSON.stringify(envelope.error)}`,
+    );
+  }
+  return envelope.result;
+}
+
+/**
+ * Extract terminal text from a herdr `pane.read` result:
+ *   { type: "pane_read", read: { ..., text: "..." } }
+ * Exported for testing.
+ */
+export function extractHerdrReadText(result: unknown): string {
+  const text = (result as { read?: { text?: unknown } })?.read?.text;
+  if (typeof text !== "string") {
+    throw new Error(
+      `herdr pane.read returned unexpected shape: ${JSON.stringify(result)?.slice(0, 200)}`,
+    );
+  }
+  return text;
+}
+
+export async function createSurface(name: string): Promise<string> {
   const backend = getMuxBackend();
 
   if (backend === "herdr") {
     const parentPaneId = process.env.HERDR_PANE_ID;
     if (!parentPaneId) throw new Error("HERDR_PANE_ID not set");
-    const splitOut = execFileSync(
-      "herdr",
-      ["pane", "split", parentPaneId, "--direction", "right", "--no-focus", "--cwd", process.cwd()],
-      { encoding: "utf8" },
-    );
-    const newPaneId = parseHerdrPaneId(splitOut);
+    const splitResult = await herdrSocketCall("pane.split", {
+      target_pane_id: parentPaneId,
+      direction: "right",
+      focus: false,
+      cwd: process.cwd(),
+    });
+    const newPaneId = paneIdFromResult(splitResult);
     if (!newPaneId) {
       throw new Error(
-        `Unexpected herdr pane split output (could not extract pane_id): ${splitOut.trim().slice(0, 200)}`,
+        `Unexpected herdr pane.split response (could not extract pane_id): ${JSON.stringify(splitResult)?.slice(0, 200)}`,
       );
     }
     try {
-      execFileSync("herdr", ["pane", "rename", newPaneId, name], { encoding: "utf8" });
+      await herdrSocketCall("pane.rename", { pane_id: newPaneId, label: name });
     } catch {
       // Optional — pane label is cosmetic.
     }
@@ -974,13 +1098,13 @@ export function createSurfaceSplit(
 /**
  * Rename the current tab/window.
  */
-export function renameCurrentTab(title: string): void {
+export async function renameCurrentTab(title: string): Promise<void> {
   const backend = requireMuxBackend();
 
   if (backend === "herdr") {
     const paneId = process.env.HERDR_PANE_ID;
     if (!paneId) throw new Error("HERDR_PANE_ID not set");
-    execFileSync("herdr", ["pane", "rename", paneId, title], { encoding: "utf8" });
+    await herdrSocketCall("pane.rename", { pane_id: paneId, label: title });
     return;
   }
 
@@ -1089,11 +1213,11 @@ export function renameWorkspace(title: string): void {
 /**
  * Send a command string to a pane and execute it.
  */
-export function sendCommand(surface: string, command: string): void {
+export async function sendCommand(surface: string, command: string): Promise<void> {
   const backend = requireMuxBackend();
 
   if (backend === "herdr") {
-    execFileSync("herdr", ["pane", "send-text", surface, command + "\n"], { encoding: "utf8" });
+    await herdrSocketCall("pane.send_text", { pane_id: surface, text: command + "\n" });
     return;
   }
 
@@ -1165,11 +1289,11 @@ export function sendEscape(surface: string): void {
  *
  * Returns the script path.
  */
-export function sendLongCommand(
+export async function sendLongCommand(
   surface: string,
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
-): string {
+): Promise<string> {
   const scriptPath =
     options?.scriptPath ??
     join(
@@ -1188,7 +1312,7 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  await sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
@@ -1250,12 +1374,13 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   const backend = requireMuxBackend();
 
   if (backend === "herdr") {
-    const { stdout } = await execFileAsync(
-      "herdr",
-      ["pane", "read", surface, "--lines", String(lines), "--format", "text"],
-      { encoding: "utf8" },
-    );
-    return stdout;
+    const result = await herdrSocketCall("pane.read", {
+      pane_id: surface,
+      source: "visible",
+      lines,
+      format: "text",
+    });
+    return extractHerdrReadText(result);
   }
 
   if (backend === "cmux") {
@@ -1298,11 +1423,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 /**
  * Close a pane.
  */
-export function closeSurface(surface: string): void {
+export async function closeSurface(surface: string): Promise<void> {
   const backend = requireMuxBackend();
 
   if (backend === "herdr") {
-    execFileSync("herdr", ["pane", "close", surface], { encoding: "utf8" });
+    await herdrSocketCall("pane.close", { pane_id: surface });
     return;
   }
 
