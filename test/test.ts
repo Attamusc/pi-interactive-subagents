@@ -26,6 +26,7 @@ import {
   parseCmuxJson,
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
+  parseHerdrPaneId,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -1343,6 +1344,29 @@ describe("cmux.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  });
+});
+describe("parseHerdrPaneId", () => {
+  it("extracts pane_id from a herdr pane split success envelope", () => {
+    const out =
+      '{"id":"cli:pane:split","result":{"pane":{"agent_status":"unknown","cwd":"/x","focused":false,"pane_id":"w1:p2","revision":0,"tab_id":"w1:t1","terminal_id":"term_x","workspace_id":"w1"},"type":"pane_info"}}';
+    assert.equal(parseHerdrPaneId(out), "w1:p2");
+  });
+  it("tolerates trailing whitespace/newlines", () => {
+    const out = '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w2:p5"},"type":"pane_info"}}\n';
+    assert.equal(parseHerdrPaneId(out), "w2:p5");
+  });
+  it("throws on an error envelope with the herdr message", () => {
+    const out = '{"error":{"code":"pane_not_found","message":"pane w9:p9 not found"},"id":"cli:request"}';
+    assert.throws(() => parseHerdrPaneId(out), /herdr pane split failed: pane w9:p9 not found/);
+  });
+  it("accepts a bare pane id (forward-compat) but rejects other non-JSON", () => {
+    assert.equal(parseHerdrPaneId("w1:p2\n"), "w1:p2");
+    assert.equal(parseHerdrPaneId("not a pane id"), null);
+    assert.equal(parseHerdrPaneId(""), null);
+  });
+  it("returns null when the envelope lacks result.pane.pane_id", () => {
+    assert.equal(parseHerdrPaneId('{"id":"x","result":{"type":"pane_info"}}'), null);
   });
 });
 describe("commands", () => {

@@ -764,18 +764,55 @@ function createCmuxSplitSurface(
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
+/**
+ * Parse a herdr `pane split` JSON-RPC response and return the new pane id.
+ *
+ * herdr emits a JSON-RPC envelope on stdout for structural commands, e.g.
+ *   {"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p2",...},"type":"pane_info"}}
+ * or on failure
+ *   {"error":{"code":"...","message":"..."},"id":"..."}
+ *
+ * The previous code threaded the whole trimmed blob as the pane id, so every
+ * downstream `herdr pane <cmd> <pane_id>` reported pane_not_found. Extract
+ * `.result.pane.pane_id` instead. Throws on an error envelope; returns null if
+ * the output is neither a recognizable envelope nor a bare pane id (caller
+ * raises a clear error rather than forwarding a bad value).
+ */
+export function parseHerdrPaneId(stdout: string): string | null {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    // Not JSON — accept only if it already looks like a bare pane id (forward-compat).
+    return /^w\d+:p\d+$/.test(trimmed) ? trimmed : null;
+  }
+  const obj = parsed as { error?: { message?: string }; result?: { pane?: { pane_id?: unknown } } };
+  if (obj?.error) {
+    throw new Error(`herdr pane split failed: ${obj.error.message ?? JSON.stringify(obj.error)}`);
+  }
+  const paneId = obj?.result?.pane?.pane_id;
+  return typeof paneId === "string" && paneId.length > 0 ? paneId : null;
+}
+
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
 
   if (backend === "herdr") {
     const parentPaneId = process.env.HERDR_PANE_ID;
     if (!parentPaneId) throw new Error("HERDR_PANE_ID not set");
-    const newPaneId = execFileSync(
+    const splitOut = execFileSync(
       "herdr",
       ["pane", "split", parentPaneId, "--direction", "down", "--no-focus", "--cwd", process.cwd()],
       { encoding: "utf8" },
-    ).trim();
-    if (!newPaneId) throw new Error("Unexpected herdr pane split output: empty");
+    );
+    const newPaneId = parseHerdrPaneId(splitOut);
+    if (!newPaneId) {
+      throw new Error(
+        `Unexpected herdr pane split output (could not extract pane_id): ${splitOut.trim().slice(0, 200)}`,
+      );
+    }
     try {
       execFileSync("herdr", ["pane", "rename", newPaneId, name], { encoding: "utf8" });
     } catch {
