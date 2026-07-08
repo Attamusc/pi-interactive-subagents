@@ -154,6 +154,7 @@ async function withIsolatedAgentEnv(
   const root = createTestDir();
   const previousCwd = process.cwd();
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousDenyTools = process.env.PI_DENY_TOOLS;
   const projectDir = join(root, "project");
   const projectAgentsDir = join(projectDir, ".pi", "agents");
   const globalDir = join(root, "global");
@@ -163,12 +164,14 @@ async function withIsolatedAgentEnv(
   mkdirSync(globalAgentsDir, { recursive: true });
   process.chdir(projectDir);
   process.env.PI_CODING_AGENT_DIR = globalDir;
+  delete process.env.PI_DENY_TOOLS;
 
   try {
     await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
   } finally {
     process.chdir(previousCwd);
     restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+    restoreEnvVar("PI_DENY_TOOLS", previousDenyTools);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -1384,7 +1387,10 @@ describe("tool registration", () => {
 
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
+    const savedDenyTools = process.env.PI_DENY_TOOLS;
+    delete process.env.PI_DENY_TOOLS;
     (subagentsModule as any).default(api);
+    restoreEnvVar("PI_DENY_TOOLS", savedDenyTools);
 
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
@@ -1405,7 +1411,10 @@ describe("tool registration", () => {
 
   it("registers subagent_resume with an autoExit override", () => {
     const { api, registeredTools } = createMockExtensionApi();
+    const savedDenyTools = process.env.PI_DENY_TOOLS;
+    delete process.env.PI_DENY_TOOLS;
     (subagentsModule as any).default(api);
+    restoreEnvVar("PI_DENY_TOOLS", savedDenyTools);
 
     const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
     assert.ok(resumeTool, "expected subagent_resume tool to be registered");
@@ -1605,8 +1614,10 @@ describe("subagent interruption", () => {
 
   it("registers subagent_interrupt in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
-
+    const savedDenyTools = process.env.PI_DENY_TOOLS;
+    delete process.env.PI_DENY_TOOLS;
     (subagentsModule as any).default(api);
+    restoreEnvVar("PI_DENY_TOOLS", savedDenyTools);
 
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
   });
