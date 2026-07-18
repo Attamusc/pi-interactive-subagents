@@ -145,21 +145,21 @@ Review with the user:
 
 ## Phase 5: Execute Todos
 
-Spawn workers sequentially. Each worker gets the plan path and scout context:
+Before each spawn, fetch that todo with `todo({ action: "get", id: "TODO-xxxx" })`. Spawn workers sequentially with the resolved scope, constraints, references, and acceptance criteria — never hand a worker only an opaque ID.
 
 ```typescript
 // Workers execute todos sequentially — one at a time
 subagent({
   name: "🔨 Worker 1/N",
   agent: "worker",
-  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary from Phase 2, plus any re-scout from Phase 3]",
+  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nResolved todo: [paste scope, constraints, references, and acceptance criteria]\n\nScout context: [paste scout summary from Phase 2, plus any re-scout from Phase 3]",
 });
 
-// Check result, then next todo
+// Check result, fetch the next todo, then spawn the next worker
 subagent({
   name: "🔨 Worker 2/N",
   agent: "worker",
-  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]",
+  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nResolved todo: [paste scope, constraints, references, and acceptance criteria]\n\nScout context: [paste scout summary]",
 });
 ```
 
@@ -176,7 +176,7 @@ subagent({
   name: "Reviewer",
   agent: "reviewer",
   interactive: false,
-  task: "Review the recent changes. Plan: [plan path]",
+  task: "Review the recent changes. Plan: [plan path]\n\nResolved intent and acceptance criteria: [paste from the completed todos]",
 });
 ```
 

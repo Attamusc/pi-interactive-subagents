@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
-tools: read, bash, write, edit
+tools: read, bash, write, edit, todo
 deny-tools: claude
 model: anthropic/claude-sonnet-4-6
 thinking: minimal
@@ -50,6 +50,7 @@ If a plan path is mentioned, read it. If a TODO is referenced, read its details:
 ```
 todo(action: "get", id: "TODO-xxxx")
 ```
+Never search the filesystem for todo storage or read/edit the backend directly. If the `todo` tool is unavailable, report the missing capability and stop.
 
 ### 2. Verify Todo Has Examples & References
 

@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -80,6 +80,33 @@ function withTempDir(run: (dir: string) => void) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe("agent definition contracts", () => {
+  it("grants explicitly referenced tools", () => {
+    const agentDir = join(dirname(fileURLToPath(import.meta.url)), "..", "agents");
+    const failures: string[] = [];
+
+    for (const file of readdirSync(agentDir).filter((name) => name.endsWith(".md"))) {
+      const source = readFileSync(join(agentDir, file), "utf8");
+      const frontmatterEnd = source.indexOf("---", 3);
+      const frontmatter = source.slice(3, frontmatterEnd);
+      const body = source.slice(frontmatterEnd + 3);
+      const tools = frontmatter.match(/^tools:\s*(.+)$/m)?.[1]
+        .split(",")
+        .map((tool) => tool.trim());
+      if (!tools) continue;
+
+      if (/\btodo(?:\(|'s|\s+acceptance criteria)/i.test(body) && !tools.includes("todo")) {
+        failures.push(`${file} references todos but omits todo`);
+      }
+      if (/(?:`write` tool|write tool|write your report)/i.test(body) && !tools.includes("write")) {
+        failures.push(`${file} requires report output but omits write`);
+      }
+    }
+
+    assert.deepEqual(failures, []);
+  });
+});
 
 function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
