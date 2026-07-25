@@ -129,6 +129,8 @@ function boundStatusLine(line: string): string {
 }
 
 function snapshotProblemLabel(snapshotState: StatusSnapshotState): string | null {
+  if (snapshotState === "missing") return "activity telemetry missing";
+  if (snapshotState === "invalid") return "activity telemetry invalid";
   if (snapshotState === "wrong-id") return "wrong activity id";
   return null;
 }
