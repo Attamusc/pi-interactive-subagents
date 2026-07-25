@@ -29,6 +29,7 @@ import {
   parseHerdrPaneId,
   parseHerdrSocketResponse,
   extractHerdrReadText,
+  pollForExit,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -52,7 +53,7 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -112,16 +113,22 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const registeredHandlers = new Map<string, Array<any>>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: any) {
+        const handlers = registeredHandlers.get(event) ?? [];
+        handlers.push(handler);
+        registeredHandlers.set(event, handlers);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -603,7 +610,7 @@ describe("status.ts", () => {
     assert.equal(classifyStatus(state, 60_999).kind, "starting");
     const stalled = classifyStatus(state, 61_000);
     assert.equal(stalled.kind, "stalled");
-    assert.equal(stalled.statusLabel, null);
+    assert.equal(stalled.statusLabel, "activity telemetry missing");
   });
 
   it("classifies active snapshots without aging into stalled", () => {
@@ -687,7 +694,7 @@ describe("status.ts", () => {
 
     const snapshot = classifyStatus(state, 20_000);
     assert.equal(snapshot.kind, "active");
-    assert.equal(snapshot.statusLabel, null);
+    assert.equal(snapshot.statusLabel, "activity telemetry missing");
   });
 
   it("forces an active state to waiting after interrupt", () => {
@@ -755,7 +762,7 @@ describe("status.ts", () => {
       activityLabel: "bash",
     }, 5_000);
     state = observeStatus(state, { snapshot: "missing" }, 10_000);
-    assert.equal(classifyStatus(state, 10_000).statusLabel, null);
+    assert.equal(classifyStatus(state, 10_000).statusLabel, "activity telemetry missing");
 
     state = observeStatus(state, {
       snapshot: "present",
@@ -1249,7 +1256,98 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("subagent watcher lifecycle", () => {
+  it("uses child transcript writes as progress when activity telemetry is missing", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(sessionFile, '{"type":"session"}\n');
+      const running = {
+        id: "child-1",
+        name: "Worker",
+        task: "",
+        surface: "pane-1",
+        startTime: 0,
+        sessionFile,
+        activityFile: join(dir, "missing-activity.json"),
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      };
+      const testApi = (subagentsModule as any).__test__;
+
+      testApi.observeRunningSubagent(running, 61_000);
+      let snapshot = classifyStatus(running.statusState, 61_000);
+      assert.equal(snapshot.kind, "active");
+      assert.equal(snapshot.activityLabel, "session transcript");
+
+      testApi.observeRunningSubagent(running, 62_000);
+      snapshot = classifyStatus(running.statusState, 62_000);
+      assert.equal(snapshot.kind, "active");
+      assert.equal(snapshot.statusLabel, "activity telemetry missing");
+
+      snapshot = classifyStatus(running.statusState, 122_001);
+      assert.equal(snapshot.kind, "stalled");
+      assert.equal(snapshot.statusLabel, "activity telemetry missing");
+    });
+  });
+
+  it("re-arms the module abort signal when a cached extension starts a replacement session", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const firstRuntime = createMockExtensionApi();
+    (subagentsModule as any).default(firstRuntime.api);
+    firstRuntime.registeredHandlers.get("session_start")![0]({}, { ui: {} });
+    const before = testApi.getModuleAbortSignal();
+
+    firstRuntime.registeredHandlers.get("session_shutdown")![0]({ reason: "new" }, {});
+    assert.equal(before.aborted, true);
+    assert.equal(before.reason, "session_shutdown:new");
+
+    const replacementRuntime = createMockExtensionApi();
+    (subagentsModule as any).default(replacementRuntime.api);
+    replacementRuntime.registeredHandlers.get("session_start")![0]({}, { ui: {} });
+    const after = testApi.getModuleAbortSignal();
+
+    assert.notEqual(after, before);
+    assert.equal(after.aborted, false);
+  });
+});
+
 describe("subagent-done.ts", () => {
+  it("writes a done sidecar before autonomous shutdown", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+      const handlers = new Map<string, any>();
+      let shutdownCalled = false;
+      try {
+        subagentDoneExtension({
+          on(event: string, handler: any) {
+            handlers.set(event, handler);
+          },
+          getAllTools() {
+            return [];
+          },
+          registerShortcut() {},
+          registerTool() {},
+        } as any);
+
+        handlers.get("agent_end")(
+          { messages: [{ role: "assistant", stopReason: "stop" }] },
+          { shutdown() { shutdownCalled = true; } },
+        );
+
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+        assert.equal(shutdownCalled, true);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      }
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1324,6 +1422,15 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
     });
+  });
+});
+
+describe("cmux.ts pollForExit", () => {
+  it("includes the abort reason instead of normalizing it away", async () => {
+    await assert.rejects(
+      pollForExit("unused", AbortSignal.abort("session_shutdown:new"), { interval: 1 }),
+      /Aborted while waiting for subagent to finish: session_shutdown:new/,
+    );
   });
 });
 
@@ -1484,6 +1591,7 @@ describe("tool registration", () => {
 
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
+    assert.equal(denied.has("subagent_terminate"), true);
     assert.equal(denied.has("subagent_resume"), true);
   });
 
@@ -1722,6 +1830,7 @@ describe("subagent interruption", () => {
     restoreEnvVar("PI_DENY_TOOLS", savedDenyTools);
 
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_terminate"), true);
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
@@ -1900,8 +2009,16 @@ describe("subagent interruption", () => {
       }));
 
       assert.equal(sentSurface, "pane-1");
-      assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
-      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
+      assert.match(result.content[0].text, /process remains alive and registered/);
+      assert.match(result.content[0].text, /subagent_terminate/);
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "interrupt_requested",
+        interruptCount: 1,
+        surface: "pane-1",
+        sessionFile: "worker.jsonl",
+      });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
       assert.equal(snapshot.activityLabel, "interrupted");
@@ -1928,6 +2045,79 @@ describe("subagent interruption", () => {
       });
 
       assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
+      assert.equal(runningMap.get("a1").interruptCount, 2);
+      assert.equal(runningMap.has("a1"), true);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("hard-terminates the pane, removes the running entry, and preserves resume metadata", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    let closedSurface = "";
+    let abortReason: unknown;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({
+        abortController: {
+          abort(reason: unknown) {
+            abortReason = reason;
+          },
+        },
+      }));
+
+      const result = await testApi.handleSubagentTerminate(
+        { name: "Worker" },
+        async (surface: string) => {
+          closedSurface = surface;
+        },
+        () => "last child output",
+      );
+
+      assert.equal(closedSurface, "pane-1");
+      assert.equal(abortReason, "terminated_by_parent");
+      assert.equal(runningMap.has("a1"), false);
+      assert.match(result.content[0].text, /Terminated subagent "Worker"/);
+      assert.match(result.content[0].text, /Resume: pi --session worker\.jsonl/);
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "terminated",
+        surface: "pane-1",
+        sessionFile: "worker.jsonl",
+      });
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("keeps the watcher registered when hard termination cannot close the pane", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    let aborted = false;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({
+        abortController: {
+          abort() {
+            aborted = true;
+          },
+        },
+      }));
+
+      const result = await testApi.handleSubagentTerminate(
+        { id: "a1" },
+        async () => {
+          throw new Error("pane close failed");
+        },
+        () => "last child output",
+      );
+
+      assert.match(result.content[0].text, /Failed to terminate/);
+      assert.equal(aborted, false);
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
@@ -1974,6 +2164,23 @@ describe("subagent interruption", () => {
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
     assert.match(presentation, /Resume: pi --session/);
+  });
+
+  it("does not advertise resume when startup failed before creating the planned session", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 0,
+        summary: "Subagent watcher error: aborted",
+        sessionFile: "/tmp/planned.jsonl",
+        sessionFileExists: false,
+      },
+      "Worker",
+    );
+
+    assert.match(presentation, /Planned session \(not created\): \/tmp\/planned\.jsonl/);
+    assert.doesNotMatch(presentation, /Resume:/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
