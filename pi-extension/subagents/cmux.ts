@@ -1508,7 +1508,8 @@ export async function pollForExit(
 
   for (;;) {
     if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
+      const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
+      throw new Error(`Aborted while waiting for subagent to finish: ${reason}`);
     }
 
     // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
@@ -1557,14 +1558,18 @@ export async function pollForExit(
     options.onTick?.(elapsed);
 
     await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
+      if (signal.aborted) {
+        const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
+        return reject(new Error(`Aborted while waiting for subagent to finish: ${reason}`));
+      }
       const timer = setTimeout(() => {
         signal.removeEventListener("abort", onAbort);
         resolve();
       }, options.interval);
       function onAbort() {
         clearTimeout(timer);
-        reject(new Error("Aborted"));
+        const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
+        reject(new Error(`Aborted while waiting for subagent to finish: ${reason}`));
       }
       signal.addEventListener("abort", onAbort, { once: true });
     });
