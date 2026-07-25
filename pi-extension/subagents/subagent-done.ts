@@ -176,26 +176,28 @@ export default function (pi: ExtensionAPI) {
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
+      // Always signal autonomous completion through the sidecar before
+      // shutdown. Terminal sentinels are only a crash fallback: narrow or
+      // destroyed mux panes can make their screen contents unavailable.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
+            JSON.stringify(
+              errorInfo
+                ? {
+                    type: "error",
+                    errorMessage: errorInfo.errorMessage,
+                    stopReason: errorInfo.stopReason,
+                  }
+                : { type: "done" },
+            ),
           );
         } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // Best effort — the watcher still has terminal-sentinel and
+          // session-file fallbacks.
         }
       }
 
