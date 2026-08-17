@@ -112,17 +112,19 @@ const SubagentParams = Type.Object({
   systemPrompt: Type.Optional(
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({ description: "Nonblank model override. Blank values inherit the agent default." }),
+  ),
   skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
+    Type.String({ description: "Nonblank comma-separated skills. Blank values inherit the agent default." }),
   ),
   tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
+    Type.String({ description: "Nonblank comma-separated tools. Blank values inherit the agent default." }),
   ),
   cwd: Type.Optional(
     Type.String({
       description:
-        "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+        "Nonblank working directory for the sub-agent. Blank values inherit the agent default. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
   fork: Type.Optional(
@@ -294,12 +296,29 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   return [...agents.values()];
 }
 
+function normalizeOptionalString(value?: string): string | undefined {
+  return value?.trim() || undefined;
+}
+
+function resolveAgentStringOverrides(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): { model?: string; tools?: string; skills?: string; cwd?: string } {
+  return {
+    model: normalizeOptionalString(params.model) ?? normalizeOptionalString(agentDefs?.model),
+    tools: normalizeOptionalString(params.tools) ?? normalizeOptionalString(agentDefs?.tools),
+    skills: normalizeOptionalString(params.skills) ?? normalizeOptionalString(agentDefs?.skills),
+    cwd: normalizeOptionalString(params.cwd) ?? normalizeOptionalString(agentDefs?.cwd),
+  };
+}
+
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
-  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-  const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
+  const explicitCwd = normalizeOptionalString(params.cwd);
+  const rawCwd = resolveAgentStringOverrides(params, agentDefs).cwd ?? null;
+  const cwdIsFromAgent = explicitCwd == null && rawCwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
   const effectiveCwd = rawCwd
     ? rawCwd.startsWith("/")
@@ -783,6 +802,12 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   return [...allow].join(",");
 }
 
+function buildPiModelArgs(effectiveModel?: string, effectiveThinking?: string): string[] {
+  if (!effectiveModel) return [];
+  const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
+  return ["--model", shellEscape(model)];
+}
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -1121,7 +1146,9 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveAgentStringOverrides,
   buildSubagentToolAllowlist,
+  buildPiModelArgs,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1161,9 +1188,11 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
-  const effectiveTools = params.tools ?? agentDefs?.tools;
-  const effectiveSkills = params.skills ?? agentDefs?.skills;
+  const {
+    model: effectiveModel,
+    tools: effectiveTools,
+    skills: effectiveSkills,
+  } = resolveAgentStringOverrides(params, agentDefs);
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
@@ -1310,10 +1339,7 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
-  }
+  parts.push(...buildPiModelArgs(effectiveModel, effectiveThinking));
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
   // with multiline content. Pi's --append-system-prompt and --system-prompt

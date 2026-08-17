@@ -178,6 +178,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
 
+Optional string overrides are trimmed. Blank or whitespace-only `model`, `skills`, `tools`, and `cwd` values are treated as omitted, so a named agent's configured default still applies.
+
 ---
 
 ## Interrupting a running subagent

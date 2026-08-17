@@ -1119,6 +1119,77 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("inherits the agent model when the model override is omitted", () => {
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "T" },
+      { model: "github-copilot/gpt-5.6-terra" },
+    );
+
+    assert.equal(resolved.model, "github-copilot/gpt-5.6-terra");
+  });
+
+  it("inherits the agent model when the model override is empty", () => {
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "T", model: "" },
+      { model: "github-copilot/gpt-5.6-terra" },
+    );
+
+    assert.equal(resolved.model, "github-copilot/gpt-5.6-terra");
+  });
+
+  it("inherits the agent model when the model override is whitespace-only", () => {
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "T", model: " \t\n " },
+      { model: "github-copilot/gpt-5.6-terra" },
+    );
+
+    assert.equal(resolved.model, "github-copilot/gpt-5.6-terra");
+  });
+
+  it("uses a nonblank explicit model instead of the agent model", () => {
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "T", model: " github-copilot/gpt-5.4 " },
+      { model: "github-copilot/gpt-5.6-terra" },
+    );
+
+    assert.equal(resolved.model, "github-copilot/gpt-5.4");
+  });
+
+  it("emits no model argument when neither spawn nor agent configures one", () => {
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "T" },
+      {},
+    );
+
+    assert.equal(resolved.model, undefined);
+    assert.deepEqual(testApi.buildPiModelArgs(resolved.model, undefined), []);
+  });
+
+  it("appends inherited thinking to the inherited model argument", () => {
+    const agent = { model: "github-copilot/gpt-5.6-terra", thinking: "high" };
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "verify model inheritance", model: "" },
+      agent,
+    );
+
+    assert.deepEqual(
+      testApi.buildPiModelArgs(resolved.model, agent.thinking),
+      ["--model", "'github-copilot/gpt-5.6-terra:high'"],
+    );
+  });
+
+  it("treats blank tools, skills, and cwd overrides as absent", () => {
+    const resolved = testApi.resolveAgentStringOverrides(
+      { name: "Researcher", task: "T", tools: "", skills: " \t", cwd: "\n" },
+      { tools: "read,bash", skills: "researcher", cwd: "agents/researcher" },
+    );
+
+    assert.deepEqual(
+      { tools: resolved.tools, skills: resolved.skills, cwd: resolved.cwd },
+      { tools: "read,bash", skills: "researcher", cwd: "agents/researcher" },
+    );
+  });
+
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
