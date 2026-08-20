@@ -566,6 +566,7 @@ interface RunningSubagent {
   sessionProgressAt?: number;
   terminationRequestedAt?: number;
   terminationOutput?: string;
+  blockedEventBus?: ExtensionAPI["events"];
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -577,6 +578,35 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+function emitHerdrBlocked(
+  eventBus: ExtensionAPI["events"],
+  data: { active: true; label: "waiting on subagent" } | { active: false },
+): void {
+  try {
+    eventBus.emit("herdr:blocked", data);
+  } catch {}
+}
+
+function registerRunningSubagent(pi: ExtensionAPI, running: RunningSubagent): void {
+  running.blockedEventBus = pi.events;
+  runningSubagents.set(running.id, running);
+  emitHerdrBlocked(running.blockedEventBus, {
+    active: true,
+    label: "waiting on subagent",
+  });
+}
+
+function releaseRunningSubagent(id: string): boolean {
+  const running = runningSubagents.get(id);
+  if (!running) return false;
+
+  runningSubagents.delete(id);
+  if (running.blockedEventBus) {
+    emitHerdrBlocked(running.blockedEventBus, { active: false });
+  }
+  return true;
+}
 
 // ── Widget management ──
 
@@ -1036,7 +1066,7 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestedAt = Date.now();
-  runningSubagents.delete(running.id);
+  releaseRunningSubagent(running.id);
   running.abortController?.abort("terminated_by_parent");
   updateWidget();
 
@@ -1159,6 +1189,9 @@ export const __test__ = {
   handleSubagentTerminate,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  registerRunningSubagent,
+  releaseRunningSubagent,
+  watchSubagent,
   runningSubagents,
   formatElapsed,
   getModuleAbortSignal,
@@ -1326,7 +1359,6 @@ async function launchSubagent(
       }),
     };
 
-    runningSubagents.set(id, running);
     return running;
   }
 
@@ -1461,7 +1493,6 @@ async function launchSubagent(
     }),
   };
 
-  runningSubagents.set(id, running);
   return running;
 }
 
@@ -1494,12 +1525,20 @@ function copyClaudeSession(sentinelFile: string): string | null {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  dependencies: {
+    pollForExit?: typeof pollForExit;
+    closeSurface?: typeof closeSurface;
+    readScreen?: typeof readScreen;
+  } = {},
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
   const moduleSignal = getModuleAbortSignal();
+  const waitForExit = dependencies.pollForExit ?? pollForExit;
+  const close = dependencies.closeSurface ?? closeSurface;
+  const read = dependencies.readScreen ?? readScreen;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
+    const result = await waitForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1521,7 +1560,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = readScreen(surface, 200)
+        summary = read(surface, 200)
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
       }
@@ -1540,8 +1579,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      await closeSurface(surface);
-      runningSubagents.delete(running.id);
+      await close(surface);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1565,8 +1603,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    await closeSurface(surface);
-    runningSubagents.delete(running.id);
+    await close(surface);
 
     return {
       name,
@@ -1581,15 +1618,14 @@ async function watchSubagent(
   } catch (err: any) {
     let terminalOutput: string | undefined;
     try {
-      terminalOutput = running.terminationOutput ?? readScreen(surface, 200)
+      terminalOutput = running.terminationOutput ?? read(surface, 200)
         .replace(/__SUBAGENT_DONE_\d+__/, "")
         .trim();
     } catch {}
 
     try {
-      await closeSurface(surface);
+      await close(surface);
     } catch {}
-    runningSubagents.delete(running.id);
 
     const watcherAborted = signal.aborted;
     const moduleAborted = moduleSignal.aborted;
@@ -1634,6 +1670,8 @@ async function watchSubagent(
         moduleAbortReason: moduleSignal.reason == null ? undefined : String(moduleSignal.reason),
       },
     };
+  } finally {
+    releaseRunningSubagent(running.id);
   }
 }
 
@@ -1660,10 +1698,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
     abortModulePolls(`session_shutdown:${event.reason}`);
-    for (const [_id, agent] of runningSubagents) {
+    for (const agent of [...runningSubagents.values()]) {
       agent.abortController?.abort(`session_shutdown:${event.reason}`);
+      releaseRunningSubagent(agent.id);
     }
-    runningSubagents.clear();
     // The runtime is invalid past this point. Drop the captured ctx and mark the
     // session inactive so deferred callbacks short-circuit instead of throwing.
     sessionActive = false;
@@ -1735,15 +1773,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Launch the subagent (creates pane, sends command)
         const running = await launchSubagent(params, ctx);
+        registerRunningSubagent(pi, running);
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        // Start widget refresh and status supervision when the first agent launches
-        startWidgetRefresh();
-        startStatusRefresh(pi);
+        // Start widget refresh and status supervision when the first agent launches.
+        // If setup fails after registration, remove the active run before surfacing
+        // the launch failure so its blocked activation cannot leak.
+        try {
+          startWidgetRefresh();
+          startStatusRefresh(pi);
+        } catch (error) {
+          releaseRunningSubagent(running.id);
+          watcherAbort.abort("launch_setup_failed");
+          try {
+            await closeSurface(running.surface);
+          } catch {}
+          throw error;
+        }
 
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
@@ -2217,13 +2267,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             startTimeMs: startTime,
           }),
         };
-        runningSubagents.set(id, running);
-        startWidgetRefresh();
-        startStatusRefresh(pi);
+        registerRunningSubagent(pi, running);
 
         // Fire-and-forget watcher
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
+
+        try {
+          startWidgetRefresh();
+          startStatusRefresh(pi);
+        } catch (error) {
+          releaseRunningSubagent(running.id);
+          watcherAbort.abort("launch_setup_failed");
+          try {
+            await closeSurface(running.surface);
+          } catch {}
+          throw error;
+        }
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {

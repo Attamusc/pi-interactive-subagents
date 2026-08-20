@@ -116,6 +116,7 @@ function createMockExtensionApi() {
   const registeredHandlers = new Map<string, Array<any>>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const emittedEvents: Array<{ channel: string; data: unknown }> = [];
   return {
     registeredTools,
     registeredCommands,
@@ -123,7 +124,16 @@ function createMockExtensionApi() {
     registeredHandlers,
     sentUserMessages,
     sentMessages,
+    emittedEvents,
     api: {
+      events: {
+        emit(channel: string, data: unknown) {
+          emittedEvents.push({ channel, data });
+        },
+        on() {
+          return () => {};
+        },
+      },
       on(event: string, handler: any) {
         const handlers = registeredHandlers.get(event) ?? [];
         handlers.push(handler);
@@ -1327,6 +1337,339 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("semantic Herdr blocked lifecycle", () => {
+  function makeRunning(overrides: Record<string, unknown> = {}) {
+    const startTime = Date.now();
+    return {
+      id: "child-1",
+      name: "Worker",
+      task: "do work",
+      surface: "pane-1",
+      startTime,
+      sessionFile: "/tmp/child-1.jsonl",
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+      ...overrides,
+    };
+  }
+
+  it("emits one balanced pair for a successfully completed child", async () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+
+    testApi.registerRunningSubagent(runtime.api, running);
+    testApi.releaseRunningSubagent(running.id);
+
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("keeps parallel children blocked with one event pair per run", () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const first = makeRunning({ id: "child-1" });
+    const second = makeRunning({ id: "child-2" });
+
+    testApi.registerRunningSubagent(runtime.api, first);
+    testApi.registerRunningSubagent(runtime.api, second);
+    testApi.releaseRunningSubagent(first.id);
+    testApi.releaseRunningSubagent(second.id);
+
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("uses the same event contract for resumed and Claude-backed runs", () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const resumed = makeRunning({ id: "resumed", task: "resumed session" });
+    const claude = makeRunning({ id: "claude", cli: "claude" });
+
+    testApi.registerRunningSubagent(runtime.api, resumed);
+    testApi.releaseRunningSubagent(resumed.id);
+    testApi.registerRunningSubagent(runtime.api, claude);
+    testApi.releaseRunningSubagent(claude.id);
+
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("releases at most once when cleanup paths race", () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+
+    testApi.registerRunningSubagent(runtime.api, running);
+    assert.equal(testApi.releaseRunningSubagent(running.id), true);
+    assert.equal(testApi.releaseRunningSubagent(running.id), false);
+
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("does not let a throwing event listener break registration or cleanup", () => {
+    const runtime = createMockExtensionApi();
+    const attempts: Array<{ channel: string; data: unknown }> = [];
+    runtime.api.events.emit = (channel: string, data: unknown) => {
+      attempts.push({ channel, data });
+      throw new Error("listener failed");
+    };
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+
+    assert.doesNotThrow(() => testApi.registerRunningSubagent(runtime.api, running));
+    assert.doesNotThrow(() => testApi.releaseRunningSubagent(running.id));
+    assert.deepEqual(attempts, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("releases every outstanding child during parent session shutdown", () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const first = makeRunning({ id: "child-1", abortController: new AbortController() });
+    const second = makeRunning({ id: "child-2", abortController: new AbortController() });
+
+    testApi.registerRunningSubagent(runtime.api, first);
+    testApi.registerRunningSubagent(runtime.api, second);
+    runtime.registeredHandlers.get("session_shutdown")![0]({ reason: "reload" }, {});
+
+    assert.equal(testApi.runningSubagents.size, 0);
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("releases the blocked event when the real watcher completes", async () => {
+    const dir = createTestDir();
+    try {
+      const runtime = createMockExtensionApi();
+      (subagentsModule as any).default(runtime.api);
+      const testApi = (subagentsModule as any).__test__;
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }] } })}\n`,
+      );
+      const running = makeRunning({ sessionFile });
+
+      testApi.registerRunningSubagent(runtime.api, running);
+      await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() {
+          return { exitCode: 0 };
+        },
+        async closeSurface() {},
+      });
+
+      assert.deepEqual(runtime.emittedEvents, [
+        {
+          channel: "herdr:blocked",
+          data: { active: true, label: "waiting on subagent" },
+        },
+        {
+          channel: "herdr:blocked",
+          data: { active: false },
+        },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("releases once for ping, non-zero, provider-error, and watcher-error exits", async () => {
+    const cases = [
+      { id: "ping", result: { exitCode: 0, ping: { name: "Worker", message: "help" } } },
+      { id: "non-zero", result: { exitCode: 7 } },
+      { id: "provider", result: { exitCode: 1, errorMessage: "provider exhausted retries" } },
+    ];
+
+    for (const testCase of cases) {
+      const runtime = createMockExtensionApi();
+      (subagentsModule as any).default(runtime.api);
+      const testApi = (subagentsModule as any).__test__;
+      const running = makeRunning({ id: testCase.id });
+      testApi.registerRunningSubagent(runtime.api, running);
+
+      await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() {
+          return testCase.result;
+        },
+        async closeSurface() {},
+      });
+
+      assert.deepEqual(runtime.emittedEvents, [
+        {
+          channel: "herdr:blocked",
+          data: { active: true, label: "waiting on subagent" },
+        },
+        {
+          channel: "herdr:blocked",
+          data: { active: false },
+        },
+      ]);
+    }
+
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({ id: "watcher-error" });
+    testApi.registerRunningSubagent(runtime.api, running);
+
+    await testApi.watchSubagent(running, new AbortController().signal, {
+      async pollForExit() {
+        throw new Error("watch failed");
+      },
+      async closeSurface() {},
+      readScreen() {
+        return "";
+      },
+    });
+
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("hard termination releases once while turn-only interrupt does not release", async () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({ abortController: new AbortController() });
+    testApi.registerRunningSubagent(runtime.api, running);
+
+    testApi.handleSubagentInterrupt({ id: running.id }, () => {});
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+    ]);
+
+    await testApi.handleSubagentTerminate(
+      { id: running.id },
+      async () => {},
+      () => "last output",
+    );
+
+    assert.deepEqual(runtime.emittedEvents, [
+      {
+        channel: "herdr:blocked",
+        data: { active: true, label: "waiting on subagent" },
+      },
+      {
+        channel: "herdr:blocked",
+        data: { active: false },
+      },
+    ]);
+  });
+
+  it("emits nothing when a subagent request is rejected before launch", async () => {
+    const runtime = createMockExtensionApi();
+    const previousDenyTools = process.env.PI_DENY_TOOLS;
+    const previousAgent = process.env.PI_SUBAGENT_AGENT;
+    delete process.env.PI_DENY_TOOLS;
+    process.env.PI_SUBAGENT_AGENT = "worker";
+    try {
+      (subagentsModule as any).default(runtime.api);
+      const tool = runtime.registeredTools.find((candidate) => candidate.name === "subagent");
+      const result = await tool.execute("call-1", {
+        name: "Worker",
+        task: "nested work",
+        agent: "worker",
+      });
+      assert.equal(result.details.error, "self-spawn blocked");
+      assert.deepEqual(runtime.emittedEvents, []);
+    } finally {
+      restoreEnvVar("PI_DENY_TOOLS", previousDenyTools);
+      restoreEnvVar("PI_SUBAGENT_AGENT", previousAgent);
+    }
+  });
+});
+
 describe("subagent watcher lifecycle", () => {
   it("uses child transcript writes as progress when activity telemetry is missing", () => {
     withTempDir((dir) => {

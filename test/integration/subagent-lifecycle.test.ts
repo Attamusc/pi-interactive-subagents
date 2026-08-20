@@ -34,6 +34,8 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
+  BLOCKED_EVENT_RECORDER_SOURCE,
   type TestEnv,
 } from "./harness.ts";
 
@@ -64,7 +66,9 @@ for (const backend of backends) {
     it("spawns a subagent that writes a file and verifies the session", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
+      const blockedEventsFile = `/tmp/pi-integ-blocked-${id}.jsonl`;
       trackTempFile(env, markerFile);
+      trackTempFile(env, blockedEventsFile);
 
       const surface = await createTrackedSurface(env, `echo-${id}`);
       await sleep(1000);
@@ -78,7 +82,10 @@ for (const backend of backends) {
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
-      await startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task, {
+        extraArgs: `-e ${BLOCKED_EVENT_RECORDER_SOURCE}`,
+        env: { PI_TEST_BLOCKED_EVENT_FILE: blockedEventsFile },
+      });
 
       // Verify: subagent created the marker file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
@@ -92,6 +99,19 @@ for (const backend of backends) {
         surface,
         /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
         PI_TIMEOUT,
+      );
+
+      const blockedEvents = await waitForFile(
+        blockedEventsFile,
+        PI_TIMEOUT,
+        /"active":false/,
+      );
+      assert.deepEqual(
+        blockedEvents.trim().split("\n").map((line) => JSON.parse(line)),
+        [
+          { active: true, label: "waiting on subagent" },
+          { active: false },
+        ],
       );
 
       // Verify: session file was created (shown in steer result)
@@ -160,8 +180,10 @@ for (const backend of backends) {
       const id = uniqueId();
       const fileA = `/tmp/pi-integ-para-${id}-a.txt`;
       const fileB = `/tmp/pi-integ-para-${id}-b.txt`;
+      const blockedEventsFile = `/tmp/pi-integ-blocked-parallel-${id}.jsonl`;
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
+      trackTempFile(env, blockedEventsFile);
 
       const surface = await createTrackedSurface(env, `parallel-${id}`);
       await sleep(1000);
@@ -182,7 +204,10 @@ for (const backend of backends) {
         `Call both subagent tools NOW, do not wait between them.`,
       ].join("\n");
 
-      await startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task, {
+        extraArgs: `-e ${BLOCKED_EVENT_RECORDER_SOURCE}`,
+        env: { PI_TEST_BLOCKED_EVENT_FILE: blockedEventsFile },
+      });
 
       // Both marker files should appear
       const [contentA, contentB] = await Promise.all([
@@ -192,6 +217,21 @@ for (const backend of backends) {
 
       assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
       assert.ok(contentB.includes(`DONE_B_${id}`), `File B should contain marker`);
+
+      const blockedEvents = await waitForFile(
+        blockedEventsFile,
+        PI_TIMEOUT,
+        /"active":false[\s\S]*"active":false/,
+      );
+      assert.deepEqual(
+        blockedEvents.trim().split("\n").map((line) => JSON.parse(line)),
+        [
+          { active: true, label: "waiting on subagent" },
+          { active: true, label: "waiting on subagent" },
+          { active: false },
+          { active: false },
+        ],
+      );
     });
 
     // ── Fork mode ──
@@ -208,8 +248,9 @@ for (const backend of backends) {
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
         `  fork: true`,
+        `  model: "${TEST_MODEL}"`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `Do not set the agent parameter. Set only name, fork, model, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 

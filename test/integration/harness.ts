@@ -12,8 +12,8 @@ import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
-  cpSync,
   readdirSync,
+  writeFileSync,
   rmSync,
   existsSync,
   readFileSync,
@@ -70,6 +70,7 @@ const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
  * installed on the host.
  */
 const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
+export const BLOCKED_EVENT_RECORDER_SOURCE = join(HARNESS_DIR, "blocked-event-recorder.ts");
 
 // ── Configuration ──
 
@@ -204,7 +205,11 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const source = readFileSync(join(TEST_AGENTS_SRC, file), "utf8");
+        const configured = process.env.PI_TEST_MODEL
+          ? source.replace(/^model:\s*.+$/m, `model: ${process.env.PI_TEST_MODEL}`)
+          : source;
+        writeFileSync(join(agentsDir, file), configured);
       }
     }
   }
@@ -271,10 +276,13 @@ export async function startPi(
   surface: string,
   testDir: string,
   task: string,
-  opts?: { model?: string; extraArgs?: string },
+  opts?: { model?: string; extraArgs?: string; env?: Record<string, string> },
 ): Promise<void> {
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
+  const envPrefix = Object.entries(opts?.env ?? {})
+    .map(([name, value]) => `${name}=${shellEscape(value)}`)
+    .join(" ");
 
   // Force pi to load the working-tree extension (not an installed pi-package
   // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
@@ -282,6 +290,7 @@ export async function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
+    envPrefix,
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
