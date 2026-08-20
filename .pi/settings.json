@@ -1,7 +1,7 @@
 {
   "packages": [
     {
-      "source": "git:github.com/HazAT/pi-interactive-subagents",
+      "source": "git:github.com/Attamusc/pi-interactive-subagents",
       "extensions": [],
       "skills": []
     }
