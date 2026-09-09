@@ -7,7 +7,6 @@ import {
   visibleHerdrCapabilities,
   type AgentLaunchIntent,
   type NormalizedAgentDefinition,
-  type ThinkingLevel,
 } from "pi-agent-execution";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
@@ -158,7 +157,7 @@ const SubagentParams = Type.Object({
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
-  definition?: NormalizedAgentDefinition;
+  definition: NormalizedAgentDefinition;
   model?: string;
   tools?: string;
   skills?: string;
@@ -167,11 +166,9 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
-  systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
-  body?: string;
   disableModelInvocation?: boolean;
 }
 
@@ -246,24 +243,31 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return value === "standalone" || value === "lineage-only" || value === "fork" ? value : undefined;
 }
 
-function parseVisibleAgentDefinition(path: string, content: string): AgentDefinition | null {
+class AgentDefinitionParseError extends Error {
+  constructor(diagnostics: readonly { path: string; location?: { line: number; column: number }; message: string }[]) {
+    super(diagnostics.map((diagnostic) => {
+      const location = diagnostic.location ? `:${diagnostic.location.line}:${diagnostic.location.column}` : "";
+      return `${diagnostic.path}${location}: ${diagnostic.message}`;
+    }).join("\n"));
+    this.name = "AgentDefinitionParseError";
+  }
+}
+
+function parseVisibleAgentDefinition(path: string, content: string): AgentDefinition {
   const parsed = parseSharedAgentDefinition(
     { path, content },
     { fallbackName: path.split("/").pop()?.replace(/\.md$/, ""), requiredFields: [] },
   );
-  if (!parsed.ok) return null;
+  if (!parsed.ok) throw new AgentDefinitionParseError(parsed.diagnostics);
 
   const { definition } = parsed;
   const metadata = definition.metadata;
-  const explicitPromptMode = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1]
-    .match(/^system-prompt:\s*(append|replace)\s*$/m)?.[1] as "append" | "replace" | undefined;
   return {
     definition,
     name: definition.name,
     description: definition.description,
     model: definition.model,
     tools: definition.tools?.join(","),
-    systemPromptMode: explicitPromptMode,
     skills: definition.skills?.join(","),
     thinking: definition.thinking,
     denyTools: metadataString(metadata, "deny-tools"),
@@ -273,7 +277,6 @@ function parseVisibleAgentDefinition(path: string, content: string): AgentDefini
     sessionMode: parseSessionMode(metadataString(metadata, "session-mode")),
     cwd: definition.cwd,
     cli: metadataString(metadata, "cli"),
-    body: definition.systemPrompt?.text || undefined,
     disableModelInvocation: metadataBoolean(metadata, "disable-model-invocation") ?? false,
   };
 }
@@ -290,9 +293,12 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
       const definitionPath = join(dir, file);
-      const parsed = parseVisibleAgentDefinition(definitionPath, readFileSync(definitionPath, "utf8"));
-      if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
+      try {
+        const parsed = parseVisibleAgentDefinition(definitionPath, readFileSync(definitionPath, "utf8"));
+        agents.set(parsed.name, { ...parsed, source });
+      } catch (error) {
+        if (!(error instanceof AgentDefinitionParseError)) throw error;
+      }
     }
   }
 
@@ -308,15 +314,7 @@ function resolveVisibleLaunchIntent(
   agentDefs: AgentDefaults | null,
   callerCwd: string,
 ): AgentLaunchIntent {
-  const definition = agentDefs?.definition ?? {
-    name: params.agent ?? params.name,
-    ...(normalizeOptionalString(agentDefs?.model) ? { model: normalizeOptionalString(agentDefs?.model) } : {}),
-    ...(normalizeOptionalString(agentDefs?.thinking) ? { thinking: normalizeOptionalString(agentDefs?.thinking) as ThinkingLevel } : {}),
-    ...(normalizeOptionalString(agentDefs?.tools) ? { tools: normalizeOptionalString(agentDefs?.tools)!.split(",").map((entry) => entry.trim()).filter(Boolean) } : {}),
-    ...(normalizeOptionalString(agentDefs?.skills) ? { skills: normalizeOptionalString(agentDefs?.skills)!.split(",").map((entry) => entry.trim()).filter(Boolean) } : {}),
-    ...(normalizeOptionalString(agentDefs?.cwd) ? { cwd: normalizeOptionalString(agentDefs?.cwd) } : {}),
-    metadata: {},
-  };
+  const definition = agentDefs?.definition ?? { name: params.agent ?? params.name, metadata: {} };
   const list = (value: string | undefined): readonly string[] | undefined =>
     normalizeOptionalString(value)?.split(",").map((entry) => entry.trim()).filter(Boolean);
   return resolveAgentLaunchIntent(definition, params.task, callerCwd, {
@@ -324,30 +322,41 @@ function resolveVisibleLaunchIntent(
     tools: list(params.tools),
     skills: list(params.skills),
     cwd: normalizeOptionalString(params.cwd),
+    ...(!definition.systemPrompt?.text.trim() && normalizeOptionalString(params.systemPrompt)
+      ? { systemPrompt: { text: normalizeOptionalString(params.systemPrompt)! } }
+      : {}),
   });
 }
 
-function resolveAgentStringOverrides(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
-): { model?: string; tools?: string; skills?: string; cwd?: string } {
-  const intent = resolveVisibleLaunchIntent(params, agentDefs, process.cwd());
+function resolveVisibleIdentityRouting(intent: AgentLaunchIntent): {
+  identity: string | null;
+  roleBlock: string;
+  cliFlag: "--system-prompt" | "--append-system-prompt" | null;
+} {
+  const prompt = intent.effective.systemPrompt;
+  const identity = prompt?.text || null;
+  const cliFlag = prompt?.mode === "replace"
+    ? "--system-prompt"
+    : prompt?.mode === "append"
+      ? "--append-system-prompt"
+      : null;
   return {
-    model: intent.effective.model,
-    tools: intent.effective.tools?.join(","),
-    skills: intent.effective.skills?.join(","),
-    cwd: intent.cwd === process.cwd() ? undefined : intent.cwd,
+    identity,
+    roleBlock: identity && !cliFlag ? `\n\n${identity}` : "",
+    cliFlag,
   };
 }
 
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
+  callerCwd = process.cwd(),
 ): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
   const explicitCwd = normalizeOptionalString(params.cwd);
-  const rawCwd = resolveAgentStringOverrides(params, agentDefs).cwd ?? null;
+  const hasConfiguredCwd = explicitCwd != null || agentDefs?.definition.cwd != null;
+  const rawCwd = hasConfiguredCwd ? resolveVisibleLaunchIntent(params, agentDefs, callerCwd).cwd : null;
   const cwdIsFromAgent = explicitCwd == null && rawCwd != null;
-  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
+  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : callerCwd;
   const effectiveCwd = rawCwd
     ? rawCwd.startsWith("/")
       ? rawCwd
@@ -430,8 +439,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
 
   for (const p of paths) {
     if (!existsSync(p)) continue;
-    const parsed = parseVisibleAgentDefinition(p, readFileSync(p, "utf8"));
-    if (parsed) return parsed;
+    return parseVisibleAgentDefinition(p, readFileSync(p, "utf8"));
   }
 
   return null;
@@ -1204,8 +1212,9 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
-  resolveAgentStringOverrides,
   resolveVisibleLaunchIntent,
+  resolveSubagentPaths,
+  resolveVisibleIdentityRouting,
   parseVisibleAgentDefinition,
   visibleHerdrCapabilities,
   buildSubagentToolAllowlist,
@@ -1264,7 +1273,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs, ctx.cwd);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1313,10 +1322,7 @@ async function launchSubagent(
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+  const { identity, roleBlock, cliFlag } = resolveVisibleIdentityRouting(launchIntent);
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
@@ -1338,9 +1344,8 @@ async function launchSubagent(
       cmdParts.push("--model", shellEscape(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
+    if (identity) {
+      cmdParts.push("--append-system-prompt", shellEscape(identity));
     }
 
     if (params.resumeSessionId) {
@@ -1406,8 +1411,8 @@ async function launchSubagent(
   // Pass agent body as system prompt via file to avoid shell escaping issues
   // with multiline content. Pi's --append-system-prompt and --system-prompt
   // auto-detect file paths and read their contents.
-  if (identityInSystemPrompt && identity) {
-    const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+  if (cliFlag && identity) {
+    const flag = cliFlag;
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const spSafeName = params.name
       .toLowerCase()

@@ -9,15 +9,18 @@ describe("visible system prompt configuration", () => {
     for (const mode of ["replace", "append"] as const) {
       const parsed = parseVisibleAgentDefinition(
         `/tmp/${mode}.md`,
-        `---\nsystem-prompt: ${mode}\n---\n\nYou are a specialized agent.`,
+        `---\nsystem-prompt: "${mode}"\n---\n\nYou are a specialized agent.`,
       );
       assert.ok(parsed);
-      assert.equal(parsed.systemPromptMode, mode);
-      assert.equal(parsed.body, "You are a specialized agent.");
-      assert.deepEqual(
-        resolveVisibleLaunchIntent({ name: "Agent", task: "work" }, parsed, "/caller").effective.systemPrompt,
-        { mode, text: "You are a specialized agent." },
-      );
+      assert.equal(parsed.definition.systemPrompt?.mode, mode);
+      assert.equal(parsed.definition.systemPrompt?.text, "You are a specialized agent.");
+      const intent = resolveVisibleLaunchIntent({ name: "Agent", task: "work" }, parsed, "/caller");
+      assert.deepEqual(intent.effective.systemPrompt, { mode, text: "You are a specialized agent." });
+      assert.deepEqual((subagentsModule as any).__test__.resolveVisibleIdentityRouting(intent), {
+        identity: "You are a specialized agent.",
+        roleBlock: "",
+        cliFlag: mode === "replace" ? "--system-prompt" : "--append-system-prompt",
+      });
     }
   });
 
@@ -27,11 +30,19 @@ describe("visible system prompt configuration", () => {
       "---\nsystem-prompt: replace\n---\n",
     );
     assert.ok(parsed);
-    assert.equal(parsed.systemPromptMode, "replace");
-    assert.equal(parsed.body, undefined);
+    assert.equal(parsed.definition.systemPrompt?.mode, "replace");
+    assert.equal(parsed.definition.systemPrompt?.text, "");
     assert.deepEqual(
       resolveVisibleLaunchIntent({ name: "Agent", task: "work" }, parsed, "/caller").effective.systemPrompt,
       { mode: "replace", text: "" },
+    );
+    assert.deepEqual(
+      resolveVisibleLaunchIntent(
+        { name: "Agent", task: "work", systemPrompt: "Parameter identity" },
+        parsed,
+        "/caller",
+      ).effective.systemPrompt,
+      { mode: "replace", text: "Parameter identity" },
     );
   });
 
@@ -41,7 +52,7 @@ describe("visible system prompt configuration", () => {
       "---\nmodel: anthropic/test\n---\n\nYou are a default agent.",
     );
     assert.ok(parsed);
-    assert.equal(parsed.systemPromptMode, undefined);
-    assert.equal(parsed.body, "You are a default agent.");
+    assert.equal(parsed.definition.systemPrompt?.mode, undefined);
+    assert.equal(parsed.definition.systemPrompt?.text, "You are a default agent.");
   });
 });

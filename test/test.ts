@@ -942,9 +942,30 @@ describe("subagent discovery", () => {
       thinking: "high",
       tools: ["read", "bash"],
       skills: ["review"],
-      systemPrompt: { mode: "append", text: "You are the worker." },
+      systemPrompt: { text: "You are the worker." },
     });
     assert.equal(intent.cwd, "workers/core");
+    assert.deepEqual(testApi.resolveVisibleIdentityRouting(intent), {
+      identity: "You are the worker.",
+      roleBlock: "\n\nYou are the worker.",
+      cliFlag: null,
+    });
+    assert.deepEqual(testApi.resolveVisibleIdentityRouting(intent), {
+      identity: "You are the worker.",
+      roleBlock: "\n\nYou are the worker.",
+      cliFlag: null,
+    });
+  });
+
+  it("preserves an explicit cwd equal to process cwd against a different caller cwd", () => {
+    const parsed = testApi.parseVisibleAgentDefinition(
+      "/tmp/local.md",
+      `---\ncwd: ${process.cwd()}\n---\n`,
+    );
+    assert.equal(
+      testApi.resolveSubagentPaths({ name: "Worker", task: "work" }, parsed, "/different-caller").effectiveCwd,
+      process.cwd(),
+    );
   });
 
   it("loads session-mode from frontmatter", async () => {
@@ -1160,74 +1181,69 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("inherits the agent model when the model override is omitted", () => {
-    const resolved = testApi.resolveAgentStringOverrides(
-      { name: "Researcher", task: "T" },
-      { model: "github-copilot/gpt-5.6-terra" },
+  function parseDefaults(frontmatter: string) {
+    return testApi.parseVisibleAgentDefinition(
+      "/tmp/researcher.md",
+      `---\nname: researcher\n${frontmatter}\n---\n`,
     );
+  }
 
-    assert.equal(resolved.model, "github-copilot/gpt-5.6-terra");
-  });
-
-  it("inherits the agent model when the model override is empty", () => {
-    const resolved = testApi.resolveAgentStringOverrides(
-      { name: "Researcher", task: "T", model: "" },
-      { model: "github-copilot/gpt-5.6-terra" },
-    );
-
-    assert.equal(resolved.model, "github-copilot/gpt-5.6-terra");
-  });
-
-  it("inherits the agent model when the model override is whitespace-only", () => {
-    const resolved = testApi.resolveAgentStringOverrides(
-      { name: "Researcher", task: "T", model: " \t\n " },
-      { model: "github-copilot/gpt-5.6-terra" },
-    );
-
-    assert.equal(resolved.model, "github-copilot/gpt-5.6-terra");
-  });
+  for (const [label, model] of [
+    ["omitted", undefined],
+    ["empty", ""],
+    ["whitespace-only", " \t\n "],
+  ] as const) {
+    it(`inherits the agent model when the model override is ${label}`, () => {
+      const intent = testApi.resolveVisibleLaunchIntent(
+        { name: "Researcher", task: "T", model },
+        parseDefaults("model: github-copilot/gpt-5.6-terra"),
+        "/caller",
+      );
+      assert.equal(intent.effective.model, "github-copilot/gpt-5.6-terra");
+    });
+  }
 
   it("uses a nonblank explicit model instead of the agent model", () => {
-    const resolved = testApi.resolveAgentStringOverrides(
+    const intent = testApi.resolveVisibleLaunchIntent(
       { name: "Researcher", task: "T", model: " github-copilot/gpt-5.4 " },
-      { model: "github-copilot/gpt-5.6-terra" },
+      parseDefaults("model: github-copilot/gpt-5.6-terra"),
+      "/caller",
     );
-
-    assert.equal(resolved.model, "github-copilot/gpt-5.4");
+    assert.equal(intent.effective.model, "github-copilot/gpt-5.4");
   });
 
   it("emits no model argument when neither spawn nor agent configures one", () => {
-    const resolved = testApi.resolveAgentStringOverrides(
+    const intent = testApi.resolveVisibleLaunchIntent(
       { name: "Researcher", task: "T" },
-      {},
+      parseDefaults("description: no model"),
+      "/caller",
     );
-
-    assert.equal(resolved.model, undefined);
-    assert.deepEqual(testApi.buildPiModelArgs(resolved.model, undefined), []);
+    assert.equal(intent.effective.model, undefined);
+    assert.deepEqual(testApi.buildPiModelArgs(intent.effective.model, undefined), []);
   });
 
   it("appends inherited thinking to the inherited model argument", () => {
-    const agent = { model: "github-copilot/gpt-5.6-terra", thinking: "high" };
-    const resolved = testApi.resolveAgentStringOverrides(
+    const agent = parseDefaults("model: github-copilot/gpt-5.6-terra\nthinking: high");
+    const intent = testApi.resolveVisibleLaunchIntent(
       { name: "Researcher", task: "verify model inheritance", model: "" },
       agent,
+      "/caller",
     );
-
     assert.deepEqual(
-      testApi.buildPiModelArgs(resolved.model, agent.thinking),
+      testApi.buildPiModelArgs(intent.effective.model, intent.effective.thinking),
       ["--model", "'github-copilot/gpt-5.6-terra:high'"],
     );
   });
 
   it("treats blank tools, skills, and cwd overrides as absent", () => {
-    const resolved = testApi.resolveAgentStringOverrides(
+    const intent = testApi.resolveVisibleLaunchIntent(
       { name: "Researcher", task: "T", tools: "", skills: " \t", cwd: "\n" },
-      { tools: "read,bash", skills: "researcher", cwd: "agents/researcher" },
+      parseDefaults("tools: read,bash\nskills: researcher\ncwd: agents/researcher"),
+      "/caller",
     );
-
     assert.deepEqual(
-      { tools: resolved.tools, skills: resolved.skills, cwd: resolved.cwd },
-      { tools: "read,bash", skills: "researcher", cwd: "agents/researcher" },
+      { tools: intent.effective.tools, skills: intent.effective.skills, cwd: intent.cwd },
+      { tools: ["read", "bash"], skills: ["researcher"], cwd: "agents/researcher" },
     );
   });
 
@@ -1319,13 +1335,24 @@ describe("subagent discovery", () => {
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
       assert.equal(loaded.model, "anthropic/test-hidden");
-      assert.equal(loaded.body, "You are the hidden agent.");
+      assert.equal(loaded.definition.systemPrompt?.text, "You are the hidden agent.");
       assert.equal(loaded.disableModelInvocation, true);
     });
   });
 
-  it("lets a hidden project agent shadow a visible global agent", async () => {
+  it("does not fall back when a selected project definition is malformed", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "invalid-thinking-agent", "name: invalid-thinking-agent\nthinking: high");
+      writeAgentFile(projectAgentsDir, "invalid-thinking-agent", "name: invalid-thinking-agent\nthinking: enormous");
+
+      assert.throws(
+        () => testApi.loadAgentDefaults("invalid-thinking-agent"),
+        /invalid-thinking-agent\.md:.*Invalid thinking level 'enormous'/,
+      );
+    });
+  });
+
+  it("lets a hidden project agent shadow a visible global agent", async () => {    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
       writeAgentFile(
         globalAgentsDir,
         "shadowed-discovery-test-agent",
@@ -1363,7 +1390,7 @@ describe("subagent discovery", () => {
       const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
       assert.ok(loaded, "expected project override to remain directly loadable");
       assert.equal(loaded.model, "anthropic/test-project");
-      assert.equal(loaded.body, "You are the project hidden agent.");
+      assert.equal(loaded.definition.systemPrompt?.text, "You are the project hidden agent.");
       assert.equal(loaded.disableModelInvocation, true);
     });
   });
