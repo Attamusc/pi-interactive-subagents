@@ -1344,8 +1344,9 @@ async function launchSubagent(
       cmdParts.push("--model", shellEscape(effectiveModel));
     }
 
-    if (identity) {
-      cmdParts.push("--append-system-prompt", shellEscape(identity));
+    const sp = params.systemPrompt ?? launchIntent.effective.systemPrompt?.text;
+    if (sp) {
+      cmdParts.push("--append-system-prompt", shellEscape(sp));
     }
 
     if (params.resumeSessionId) {
