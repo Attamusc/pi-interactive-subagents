@@ -1784,42 +1784,6 @@ describe("subagent watcher lifecycle", () => {
 });
 
 describe("subagent-done.ts", () => {
-  it("writes a done sidecar before autonomous shutdown", () => {
-    withTempDir((dir) => {
-      const sessionFile = join(dir, "child.jsonl");
-      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-      const previousSession = process.env.PI_SUBAGENT_SESSION;
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      process.env.PI_SUBAGENT_SESSION = sessionFile;
-
-      const handlers = new Map<string, any>();
-      let shutdownCalled = false;
-      try {
-        subagentDoneExtension({
-          on(event: string, handler: any) {
-            handlers.set(event, handler);
-          },
-          getAllTools() {
-            return [];
-          },
-          registerShortcut() {},
-          registerTool() {},
-        } as any);
-
-        handlers.get("agent_end")(
-          { messages: [{ role: "assistant", stopReason: "stop" }] },
-          { shutdown() { shutdownCalled = true; } },
-        );
-
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
-        assert.equal(shutdownCalled, true);
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
-        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-      }
-    });
-  });
-
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1836,9 +1800,9 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
     });
 
-    it("auto-exits after normal completion even when the user sent the prompt", () => {
+    it("stays open after user takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
+      assert.equal(shouldAutoExitOnAgentEnd(true, messages), false);
     });
 
     it("stays open after Escape aborts the run", () => {

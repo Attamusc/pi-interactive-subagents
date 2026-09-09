@@ -131,8 +131,9 @@ export function readChildCompletionSnapshot(file: string, expectedRunId: string,
   if (value.sequence <= afterSequence) return { ok: false, reason: "stale" };
   if (!value.latestFacts.every(f => validateFact(f, expectedRunId, value.sourceId as string))) return { ok: false, reason: "invalid", error: "invalid lifecycle fact" };
   const facts = value.latestFacts as ChildCompletionFact[];
+  const sequence = value.sequence;
   const sequences = facts.map(f => f.sequence); const kinds = facts.map(f => f.kind);
-  if (new Set(sequences).size !== sequences.length || new Set(kinds).size !== kinds.length || sequences.some((n, i) => i > 0 && n <= sequences[i - 1]!) || sequences.some(n => n > value.sequence) || sequences.at(-1) !== value.sequence) return { ok: false, reason: "invalid", error: "facts are duplicate, stale, or inconsistent with snapshot sequence" };
+  if (new Set(sequences).size !== sequences.length || new Set(kinds).size !== kinds.length || sequences.some((n, i) => i > 0 && n <= sequences[i - 1]!) || sequences.some(n => n > sequence) || sequences.at(-1) !== sequence) return { ok: false, reason: "invalid", error: "facts are duplicate, stale, or inconsistent with snapshot sequence" };
   const request = facts.find(f => f.kind === "completion-requested");
   if ((request === undefined) !== (value.completionPayload === undefined) || (request?.kind === "completion-requested" && !payloadMatches(request.reason, value.completionPayload as CompletionPayload))) return { ok: false, reason: "invalid", error: "completion payload does not match request" };
   return { ok: true, value: value as unknown as ChildCompletionSnapshot };

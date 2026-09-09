@@ -6,34 +6,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { createChildCompletionRecorder } from "./completion.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
 export function shouldAutoExitOnAgentEnd(
-  _userTookOver: boolean,
+  userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
+  if (userTookOver) return false;
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
-      if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
-      }
+      if (msg?.role === "assistant") return msg.stopReason !== "aborted";
     }
   }
-
   return true;
 }
 
@@ -85,8 +75,22 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const runId = process.env.PI_SUBAGENT_ID;
+  const snapshotFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
+  const sessionFile = process.env.PI_SUBAGENT_SESSION;
+  if (!runId || !snapshotFile || !sessionFile) {
+    throw new Error(
+      "subagent completion requires PI_SUBAGENT_ID, PI_SUBAGENT_COMPLETION_FILE, and PI_SUBAGENT_SESSION",
+    );
+  }
+  const completionRecorder = createChildCompletionRecorder({
+    runId,
+    snapshotFile,
+    sessionFile,
+    childPid: process.pid,
+  });
   const recorder = createSubagentActivityRecorder({
-    runningChildId: process.env.PI_SUBAGENT_ID,
+    runningChildId: runId,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
@@ -143,9 +147,12 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let latestMessages: any[] | undefined;
+  let explicitCompletionRequested = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    completionRecorder.record({ kind: "progress", activity: "session-start", estimated: false });
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -168,50 +175,34 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    completionRecorder.record({ kind: "progress", activity: "agent-start", estimated: false });
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+  pi.on("agent_end", (event) => {
+    latestMessages = (event as any).messages as any[] | undefined;
+    completionRecorder.record({ kind: "agent-ended" });
+    recorder.agentEndWaiting();
+  });
 
-    if (shouldExit) {
-      // Always signal autonomous completion through the sidecar before
-      // shutdown. Terminal sentinels are only a crash fallback: narrow or
-      // destroyed mux panes can make their screen contents unavailable.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify(
-              errorInfo
-                ? {
-                    type: "error",
-                    errorMessage: errorInfo.errorMessage,
-                    stopReason: errorInfo.stopReason,
-                  }
-                : { type: "done" },
-            ),
-          );
-        } catch {
-          // Best effort — the watcher still has terminal-sentinel and
-          // session-file fallbacks.
-        }
-      }
-
-      recorder.agentEndDone();
-      ctx.shutdown();
+  pi.on("agent_settled", (_event, ctx) => {
+    completionRecorder.record({ kind: "agent-settled" });
+    if (explicitCompletionRequested || !autoExit || !shouldAutoExitOnAgentEnd(userTookOver, latestMessages)) {
       return;
     }
 
-    recorder.agentEndWaiting();
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
-      userTookOver = false;
+    const errorInfo = findLatestAssistantError(latestMessages);
+    explicitCompletionRequested = true;
+    if (errorInfo) {
+      completionRecorder.record(
+        { kind: "completion-requested", reason: "agent-error" },
+        { kind: "error", ...errorInfo },
+      );
+    } else {
+      completionRecorder.record({ kind: "completion-requested", reason: "auto-exit" }, { kind: "done" });
     }
+    recorder.agentEndDone();
+    ctx.shutdown();
   });
 
   pi.on("turn_start", (event) => {
@@ -255,7 +246,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
-    recorder.sessionShutdown((event as any).reason);
+    const reason = (event as any).reason;
+    completionRecorder.record({ kind: "session-shutdown", reason });
+    recorder.sessionShutdown(reason);
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -278,22 +271,14 @@ export default function (pi: ExtensionAPI) {
       message: Type.String({ description: "What you need help with" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (!sessionFile) {
-        throw new Error(
-          "caller_ping is only available in subagent contexts. " +
-            "PI_SUBAGENT_SESSION environment variable is not set.",
-        );
-      }
-
-      recorder.callerPing();
-      const exitData = {
-        type: "ping" as const,
+      const payload = {
+        kind: "ping" as const,
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
-
+      completionRecorder.record({ kind: "completion-requested", reason: "ping" }, payload);
+      explicitCompletionRequested = true;
+      recorder.callerPing();
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
@@ -311,11 +296,9 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      completionRecorder.record({ kind: "completion-requested", reason: "done" }, { kind: "done" });
+      explicitCompletionRequested = true;
       recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-      }
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
