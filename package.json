@@ -27,8 +27,11 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.0",
-    "@earendil-works/pi-tui": "^0.80.0",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
     "@sinclair/typebox": "^0.34.49"
+  },
+  "dependencies": {
+    "pi-agent-execution": "github:Attamusc/pi-agent-execution#7ee1beec0aae202d12628149a3c646123a2ee25d"
   }
 }

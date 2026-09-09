@@ -89,6 +89,8 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
+Definition parsing and effective model, thinking, tools, skills, system-prompt, and cwd resolution use the pinned `pi-agent-execution` contract. Discovery order and visible-only settings (`deny-tools`, spawning, auto-exit, interactive, session mode, and CLI selection) remain owned by this package. Its declared host profile is `visibleHerdrCapabilities`: persistent Pi sessions, activity snapshots, turn-level Escape, pane termination, session resume/fork, and user takeover, with no runtime timeout operation.
+
 ---
 
 ## Async Subagent Flow

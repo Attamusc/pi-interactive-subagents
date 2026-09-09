@@ -1,6 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
+import {
+  parseAgentDefinition as parseSharedAgentDefinition,
+  resolveAgentLaunchIntent,
+  visibleHerdrCapabilities,
+  type AgentLaunchIntent,
+  type NormalizedAgentDefinition,
+  type ThinkingLevel,
+} from "pi-agent-execution";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -150,6 +158,7 @@ const SubagentParams = Type.Object({
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
+  definition?: NormalizedAgentDefinition;
   model?: string;
   tools?: string;
   skills?: string;
@@ -223,53 +232,49 @@ function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
 }
 
-function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : undefined;
+function metadataString(metadata: Readonly<Record<string, unknown>>, key: string): string | undefined {
+  const value = metadata[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-  return value != null ? value === "true" : undefined;
+function metadataBoolean(metadata: Readonly<Record<string, unknown>>, key: string): boolean | undefined {
+  const value = metadata[key];
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
-  if (value === "standalone" || value === "lineage-only" || value === "fork") {
-    return value;
-  }
-  return undefined;
+  return value === "standalone" || value === "lineage-only" || value === "fork" ? value : undefined;
 }
 
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
+function parseVisibleAgentDefinition(path: string, content: string): AgentDefinition | null {
+  const parsed = parseSharedAgentDefinition(
+    { path, content },
+    { fallbackName: path.split("/").pop()?.replace(/\.md$/, ""), requiredFields: [] },
+  );
+  if (!parsed.ok) return null;
 
-  const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
-
+  const { definition } = parsed;
+  const metadata = definition.metadata;
+  const explicitPromptMode = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1]
+    .match(/^system-prompt:\s*(append|replace)\s*$/m)?.[1] as "append" | "replace" | undefined;
   return {
-    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
-    description: getFrontmatterValue(frontmatter, "description"),
-    model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
-    systemPromptMode:
-      systemPromptMode === "replace"
-        ? "replace"
-        : systemPromptMode === "append"
-          ? "append"
-          : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
-    autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
-    interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
-    sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
-    cwd: getFrontmatterValue(frontmatter, "cwd"),
-    cli: getFrontmatterValue(frontmatter, "cli"),
-    body: body || undefined,
-    disableModelInvocation:
-      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+    definition,
+    name: definition.name,
+    description: definition.description,
+    model: definition.model,
+    tools: definition.tools?.join(","),
+    systemPromptMode: explicitPromptMode,
+    skills: definition.skills?.join(","),
+    thinking: definition.thinking,
+    denyTools: metadataString(metadata, "deny-tools"),
+    spawning: metadataBoolean(metadata, "spawning"),
+    autoExit: metadataBoolean(metadata, "auto-exit"),
+    interactive: metadataBoolean(metadata, "interactive"),
+    sessionMode: parseSessionMode(metadataString(metadata, "session-mode")),
+    cwd: definition.cwd,
+    cli: metadataString(metadata, "cli"),
+    body: definition.systemPrompt?.text || undefined,
+    disableModelInvocation: metadataBoolean(metadata, "disable-model-invocation") ?? false,
   };
 }
 
@@ -284,10 +289,8 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      const parsed = parseAgentDefinition(
-        readFileSync(join(dir, file), "utf8"),
-        file.replace(/\.md$/, ""),
-      );
+      const definitionPath = join(dir, file);
+      const parsed = parseVisibleAgentDefinition(definitionPath, readFileSync(definitionPath, "utf8"));
       if (!parsed) continue;
       agents.set(parsed.name, { ...parsed, source });
     }
@@ -300,15 +303,40 @@ function normalizeOptionalString(value?: string): string | undefined {
   return value?.trim() || undefined;
 }
 
+function resolveVisibleLaunchIntent(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  callerCwd: string,
+): AgentLaunchIntent {
+  const definition = agentDefs?.definition ?? {
+    name: params.agent ?? params.name,
+    ...(normalizeOptionalString(agentDefs?.model) ? { model: normalizeOptionalString(agentDefs?.model) } : {}),
+    ...(normalizeOptionalString(agentDefs?.thinking) ? { thinking: normalizeOptionalString(agentDefs?.thinking) as ThinkingLevel } : {}),
+    ...(normalizeOptionalString(agentDefs?.tools) ? { tools: normalizeOptionalString(agentDefs?.tools)!.split(",").map((entry) => entry.trim()).filter(Boolean) } : {}),
+    ...(normalizeOptionalString(agentDefs?.skills) ? { skills: normalizeOptionalString(agentDefs?.skills)!.split(",").map((entry) => entry.trim()).filter(Boolean) } : {}),
+    ...(normalizeOptionalString(agentDefs?.cwd) ? { cwd: normalizeOptionalString(agentDefs?.cwd) } : {}),
+    metadata: {},
+  };
+  const list = (value: string | undefined): readonly string[] | undefined =>
+    normalizeOptionalString(value)?.split(",").map((entry) => entry.trim()).filter(Boolean);
+  return resolveAgentLaunchIntent(definition, params.task, callerCwd, {
+    model: normalizeOptionalString(params.model),
+    tools: list(params.tools),
+    skills: list(params.skills),
+    cwd: normalizeOptionalString(params.cwd),
+  });
+}
+
 function resolveAgentStringOverrides(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): { model?: string; tools?: string; skills?: string; cwd?: string } {
+  const intent = resolveVisibleLaunchIntent(params, agentDefs, process.cwd());
   return {
-    model: normalizeOptionalString(params.model) ?? normalizeOptionalString(agentDefs?.model),
-    tools: normalizeOptionalString(params.tools) ?? normalizeOptionalString(agentDefs?.tools),
-    skills: normalizeOptionalString(params.skills) ?? normalizeOptionalString(agentDefs?.skills),
-    cwd: normalizeOptionalString(params.cwd) ?? normalizeOptionalString(agentDefs?.cwd),
+    model: intent.effective.model,
+    tools: intent.effective.tools?.join(","),
+    skills: intent.effective.skills?.join(","),
+    cwd: intent.cwd === process.cwd() ? undefined : intent.cwd,
   };
 }
 
@@ -402,7 +430,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
 
   for (const p of paths) {
     if (!existsSync(p)) continue;
-    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
+    const parsed = parseVisibleAgentDefinition(p, readFileSync(p, "utf8"));
     if (parsed) return parsed;
   }
 
@@ -1177,6 +1205,9 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   resolveAgentStringOverrides,
+  resolveVisibleLaunchIntent,
+  parseVisibleAgentDefinition,
+  visibleHerdrCapabilities,
   buildSubagentToolAllowlist,
   buildPiModelArgs,
   buildPiPromptArgs,
@@ -1221,12 +1252,11 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const {
-    model: effectiveModel,
-    tools: effectiveTools,
-    skills: effectiveSkills,
-  } = resolveAgentStringOverrides(params, agentDefs);
-  const effectiveThinking = agentDefs?.thinking;
+  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
+  const effectiveModel = launchIntent.effective.model;
+  const effectiveTools = launchIntent.effective.tools?.join(",");
+  const effectiveSkills = launchIntent.effective.skills?.join(",");
+  const effectiveThinking = launchIntent.effective.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { contractVersion, visibleHerdrCapabilities } from "pi-agent-execution";
 
 import {
   getLeafId,
@@ -915,6 +916,36 @@ describe("status.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+
+  it("pins the supported shared execution contract and visible capability profile", () => {
+    assert.equal(contractVersion, 1);
+    assert.deepEqual(testApi.visibleHerdrCapabilities, visibleHerdrCapabilities);
+  });
+
+  it("parses and resolves a golden visible launch through production seams", () => {
+    const parsed = testApi.parseVisibleAgentDefinition(
+      "/tmp/fallback-worker.md",
+      `---\nmodel: github-copilot/gpt-5.6-sol\nthinking: high\ntools: read, bash\nskills: tdd, commit\ncwd: workers/core\nauto-exit: true\nsession-mode: lineage-only\n---\n\nYou are the worker.`,
+    );
+    assert.ok(parsed);
+    assert.equal(parsed.name, "fallback-worker");
+    assert.equal(parsed.autoExit, true);
+    assert.equal(parsed.sessionMode, "lineage-only");
+
+    const intent = testApi.resolveVisibleLaunchIntent(
+      { name: "Worker", task: "Implement it", model: " ", tools: "", skills: " review " },
+      parsed,
+      "/caller",
+    );
+    assert.deepEqual(intent.effective, {
+      model: "github-copilot/gpt-5.6-sol",
+      thinking: "high",
+      tools: ["read", "bash"],
+      skills: ["review"],
+      systemPrompt: { mode: "append", text: "You are the worker." },
+    });
+    assert.equal(intent.cwd, "workers/core");
+  });
 
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
