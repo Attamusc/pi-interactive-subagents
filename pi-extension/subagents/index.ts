@@ -61,6 +61,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { buildVisibleCompletionPaths, buildVisibleWrapperCommand } from "./completion.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -459,6 +460,11 @@ function formatElapsed(seconds: number): string {
  * (for example direnv/devenv), so the delay is configurable for users who hit
  * dropped commands. Keep the historical default at 500ms.
  */
+function countNonemptyLines(file: string): number {
+  if (!existsSync(file)) return 0;
+  return readFileSync(file, "utf8").split("\n").filter((line) => line.trim()).length;
+}
+
 function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
@@ -578,12 +584,19 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   id: string;
+  runId: string;
   name: string;
   task: string;
   agent?: string;
   surface: string;
   startTime: number;
   sessionFile: string;
+  /** Exact Pi transcript identity; unlike a host pane reference, this is resumable. */
+  piSessionRef?: string;
+  runtimeModel?: string;
+  transcriptStartLine: number;
+  childSnapshotFile?: string;
+  wrapperExitFile?: string;
   launchScriptFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
@@ -1307,6 +1320,7 @@ async function launchSubagent(
       childCwd: targetCwdForSession,
     });
   }
+  const transcriptStartLine = countNonemptyLines(subagentSessionFile);
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
@@ -1379,12 +1393,14 @@ async function launchSubagent(
 
     const running: RunningSubagent = {
       id,
+      runId: id,
       name: params.name,
       task: params.task,
       agent: params.agent,
       surface,
       startTime,
       sessionFile: subagentSessionFile,
+      transcriptStartLine,
       launchScriptFile,
       cli: "claude",
       sentinelFile,
@@ -1453,8 +1469,10 @@ async function launchSubagent(
   if (agentDefs?.autoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
+  const completionPaths = buildVisibleCompletionPaths(artifactDir, id);
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
@@ -1494,7 +1512,11 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = buildVisibleWrapperCommand({
+    piCommand,
+    runId: id,
+    wrapperExitFile: completionPaths.wrapperExit,
+  });
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1514,12 +1536,18 @@ async function launchSubagent(
 
   const running: RunningSubagent = {
     id,
+    runId: id,
     name: params.name,
     task: params.task,
     agent: params.agent,
     surface,
     startTime,
     sessionFile: subagentSessionFile,
+    piSessionRef: subagentSessionFile,
+    runtimeModel: effectiveModel,
+    transcriptStartLine,
+    childSnapshotFile: completionPaths.childSnapshot,
+    wrapperExitFile: completionPaths.wrapperExit,
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
@@ -2215,8 +2243,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        // Record the raw nonempty-line offset before resuming so extraction only
+        // sees transcript entries appended by this run.
+        const transcriptStartLine = countNonemptyLines(params.sessionPath);
 
         const surface = await createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -2231,6 +2260,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
+        const completionPaths = buildVisibleCompletionPaths(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
@@ -2259,13 +2289,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = buildVisibleWrapperCommand({
+          piCommand: resumeEnvPrefix + parts.join(" "),
+          runId: id,
+          wrapperExitFile: completionPaths.wrapperExit,
+        });
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2290,11 +2325,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
+          runId: id,
           name,
           task: params.message ?? "resumed session",
           surface,
           startTime,
           sessionFile: params.sessionPath,
+          piSessionRef: params.sessionPath,
+          transcriptStartLine,
+          childSnapshotFile: completionPaths.childSnapshot,
+          wrapperExitFile: completionPaths.wrapperExit,
           launchScriptFile,
           activityFile,
           interactive,
@@ -2343,7 +2383,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            const allEntries = getNewEntries(params.sessionPath, transcriptStartLine);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
