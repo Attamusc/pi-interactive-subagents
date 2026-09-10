@@ -293,6 +293,9 @@ it("interrupts then terminates one real held Herdr child through registered tool
     assert.equal(delivered.length, 1);
     assert.equal(delivered[0].details.name, "ControlledChild");
     assert.notEqual(delivered[0].details.exitCode, 0);
+    assert.equal(delivered[0].details.error, "terminated");
+    assert.match(delivered[0].content, /terminated by parent request/i);
+    assert.doesNotMatch(delivered[0].content, /provider\/agent error|auto-retry exhausted/i);
     const terminateReceipt = lines(parentSessionFile).find(entry => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolName === "subagent_terminate");
     assert.equal(terminateReceipt?.message.details?.name, "ControlledChild");
     assert.ok(["termination_requested_unconfirmed", "terminated"].includes(terminateReceipt?.message.details?.status));
@@ -400,6 +403,9 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
       return results.length === 1 && results[0].details.name === "SiblingA" ? results[0] : undefined;
     });
     assert.notEqual(aResult.details.exitCode, 0);
+    assert.equal(aResult.details.error, "terminated");
+    assert.match(aResult.content, /terminated by parent request/i);
+    assert.doesNotMatch(aResult.content, /provider\/agent error|auto-retry exhausted/i);
     const aSnapshotPath = await waitFor("sibling A snapshot", () => findOne(sessions, `${aHeld.subagentId}.child.json`));
     const aWrapperPath = aSnapshotPath.replace(/\.child\.json$/, ".wrapper.json");
     if (existsSync(aWrapperPath)) {

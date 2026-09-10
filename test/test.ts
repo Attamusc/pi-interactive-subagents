@@ -890,6 +890,7 @@ describe("status.ts", () => {
     assert.equal(advanced.transition, null);
     assert.equal(line, "Worker running 7s, finishing.");
     assert.equal(aggregate, "Subagent status:\n• Worker running 7s, finishing.");
+    assert.equal((subagentsModule as any).__test__.formatWidgetRightLabel(advanced.snapshot), " finishing 7s ");
     assert.doesNotMatch(line, /stalled/);
   });
 
@@ -1744,7 +1745,15 @@ describe("semantic Herdr blocked lifecycle", () => {
     writeFileSync(paths.wrapperExit, JSON.stringify({ version: 1, runId: "race", sourceId: "wrapper:race", sequence: 1, observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 } }));
     const result = await watcher;
     assert.equal(result.exitCode, 1);
+    assert.equal(result.error, "terminated");
     assert.match(result.summary, /terminated by parent/);
+    const presentation = testApi.resolveResultPresentation(
+      { ...result, errorMessage: "Operation aborted" },
+      "Worker",
+    );
+    assert.match(presentation, /terminated by parent request/);
+    assert.match(presentation, /Diagnostic: Operation aborted/);
+    assert.doesNotMatch(presentation, /provider\/agent error|auto-retry exhausted/);
     assert.equal(testApi.runningSubagents.has("race"), false);
     assert.equal(watcherCloses, 0);
     acceptClose();
@@ -1800,6 +1809,13 @@ describe("semantic Herdr blocked lifecycle", () => {
     const result = await watcher;
     assert.deepEqual(closed, ["pane-1"]);
     assert.equal(result.error, "cancelled");
+    const presentation = testApi.resolveResultPresentation(
+      { ...result, errorMessage: "Operation aborted" },
+      "Worker",
+    );
+    assert.match(presentation, /cancelled by parent session/);
+    assert.match(presentation, /Diagnostic: Operation aborted/);
+    assert.doesNotMatch(presentation, /provider\/agent error|auto-retry exhausted/);
     assert.equal(completionState.core.process.status, "not-started");
     assert.equal(testApi.runningSubagents.has("cancel"), false);
     rmSync(dir, { recursive: true, force: true });
@@ -2693,7 +2709,8 @@ describe("subagent interruption", () => {
     );
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
-    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);

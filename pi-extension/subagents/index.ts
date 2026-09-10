@@ -39,7 +39,6 @@ import {
 } from "./cmux.ts";
 
 import {
-  findLastAssistantMessage,
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
@@ -518,6 +517,7 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
     const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
     return ` waiting${duration}${detail} `;
   }
+  if (snapshot.kind === "finishing") return ` finishing ${snapshot.elapsedText} `;
 
   const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
   const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
@@ -532,6 +532,7 @@ function resolveResultPresentation(
     | "summary"
     | "sessionFile"
     | "sessionFileExists"
+    | "error"
     | "errorMessage"
   >,
   name: string,
@@ -542,14 +543,18 @@ function resolveResultPresentation(
       : `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
 
+  if (result.error === "terminated" || result.error === "cancelled") {
+    const cause = result.error === "terminated"
+      ? "terminated by parent request"
+      : "cancelled by parent session";
+    const diagnostic = result.errorMessage ? `\n\nDiagnostic: ${result.errorMessage}` : "";
+    return `Sub-agent "${name}" was ${cause}.\n\n${result.summary}${diagnostic}${sessionRef}`;
+  }
+
   if (result.errorMessage) {
-    // Auto-retry exhausted or other agent-loop error. The subagent did not
-    // produce a usable result — surface the underlying provider/network
-    // failure so the orchestrator can decide whether to retry, resume, or
-    // change approach instead of silently treating the run as completed.
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `(provider/agent error).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_resume.${sessionRef}`
@@ -1716,16 +1721,20 @@ async function watchSubagent(
     const observed = result as Awaited<ReturnType<typeof waitForVisibleCompletion>>;
     const completion = observed.completion;
     const exitCode = completionExitCode(completion);
-    const summary = completion.output || (completion.errorMessage
-      ? `Subagent error: ${completion.errorMessage}`
-      : completion.execution === "terminated" ? "Subagent terminated by parent request."
-      : completion.execution === "aborted" ? "Subagent process was aborted."
-      : exitCode !== 0 ? "Sub-agent exited abnormally" : "Sub-agent exited without new output");
+    const controlError = completion.execution === "terminated" ? "terminated"
+      : completion.execution === "aborted" ? "cancelled"
+      : undefined;
+    const summary = controlError === "terminated" ? "Subagent terminated by parent request."
+      : controlError === "cancelled" ? "Subagent cancelled by parent session."
+      : completion.output || (completion.errorMessage
+        ? `Subagent error: ${completion.errorMessage}`
+        : exitCode !== 0 ? "Sub-agent exited abnormally" : "Sub-agent exited without new output");
     if (!running.terminationRequestState) await close(surface);
 
     return {
       name, task, summary, sessionFile, exitCode, elapsed,
       ping: observed.payload?.kind === "ping" ? { name: observed.payload.name, message: observed.payload.message } : undefined,
+      ...(controlError ? { error: controlError } : {}),
       ...(completion.errorMessage ? { errorMessage: completion.errorMessage } : {}),
     };
   } catch (err: any) {
