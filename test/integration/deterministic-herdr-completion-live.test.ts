@@ -293,7 +293,7 @@ it("interrupts then terminates one real held Herdr child through registered tool
     assert.notEqual(delivered[0].details.exitCode, 0);
     const terminateReceipt = lines(parentSessionFile).find(entry => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolName === "subagent_terminate");
     assert.equal(terminateReceipt?.message.details?.name, "ControlledChild");
-    assert.ok(["termination_requested", "terminated"].includes(terminateReceipt?.message.details?.status));
+    assert.ok(["termination_requested_unconfirmed", "terminated"].includes(terminateReceipt?.message.details?.status));
     assert.equal(alive(childPid), false, "result must be observed after process exit");
     assert.equal(lines(parentSessionFile).some(entry => entry.type === "custom_message" && entry.customType === "subagent_result"), true);
     await waitFor("child pane removal and parent unblock", () => {
@@ -316,6 +316,142 @@ it("interrupts then terminates one real held Herdr child through registered tool
     if (parentPid) await waitFor("owned parent PID exit", () => !alive(parentPid!) ? true : undefined, 10_000);
     if (childPid) await waitFor("owned child PID exit", () => !alive(childPid!) ? true : undefined, 10_000);
     writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ workspaceGone: workspaceId ? workspaceIsGone(workspaceId) : true, parentGone: parentPid ? !alive(parentPid) : null, childGone: childPid ? !alive(childPid) : null }, null, 2)}\n`);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+
+it("keeps sibling ownership through termination, auto-exit, and resume", { skip: !enabled, timeout: 120_000 }, async (t) => {
+  assert.equal(process.env.HERDR_ENV, "1");
+  assert.equal(execFileSync(exactPi, ["--version"], { encoding: "utf8" }).trim(), "0.85.1");
+  const temp = mkdtempSync(join(tmpdir(), "pi-herdr-siblings-"));
+  const agentDir = join(temp, "agent");
+  const sessions = join(temp, "sessions");
+  const events = join(temp, "events.jsonl");
+  const versions = join(temp, "versions.jsonl");
+  const siblingRelease = join(temp, "release-b");
+  const evidenceBase = process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir();
+  mkdirSync(evidenceBase, { recursive: true });
+  const forensicDir = mkdtempSync(join(evidenceBase, "pi-herdr-siblings-evidence-"));
+  t.diagnostic(`Herdr sibling evidence: ${forensicDir}`);
+  let workspaceId: string | undefined;
+  let rootPane: string | undefined;
+  let parentPid: number | undefined;
+  const childPids: number[] = [];
+  let parentSessionFile: string | undefined;
+  let completed = false;
+  try {
+    for (const dir of ["agents", "extensions", "packages", "models"]) mkdirSync(join(agentDir, dir), { recursive: true });
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(agentDir, "settings.json"), "{\"packages\":[]}\n");
+    writeFileSync(join(agentDir, "models.json"), "{\"providers\":{}}\n");
+    writeFileSync(join(agentDir, "extensions", "deterministic-herdr-provider.ts"), readFileSync(providerExtension, "utf8"));
+    writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: join(temp, "unused-gate"), releaseFile: join(temp, "unused-release"), versionsFile: versions, siblingReleaseFile: siblingRelease, scenario: "siblings" }, null, 2)}\n`);
+    writeFileSync(join(agentDir, "agents", "deterministic-held-child.md"), `---\nname: deterministic-held-child\ndescription: held sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: false\ndisable-model-invocation: true\n---\nHold until terminated.\n`);
+    writeFileSync(join(agentDir, "agents", "deterministic-auto-child.md"), `---\nname: deterministic-auto-child\ndescription: auto-exit sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: true\ndisable-model-invocation: true\n---\nHold until released, then finish.\n`);
+    const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST deterministic-siblings ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
+    workspaceId = created.workspace.workspace_id;
+    rootPane = created.root_pane.pane_id;
+    const command = [
+      "env -u PI_SUBAGENT_ID -u PI_SUBAGENT_SESSION -u PI_SUBAGENT_COMPLETION_FILE -u PI_SUBAGENT_ACTIVITY_FILE -u PI_SUBAGENT_NAME -u PI_SUBAGENT_AGENT -u PI_SUBAGENT_SURFACE",
+      `${JSON.stringify(exactPi)} -ne`, `-e ${JSON.stringify(sourceExtension)}`, `-e ${JSON.stringify(managedHerdr)}`, `-e ${JSON.stringify(providerExtension)}`,
+      "--offline --provider deterministic-herdr --model probe", `--session-dir ${JSON.stringify(sessions)}`,
+      "--no-builtin-tools --tools subagent,subagent_interrupt,subagent_terminate,subagent_resume --no-skills --no-prompt-templates --no-context-files --no-themes",
+      JSON.stringify("Launch both deterministic siblings and wait."),
+    ].join(" ");
+    herdr(["pane", "run", rootPane, command]);
+
+    const held = await waitFor("both held siblings", () => {
+      const rows = lines(events).filter(event => event.event === "child_stream_held");
+      return rows.length === 2 ? rows : undefined;
+    }, 30_000);
+    const aHeld = held.find((event: any) => event.subagentName === "SiblingA");
+    const bHeld = held.find((event: any) => event.subagentName === "SiblingB");
+    assert.ok(aHeld && bHeld);
+    childPids.push(aHeld.pid, bHeld.pid);
+    const parentStart = lines(events).find(event => event.event === "session_start" && event.subagentId === null);
+    assert.ok(parentStart?.sessionFile);
+    parentPid = parentStart.pid;
+    parentSessionFile = parentStart.sessionFile;
+    const spawnReceipts = lines(parentSessionFile).filter(entry => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolName === "subagent");
+    assert.equal(spawnReceipts.length, 2);
+    const aSpawn = spawnReceipts.find(entry => entry.message.details.name === "SiblingA");
+    const bSpawn = spawnReceipts.find(entry => entry.message.details.name === "SiblingB");
+    assert.ok(aSpawn && bSpawn);
+    assert.notEqual(aSpawn.message.details.id, bSpawn.message.details.id);
+    assert.notEqual(aSpawn.message.details.surface, bSpawn.message.details.surface);
+    assert.equal(herdr(["pane", "get", rootPane]).pane.agent_status, "blocked");
+
+    herdr(["pane", "send-text", rootPane, "fixture interrupt A"]);
+    herdr(["pane", "send-keys", rootPane, "enter"]);
+    await waitFor("sibling A abort", () => lines(events).find(event => event.event === "child_stream_aborted" && event.subagentName === "SiblingA"));
+    await waitFor("sibling A resumable session", () => existsSync(aSpawn.message.details.sessionFile) ? true : undefined);
+    assert.equal(alive(aHeld.pid), true);
+
+    herdr(["pane", "send-text", rootPane, "fixture terminate A"]);
+    herdr(["pane", "send-keys", rootPane, "enter"]);
+    await waitFor("sibling A exit", () => !alive(aHeld.pid) ? true : undefined);
+    const aResult = await waitFor("only sibling A result", () => {
+      const results = parentResults(parentSessionFile!);
+      return results.length === 1 && results[0].details.name === "SiblingA" ? results[0] : undefined;
+    });
+    assert.notEqual(aResult.details.exitCode, 0);
+    const aSnapshotPath = await waitFor("sibling A snapshot", () => findOne(sessions, `${aHeld.subagentId}.child.json`));
+    assert.equal(existsSync(aSnapshotPath.replace(/\.child\.json$/, ".wrapper.json")), false, "terminated run must not forge a wrapper exit");
+    assert.equal(alive(bHeld.pid), true);
+    const panesWithB = herdr(["pane", "list", "--workspace", workspaceId]).panes;
+    assert.equal(panesWithB.some((pane: any) => pane.pane_id === bSpawn.message.details.surface), true);
+    assert.equal(panesWithB.some((pane: any) => pane.pane_id === aSpawn.message.details.surface), false);
+    assert.equal(herdr(["pane", "get", rootPane]).pane.agent_status, "blocked");
+    const terminateReceipt = lines(parentSessionFile).find(entry => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolName === "subagent_terminate");
+    assert.ok(["termination_requested_unconfirmed", "terminated"].includes(terminateReceipt?.message.details?.status));
+
+    writeFileSync(siblingRelease, "release\n");
+    const bSettled = await waitFor("sibling B settlement", () => lines(events).find(event => event.event === "agent_settled" && event.subagentName === "SiblingB"));
+    const bSnapshotPath = await waitFor("sibling B snapshot", () => findOne(sessions, `${bHeld.subagentId}.child.json`));
+    const bWrapperPath = bSnapshotPath.replace(/\.child\.json$/, ".wrapper.json");
+    await waitFor("sibling B wrapper", () => existsSync(bWrapperPath) ? true : undefined);
+    await waitFor("sibling B result", () => parentResults(parentSessionFile!).some(result => result.details.name === "SiblingB") ? true : undefined);
+    const bSnapshot = JSON.parse(readFileSync(bSnapshotPath, "utf8"));
+    const settledFact = bSnapshot.latestFacts.find((fact: any) => fact.kind === "agent-settled");
+    const requestedFact = bSnapshot.latestFacts.find((fact: any) => fact.kind === "completion-requested" && fact.reason === "auto-exit");
+    assert.ok(settledFact.sequence < requestedFact.sequence);
+    assert.equal(JSON.parse(readFileSync(bWrapperPath, "utf8")).exit.shellStatus, 0);
+    await waitFor("parent unblock after final sibling", () => herdr(["pane", "get", rootPane!]).pane.agent_status !== "blocked" ? true : undefined);
+
+    herdr(["pane", "send-text", rootPane, "fixture resume A"]);
+    herdr(["pane", "send-keys", rootPane, "enter"]);
+    const resumeReceipt = await waitFor("resume tool result", () => lines(parentSessionFile!).find(entry => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolName === "subagent_resume"));
+    assert.equal(resumeReceipt.message.details.name, "ResumedA");
+    assert.equal(resumeReceipt.message.details.sessionPath, aSpawn.message.details.sessionFile);
+    assert.notEqual(resumeReceipt.message.details.id, aSpawn.message.details.id);
+    const resumedStart = await waitFor("resumed Pi start", () => lines(events).find(event => event.event === "session_start" && event.subagentName === "ResumedA"));
+    childPids.push(resumedStart.pid);
+    assert.notEqual(resumedStart.pid, aHeld.pid);
+    assert.equal(resumedStart.sessionFile, aSpawn.message.details.sessionFile);
+    const resumedResult = await waitFor("fresh resumed result", () => parentResults(parentSessionFile!).find(result => result.details.name === "ResumedA"));
+    assert.match(resumedResult.content, /RESUMED_A_FRESH_RESULT/);
+    assert.doesNotMatch(resumedResult.content, /Request was aborted|PARENT_LAUNCHING_CHILD/);
+    const resumedSnapshot = await waitFor("resumed child snapshot", () => findOne(sessions, `${resumeReceipt.message.details.id}.child.json`));
+    assert.notEqual(resumedSnapshot, aSnapshotPath, "resume must own a fresh sidecar path");
+    assert.notEqual(resumedSnapshot, bSnapshotPath);
+    assert.equal(existsSync(resumedSnapshot.replace(/\.child\.json$/, ".wrapper.json")), true);
+    assert.equal(parentResults(parentSessionFile).filter(result => result.details.name === "ResumedA").length, 1);
+    assert.equal(parentResults(parentSessionFile).length, 3);
+    const versionRows = await waitFor("all sibling Pi versions", () => lines(versions).length >= 4 ? lines(versions) : undefined);
+    assert.equal(versionRows.length, 4);
+    assert.equal(versionRows.every((row: any) => row.version === "0.85.1"), true);
+    completed = true;
+  } finally {
+    if (existsSync(temp)) cpSync(temp, join(forensicDir, "run"), { recursive: true });
+    writeFileSync(join(forensicDir, "result.json"), `${JSON.stringify({ completed, recordedAt: new Date().toISOString(), workspaceId, rootPane, parentPid, childPids, workingTemp: temp }, null, 2)}\n`);
+    if (workspaceId) {
+      herdr(["workspace", "close", workspaceId]);
+      await waitFor("owned workspace cleanup", () => workspaceIsGone(workspaceId!) ? true : undefined, 10_000);
+    }
+    if (parentPid) await waitFor("owned parent PID exit", () => !alive(parentPid!) ? true : undefined, 10_000);
+    for (const pid of childPids) await waitFor(`owned child PID ${pid} exit`, () => !alive(pid) ? true : undefined, 10_000);
+    writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ workspaceGone: workspaceId ? workspaceIsGone(workspaceId) : true, parentGone: parentPid ? !alive(parentPid) : null, childrenGone: childPids.map(pid => ({ pid, gone: !alive(pid) })) }, null, 2)}\n`);
     rmSync(temp, { recursive: true, force: true });
   }
 });
