@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
@@ -14,6 +14,7 @@ function createHarness(options: { autoExit?: boolean } = {}) {
   const previous = { ...process.env };
   process.env.PI_SUBAGENT_ID = runId;
   process.env.PI_SUBAGENT_COMPLETION_FILE = snapshotFile;
+  process.env.PI_SUBAGENT_ACTIVITY_FILE = join(dir, "activity.json");
   process.env.PI_SUBAGENT_SESSION = sessionFile;
   process.env.PI_SUBAGENT_NAME = "subagent";
   process.env.PI_SUBAGENT_AUTO_EXIT = options.autoExit ? "1" : "0";
@@ -37,7 +38,14 @@ function createHarness(options: { autoExit?: boolean } = {}) {
       if (!result.ok) throw new Error(result.reason);
       return result.value;
     },
-    cleanup() { process.env = previous; rmSync(dir, { recursive: true, force: true }); },
+    cleanup() {
+      try {
+        handlers.get("session_shutdown")!({ reason: "quit" }, ctx);
+      } finally {
+        process.env = previous;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
   };
 }
 
@@ -50,6 +58,25 @@ function assistant(stopReason: string, errorMessage?: string) {
 }
 
 describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
+  it("does not write to an inherited worker activity file", () => {
+    const ambientDir = mkdtempSync(join(tmpdir(), "ambient-worker-"));
+    const ambientFile = join(ambientDir, "activity.json");
+    const originalActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+    const sentinel = '{"owner":"real-worker"}';
+    writeFileSync(ambientFile, sentinel);
+    process.env.PI_SUBAGENT_ACTIVITY_FILE = ambientFile;
+    const h = createHarness();
+    try {
+      h.handlers.get("agent_start")!({}, h.ctx);
+      assert.equal(readFileSync(ambientFile, "utf8"), sentinel);
+    } finally {
+      h.handlers.get("session_shutdown")!({ reason: "quit" }, h.ctx);
+      h.cleanup();
+      if (originalActivityFile === undefined) delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+      else process.env.PI_SUBAGENT_ACTIVITY_FILE = originalActivityFile;
+      rmSync(ambientDir, { recursive: true, force: true });
+    }
+  });
   it("requires launcher-owned identity, snapshot, and session inputs", () => {
     const previous = { ...process.env };
     delete process.env.PI_SUBAGENT_ID;
