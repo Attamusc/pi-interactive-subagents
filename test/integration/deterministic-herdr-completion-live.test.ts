@@ -63,7 +63,9 @@ function workspaceIsGone(workspaceId: string): boolean {
   try { herdr(["workspace", "get", workspaceId]); return false; }
   catch (error) {
     const stderr = String((error as { stderr?: unknown }).stderr ?? "");
-    if (stderr.includes('"code":"workspace_not_found"')) return true;
+    let response: { error?: { code?: string } };
+    try { response = JSON.parse(stderr); } catch { throw error; }
+    if (response.error?.code === "workspace_not_found") return true;
     throw error;
   }
 }
@@ -348,7 +350,7 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     writeFileSync(join(agentDir, "extensions", "deterministic-herdr-provider.ts"), readFileSync(providerExtension, "utf8"));
     writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: join(temp, "unused-gate"), releaseFile: join(temp, "unused-release"), versionsFile: versions, siblingReleaseFile: siblingRelease, scenario: "siblings" }, null, 2)}\n`);
     writeFileSync(join(agentDir, "agents", "deterministic-held-child.md"), `---\nname: deterministic-held-child\ndescription: held sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: false\ndisable-model-invocation: true\n---\nHold until terminated.\n`);
-    writeFileSync(join(agentDir, "agents", "deterministic-auto-child.md"), `---\nname: deterministic-auto-child\ndescription: auto-exit sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: true\ndisable-model-invocation: true\n---\nHold until released, then finish.\n`);
+    writeFileSync(join(agentDir, "agents", "deterministic-auto-child.md"), `---\nname: deterministic-auto-child\ndescription: auto-exit sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: true\nsession-mode: fork\ndisable-model-invocation: true\n---\nHold until released, then finish.\n`);
     const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST deterministic-siblings ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
     workspaceId = created.workspace.workspace_id;
     rootPane = created.root_pane.pane_id;
@@ -380,6 +382,8 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     assert.ok(aSpawn && bSpawn);
     assert.notEqual(aSpawn.message.details.id, bSpawn.message.details.id);
     assert.notEqual(aSpawn.message.details.surface, bSpawn.message.details.surface);
+    assert.notEqual(aSpawn.message.details.sessionFile, bSpawn.message.details.sessionFile);
+    assert.equal(lines(bSpawn.message.details.sessionFile)[0].parentSession, parentSessionFile);
     assert.equal(herdr(["pane", "get", rootPane]).pane.agent_status, "blocked");
 
     herdr(["pane", "send-text", rootPane, "fixture interrupt A"]);
@@ -397,7 +401,16 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     });
     assert.notEqual(aResult.details.exitCode, 0);
     const aSnapshotPath = await waitFor("sibling A snapshot", () => findOne(sessions, `${aHeld.subagentId}.child.json`));
-    assert.equal(existsSync(aSnapshotPath.replace(/\.child\.json$/, ".wrapper.json")), false, "terminated run must not forge a wrapper exit");
+    const aWrapperPath = aSnapshotPath.replace(/\.child\.json$/, ".wrapper.json");
+    if (existsSync(aWrapperPath)) {
+      // A graceful return may let the wrapper finish before Herdr closes it.
+      const aWrapper = JSON.parse(readFileSync(aWrapperPath, "utf8"));
+      assert.equal(aWrapper.runId, aHeld.subagentId);
+      assert.equal(aWrapper.sourceId, `wrapper:${aHeld.subagentId}`);
+      assert.deepEqual(Object.keys(aWrapper.exit).sort(), ["kind", "shellStatus"]);
+      assert.equal(aWrapper.exit.kind, "shell");
+      assert.ok(Number.isInteger(aWrapper.exit.shellStatus) && aWrapper.exit.shellStatus >= 0 && aWrapper.exit.shellStatus <= 255);
+    }
     assert.equal(alive(bHeld.pid), true);
     const panesWithB = herdr(["pane", "list", "--workspace", workspaceId]).panes;
     assert.equal(panesWithB.some((pane: any) => pane.pane_id === bSpawn.message.details.surface), true);
@@ -417,6 +430,11 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     const requestedFact = bSnapshot.latestFacts.find((fact: any) => fact.kind === "completion-requested" && fact.reason === "auto-exit");
     assert.ok(settledFact.sequence < requestedFact.sequence);
     assert.equal(JSON.parse(readFileSync(bWrapperPath, "utf8")).exit.shellStatus, 0);
+    const bResults = parentResults(parentSessionFile).filter(result => result.details.name === "SiblingB");
+    assert.equal(bResults.length, 1);
+    assert.equal(bResults[0].details.exitCode, 0);
+    assert.equal(bResults[0].details.sessionFile, bSpawn.message.details.sessionFile);
+    assert.match(bResults[0].content, /SIBLING_B_RELEASED/);
     await waitFor("parent unblock after final sibling", () => herdr(["pane", "get", rootPane!]).pane.agent_status !== "blocked" ? true : undefined);
 
     herdr(["pane", "send-text", rootPane, "fixture resume A"]);
@@ -430,12 +448,19 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     assert.notEqual(resumedStart.pid, aHeld.pid);
     assert.equal(resumedStart.sessionFile, aSpawn.message.details.sessionFile);
     const resumedResult = await waitFor("fresh resumed result", () => parentResults(parentSessionFile!).find(result => result.details.name === "ResumedA"));
+    assert.equal(resumedResult.details.exitCode, 0);
+    assert.equal(resumedResult.details.sessionFile, aSpawn.message.details.sessionFile);
     assert.match(resumedResult.content, /RESUMED_A_FRESH_RESULT/);
     assert.doesNotMatch(resumedResult.content, /Request was aborted|PARENT_LAUNCHING_CHILD/);
     const resumedSnapshot = await waitFor("resumed child snapshot", () => findOne(sessions, `${resumeReceipt.message.details.id}.child.json`));
     assert.notEqual(resumedSnapshot, aSnapshotPath, "resume must own a fresh sidecar path");
     assert.notEqual(resumedSnapshot, bSnapshotPath);
-    assert.equal(existsSync(resumedSnapshot.replace(/\.child\.json$/, ".wrapper.json")), true);
+    assert.equal(JSON.parse(readFileSync(resumedSnapshot.replace(/\.child\.json$/, ".wrapper.json"), "utf8")).exit.shellStatus, 0);
+    await waitFor("resumed child exit and parent unblock", () => {
+      const panes = herdr(["pane", "list", "--workspace", workspaceId!]).panes;
+      const status = herdr(["pane", "get", rootPane!]).pane.agent_status;
+      return !alive(resumedStart.pid) && panes.length === 1 && status !== "blocked" ? true : undefined;
+    });
     assert.equal(parentResults(parentSessionFile).filter(result => result.details.name === "ResumedA").length, 1);
     assert.equal(parentResults(parentSessionFile).length, 3);
     const versionRows = await waitFor("all sibling Pi versions", () => lines(versions).length >= 4 ? lines(versions) : undefined);
