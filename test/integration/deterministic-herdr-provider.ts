@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 const agentDir = process.env.PI_CODING_AGENT_DIR;
 if (!agentDir) throw new Error("deterministic provider requires PI_CODING_AGENT_DIR");
 const config = JSON.parse(readFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), "utf8"));
-const { eventsFile, gateFile, releaseFile, versionsFile } = config;
+const { eventsFile, gateFile, releaseFile, versionsFile, scenario = "completion", childName = "DeterministicChild" } = config;
 
 function record(event: string, details: Record<string, unknown> = {}) {
   appendFileSync(eventsFile, `${JSON.stringify({ event, at: new Date().toISOString(), pid: process.pid, subagentId: process.env.PI_SUBAGENT_ID ?? null, ...details })}\n`);
@@ -56,31 +56,62 @@ export default function (pi: any) {
     apiKey: "offline-test-only",
     api: "openai-completions",
     models: [{ id: "probe", name: "Probe", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
-    streamSimple(model: any, context: any) {
+    streamSimple(model: any, context: any, options: any = {}) {
       const stream = createAssistantMessageEventStream();
       const child = Boolean(process.env.PI_SUBAGENT_ID);
+      const latest = context.messages.at(-1);
       const hasToolResult = context.messages.some((message: any) => message.role === "toolResult");
       record("provider_invoked", { child, hasToolResult });
+
+      const output: any = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "pending", timestamp: Date.now() };
+      if (scenario === "control" && child) {
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: output });
+          record("child_stream_held");
+          const abort = () => {
+            output.stopReason = "aborted";
+            output.errorMessage = "Request was aborted";
+            output.timestamp = Date.now();
+            record("child_stream_aborted");
+            stream.push({ type: "error", reason: "aborted", error: output });
+            stream.end(output);
+          };
+          if (options.signal?.aborted) abort();
+          else options.signal?.addEventListener("abort", abort, { once: true });
+        });
+        return stream;
+      }
+
       queueMicrotask(() => {
-        const output: any = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-          stopReason: hasToolResult ? "stop" : "toolUse", timestamp: Date.now() };
+        const latestUserText = latest?.role === "user"
+          ? (typeof latest.content === "string" ? latest.content : latest.content?.filter((part: any) => part.type === "text").map((part: any) => part.text).join(""))
+          : undefined;
+        const controlTool = scenario === "control" && latestUserText === "fixture interrupt" ? "subagent_interrupt"
+          : scenario === "control" && latestUserText === "fixture terminate" ? "subagent_terminate" : undefined;
+        const initialControl = scenario === "control" && !hasToolResult && !controlTool;
+        output.stopReason = hasToolResult && !controlTool ? "stop" : "toolUse";
         stream.push({ type: "start", partial: output });
-        const text = hasToolResult ? (child ? "CHILD_POST_TOOL_STOP" : "PARENT_RECEIVED_RESULT") : (child ? "CHILD_COMPLETION_SUMMARY" : "PARENT_LAUNCHING_CHILD");
+        const text = hasToolResult && !controlTool ? (child ? "CHILD_POST_TOOL_STOP" : "PARENT_RECEIVED_RESULT") : (child ? "CHILD_COMPLETION_SUMMARY" : "PARENT_LAUNCHING_CHILD");
         output.content.push({ type: "text", text });
         stream.push({ type: "text_start", contentIndex: 0, partial: output });
         stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
         stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
-        if (!hasToolResult) {
-          const toolCall = child
-            ? { type: "toolCall", id: "done-1", name: "subagent_done", arguments: {} }
-            : { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: "DeterministicChild", agent: "deterministic-child", task: "Call subagent_done exactly once." } };
+        if (!hasToolResult || controlTool) {
+          const toolCall = controlTool
+            ? { type: "toolCall", id: `${controlTool}-1`, name: controlTool, arguments: { name: childName } }
+            : initialControl
+              ? { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: childName, agent: "deterministic-child", task: "hold for control test" } }
+              : child
+                ? { type: "toolCall", id: "done-1", name: "subagent_done", arguments: {} }
+                : { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: childName, agent: "deterministic-child", task: "Call subagent_done exactly once." } };
           output.content.push(toolCall);
           stream.push({ type: "toolcall_start", contentIndex: 1, partial: output });
           stream.push({ type: "toolcall_end", contentIndex: 1, toolCall, partial: output });
         }
         stream.push({ type: "done", reason: output.stopReason, message: output });
-        stream.end();
+        stream.end(output);
       });
       return stream;
     },
