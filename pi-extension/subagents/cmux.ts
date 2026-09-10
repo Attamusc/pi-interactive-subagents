@@ -1464,42 +1464,12 @@ export interface PollResult {
   errorMessage?: string;
 }
 
-/**
- * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
- * the error path in subagent-done.ts). Centralized so both the fast and slow
- * paths in pollForExit decode the payload the same way.
- */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "ping") {
-    return {
-      reason: "ping",
-      exitCode: 0,
-      ping: { name: data.name, message: data.message },
-    };
-  }
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  return { reason: "done", exitCode: 0 };
-}
-
-export const __pollForExitTest__ = { interpretExitSidecar };
-
-/**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by subagent_done / caller_ping), falling back to the terminal
- * sentinel for crash detection.
- */
+/** Poll the separate Claude transport until its plugin or screen sentinel appears. */
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
   options: {
     interval: number;
-    sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
@@ -1510,18 +1480,6 @@ export async function pollForExit(
     if (signal.aborted) {
       const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
       throw new Error(`Aborted while waiting for subagent to finish: ${reason}`);
-    }
-
-    // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
     }
 
     // Check Claude sentinel file (written by plugin Stop hook)
@@ -1541,17 +1499,7 @@ export async function pollForExit(
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
+      // Screen loss is not completion evidence; continue until a sentinel or cancellation.
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

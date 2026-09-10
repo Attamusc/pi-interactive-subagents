@@ -54,12 +54,12 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
+import { createVisibleCompletionState } from "../pi-extension/subagents/completion-watch.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
 
@@ -1672,7 +1672,7 @@ describe("semantic Herdr blocked lifecycle", () => {
     ]);
   });
 
-  it("hard termination releases once while turn-only interrupt does not release", async () => {
+  it("hard termination keeps Pi registration until process exit is proven", async () => {
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
     const testApi = (subagentsModule as any).__test__;
@@ -1698,11 +1698,8 @@ describe("semantic Herdr blocked lifecycle", () => {
         channel: "herdr:blocked",
         data: { active: true, label: "waiting on subagent" },
       },
-      {
-        channel: "herdr:blocked",
-        data: { active: false },
-      },
     ]);
+    assert.equal(testApi.runningSubagents.has(running.id), true);
   });
 
   it("emits nothing when a subagent request is rejected before launch", async () => {
@@ -1870,54 +1867,6 @@ describe("cmux.ts pollForExit", () => {
   });
 });
 
-describe("cmux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
-
-  it("decodes ping payloads", () => {
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      {
-        reason: "ping",
-        exitCode: 0,
-        ping: { name: "Worker", message: "need help" },
-      },
-    );
-  });
-
-  it("decodes done payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "done" }), {
-      reason: "done",
-      exitCode: 0,
-    });
-  });
-
-  it("decodes error payloads and propagates the message with a non-zero exit code", () => {
-    assert.deepEqual(
-      interpretExitSidecar({
-        type: "error",
-        errorMessage: "Anthropic 529 Overloaded after 3 retries",
-        stopReason: "error",
-      }),
-      {
-        reason: "error",
-        exitCode: 1,
-        errorMessage: "Anthropic 529 Overloaded after 3 retries",
-      },
-    );
-  });
-
-  it("falls back to a placeholder when error payload has no errorMessage", () => {
-    const result = interpretExitSidecar({ type: "error" });
-    assert.equal(result.reason, "error");
-    assert.equal(result.exitCode, 1);
-    assert.match(result.errorMessage ?? "", /no errorMessage/);
-  });
-
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
-  });
-});
 describe("parseHerdrPaneId", () => {
   it("extracts pane_id from a herdr pane split success envelope", () => {
     const out =
@@ -2488,7 +2437,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("hard-terminates the pane, removes the running entry, and preserves resume metadata", async () => {
+  it("accepts pane close but retains a Pi run while owned process exit is unconfirmed", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let closedSurface = "";
@@ -2497,10 +2446,12 @@ describe("subagent interruption", () => {
 
     try {
       runningMap.set("a1", makeRunning({
+        runId: "a1",
+        completionState: createVisibleCompletionState("a1"),
+        childSnapshotFile: join(tmpdir(), "missing-child-snapshot"),
+        wrapperExitFile: join(tmpdir(), "missing-wrapper-exit"),
         abortController: {
-          abort(reason: unknown) {
-            abortReason = reason;
-          },
+          abort(reason: unknown) { abortReason = reason; },
         },
       }));
 
@@ -2513,17 +2464,10 @@ describe("subagent interruption", () => {
       );
 
       assert.equal(closedSurface, "pane-1");
-      assert.equal(abortReason, "terminated_by_parent");
-      assert.equal(runningMap.has("a1"), false);
-      assert.match(result.content[0].text, /Terminated subagent "Worker"/);
-      assert.match(result.content[0].text, /Resume: pi --session worker\.jsonl/);
-      assert.deepEqual(result.details, {
-        id: "a1",
-        name: "Worker",
-        status: "terminated",
-        surface: "pane-1",
-        sessionFile: "worker.jsonl",
-      });
+      assert.equal(abortReason, undefined);
+      assert.equal(runningMap.has("a1"), true);
+      assert.match(result.content[0].text, /process exit is unconfirmed/);
+      assert.equal(result.details.status, "termination_requested_unconfirmed");
     } finally {
       runningMap.clear();
     }

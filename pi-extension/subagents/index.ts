@@ -5,6 +5,7 @@ import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
   visibleHerdrCapabilities,
+  type AgentRunState,
   type AgentLaunchIntent,
   type NormalizedAgentDefinition,
 } from "pi-agent-execution";
@@ -50,6 +51,7 @@ import {
   classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
+  forceStatusFinishing,
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
@@ -62,6 +64,14 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { buildVisibleCompletionPaths, buildVisibleWrapperCommand } from "./completion.ts";
+import {
+  confirmOwnedProcessGone,
+  createVisibleCompletionState,
+  observeVisibleCompletion,
+  recordVisibleControl,
+  waitForVisibleCompletion,
+  type VisibleCompletionState,
+} from "./completion-watch.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -593,8 +603,8 @@ interface RunningSubagent {
   sessionFile: string;
   /** Exact Pi transcript identity; unlike a host pane reference, this is resumable. */
   piSessionRef?: string;
-  runtimeModel?: string;
   transcriptStartLine: number;
+  completionState?: VisibleCompletionState;
   childSnapshotFile?: string;
   wrapperExitFile?: string;
   launchScriptFile?: string;
@@ -918,6 +928,14 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
   if (running.cli === "claude") return;
 
+  if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
+    const completionStatus = observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
+    if (completionStatus.status === "finishing") {
+      running.statusState = forceStatusFinishing(running.statusState, observedAt);
+      return;
+    }
+  }
+
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
     ? readSubagentActivityFile(activityFile, running.id)
@@ -1054,6 +1072,7 @@ function handleSubagentInterrupt(
 
   running.interruptCount = (running.interruptCount ?? 0) + 1;
   running.interruptRequestedAt = now;
+  if (running.completionState) recordVisibleControl(running.completionState, { kind: "interrupt-requested", mode: "turn-escape" });
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
 
@@ -1091,11 +1110,21 @@ async function handleSubagentTerminate(
 
   const running = resolved.running;
   observeRunningSubagent(running);
+  if (running.cli !== "claude" && running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
+    observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
+  }
   try {
     running.terminationOutput = read(running.surface, 200)
       .replace(/__SUBAGENT_DONE_\d+__/, "")
       .trim();
   } catch {}
+
+  if (running.terminationRequestedAt) {
+    return {
+      content: [{ type: "text" as const, text: `Termination was already requested for subagent "${running.name}"; process exit remains unconfirmed.` }],
+      details: { id: running.id, name: running.name, status: "termination_requested_unconfirmed", surface: running.surface, sessionFile: running.sessionFile },
+    };
+  }
 
   try {
     await close(running.surface);
@@ -1115,22 +1144,27 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestedAt = Date.now();
-  releaseRunningSubagent(running.id);
-  running.abortController?.abort("terminated_by_parent");
+  if (running.cli === "claude") {
+    releaseRunningSubagent(running.id);
+    running.abortController?.abort("terminated_by_parent");
+  } else if (running.completionState) {
+    recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: "herdr-pane-close" });
+    confirmOwnedProcessGone(running.completionState);
+  }
   updateWidget();
 
+  const confirmed = running.cli === "claude" || running.completionState?.core.process.status === "exited";
   return {
     content: [{
       type: "text" as const,
-      text:
-        `Terminated subagent "${running.name}" and closed its pane.\n\n` +
-        `ID: ${running.id}\nSession: ${running.sessionFile}\n` +
-        `Resume: pi --session ${running.sessionFile}`,
+      text: confirmed
+        ? `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}\nSession: ${running.sessionFile}`
+        : `Termination requested for subagent "${running.name}"; process exit is unconfirmed and the run remains registered.\n\nID: ${running.id}\nSession: ${running.sessionFile}`,
     }],
     details: {
       id: running.id,
       name: running.name,
-      status: "terminated",
+      status: confirmed ? "terminated" : "termination_requested_unconfirmed",
       surface: running.surface,
       sessionFile: running.sessionFile,
     },
@@ -1544,8 +1578,8 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     piSessionRef: subagentSessionFile,
-    runtimeModel: effectiveModel,
     transcriptStartLine,
+    completionState: createVisibleCompletionState(id),
     childSnapshotFile: completionPaths.childSnapshot,
     wrapperExitFile: completionPaths.wrapperExit,
     launchScriptFile,
@@ -1600,17 +1634,29 @@ async function watchSubagent(
   const waitForExit = dependencies.pollForExit ?? pollForExit;
   const close = dependencies.closeSurface ?? closeSurface;
   const read = dependencies.readScreen ?? readScreen;
+  let terminalObserved = false;
 
   try {
-    const result = await waitForExit(surface, AbortSignal.any([signal, moduleSignal]), {
-      interval: 1000,
-      sessionFile,
-      sentinelFile: running.sentinelFile,
-      onTick() {
-        observeRunningSubagent(running);
-      },
-    });
+    const combinedSignal = AbortSignal.any([signal, moduleSignal]);
+    const result = running.cli === "claude"
+      ? await waitForExit(surface, combinedSignal, {
+          interval: 1000,
+          sentinelFile: running.sentinelFile,
+          onTick() { observeRunningSubagent(running); },
+        })
+      : await waitForVisibleCompletion({
+          state: running.completionState!,
+          childSnapshotFile: running.childSnapshotFile!,
+          wrapperExitFile: running.wrapperExitFile!,
+          sessionFile,
+          transcriptStartLine: running.transcriptStartLine,
+          sessionRef: running.piSessionRef,
+          signal: combinedSignal,
+          interval: 1000,
+          onTick() { observeRunningSubagent(running); },
+        });
 
+    terminalObserved = true;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (running.cli === "claude") {
@@ -1648,36 +1694,21 @@ async function watchSubagent(
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
-    // Pi subagent result extraction
-    let summary: string;
-    if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
-      summary =
-        findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
-    } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
-    }
-
-    await close(surface);
+    // Pi completion is delivered only after the shared lifecycle reaches a
+    // terminal projection backed by correlated process-exit evidence.
+    const observed = result as Awaited<ReturnType<typeof waitForVisibleCompletion>>;
+    const completion = observed.completion;
+    const processExit = completion.processExit;
+    const exitCode = processExit?.kind === "shell" ? processExit.shellStatus : completion.execution === "normal-exit" ? 0 : 1;
+    const summary = completion.output || (completion.errorMessage
+      ? `Subagent error: ${completion.errorMessage}`
+      : exitCode !== 0 ? `Sub-agent exited abnormally` : "Sub-agent exited without new output");
+    if (!running.terminationRequestedAt) await close(surface);
 
     return {
-      name,
-      task,
-      summary,
-      sessionFile,
-      exitCode: result.exitCode,
-      elapsed,
-      ping: result.ping,
-      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      name, task, summary, sessionFile, exitCode, elapsed,
+      ping: observed.payload?.kind === "ping" ? { name: observed.payload.name, message: observed.payload.message } : undefined,
+      ...(completion.errorMessage ? { errorMessage: completion.errorMessage } : {}),
     };
   } catch (err: any) {
     let terminalOutput: string | undefined;
@@ -1687,9 +1718,11 @@ async function watchSubagent(
         .trim();
     } catch {}
 
-    try {
-      await close(surface);
-    } catch {}
+    // Observation failures and pane disappearance are diagnostics, never exit
+    // proof. Parent-session cancellation owns its existing explicit cleanup.
+    if (running.cli === "claude") {
+      try { await close(surface); } catch {}
+    }
 
     const watcherAborted = signal.aborted;
     const moduleAborted = moduleSignal.aborted;
@@ -1735,7 +1768,9 @@ async function watchSubagent(
       },
     };
   } finally {
-    releaseRunningSubagent(running.id);
+    if (terminalObserved || signal.aborted || moduleSignal.aborted || running.cli === "claude") {
+      releaseRunningSubagent(running.id);
+    }
   }
 }
 
@@ -2333,6 +2368,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           piSessionRef: params.sessionPath,
           transcriptStartLine,
+          completionState: createVisibleCompletionState(id),
           childSnapshotFile: completionPaths.childSnapshot,
           wrapperExitFile: completionPaths.wrapperExit,
           launchScriptFile,

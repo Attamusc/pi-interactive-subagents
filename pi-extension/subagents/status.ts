@@ -11,7 +11,7 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
+export type SubagentStatusKind = "starting" | "active" | "waiting" | "finishing" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
@@ -289,6 +289,13 @@ export function observeStatus(
   };
 }
 
+export function forceStatusFinishing(state: SubagentStatusState, now: number): SubagentStatusState {
+  if (state.source === "claude") return state;
+  return { ...state, firstObservationAtMs: state.firstObservationAtMs ?? now, activeNow: false,
+    activeSinceMs: null, waitingSinceMs: now, phase: "waiting", latestEvent: "completion_requested",
+    activityLabel: "finishing", currentKind: "finishing" };
+}
+
 export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
   if (state.source === "claude") return state;
 
@@ -364,7 +371,10 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   let kind: SubagentStatusKind;
   let statusLabel: string | null = null;
 
-  if (state.snapshotState === "present") {
+  if (state.currentKind === "finishing") {
+    kind = "finishing";
+    statusLabel = "finishing";
+  } else if (state.snapshotState === "present") {
     if (state.phase === "active" || state.activeNow) {
       kind = "active";
     } else if (state.phase === "waiting") {
