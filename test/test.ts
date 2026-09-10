@@ -42,6 +42,7 @@ import {
   classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
+  forceStatusFinishing,
   formatStatusAggregate,
   formatStatusLine,
   formatTransitionLine,
@@ -879,6 +880,19 @@ describe("status.ts", () => {
     assert.ok(recovered.length <= 120, `expected bounded line length, got ${recovered.length}`);
   });
 
+  it("renders finishing directly without a stalled transition or wake line", () => {
+    const finishing = forceStatusFinishing(createStatusState({ source: "pi", startTimeMs: 0 }), 5_000);
+    const advanced = advanceStatusState(finishing, 7_000);
+    const line = formatStatusLine("Worker", advanced.snapshot);
+    const aggregate = formatStatusAggregate([line], 4);
+
+    assert.equal(advanced.snapshot.kind, "finishing");
+    assert.equal(advanced.transition, null);
+    assert.equal(line, "Worker running 7s, finishing.");
+    assert.equal(aggregate, "Subagent status:\n• Worker running 7s, finishing.");
+    assert.doesNotMatch(line, /stalled/);
+  });
+
   it("caps visible status lines and reports overflow consistently", () => {
     const waitingState = observeStatus(
       createStatusState({ source: "pi", startTimeMs: 0 }),
@@ -1703,7 +1717,7 @@ describe("semantic Herdr blocked lifecycle", () => {
     assert.equal(testApi.runningSubagents.has(running.id), true);
   });
 
-  it("holds terminal delivery while pane close is pending and reports termination for shell zero", async () => {
+  it("records termination before pane close and reports a racing shell-zero exit as terminated", async () => {
     const dir = createTestDir();
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
@@ -1721,16 +1735,20 @@ describe("semantic Herdr blocked lifecycle", () => {
     testApi.registerRunningSubagent(runtime.api, running);
     let acceptClose!: () => void;
     const closePending = new Promise<void>((resolve) => { acceptClose = resolve; });
-    const watcher = testApi.watchSubagent(running, new AbortController().signal, { async closeSurface() {}, visibleInterval: 1 });
-    const termination = testApi.handleSubagentTerminate({ id: "race" }, async () => closePending, () => "");
+    let watcherCloses = 0;
+    const watcher = testApi.watchSubagent(running, new AbortController().signal, { async closeSurface() { watcherCloses++; }, visibleInterval: 1 });
+    const termination = testApi.handleSubagentTerminate({ id: "race" }, async () => {
+      assert.equal(running.completionState.core.control.status, "terminate-requested");
+      return closePending;
+    }, () => "");
     writeFileSync(paths.wrapperExit, JSON.stringify({ version: 1, runId: "race", sourceId: "wrapper:race", sequence: 1, observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 } }));
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(testApi.runningSubagents.has("race"), true);
-    acceptClose();
-    await termination;
     const result = await watcher;
     assert.equal(result.exitCode, 1);
+    assert.match(result.summary, /terminated by parent/);
     assert.equal(testApi.runningSubagents.has("race"), false);
+    assert.equal(watcherCloses, 0);
+    acceptClose();
+    await termination;
     rmSync(dir, { recursive: true, force: true });
   });
 

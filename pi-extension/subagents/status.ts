@@ -482,6 +482,10 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatActiveDetail(snapshot)}.`);
   }
 
+  if (snapshot.kind === "finishing") {
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, finishing.`);
+  }
+
   if (snapshot.kind === "waiting") {
     const problem = snapshot.statusLabel && snapshot.statusLabel !== "done"
       ? ` (${snapshot.statusLabel})`

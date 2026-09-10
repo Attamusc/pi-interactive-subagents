@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `finishing`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -62,12 +62,13 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 2 subagent-only control tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_terminate` | Request a hard stop; Pi runs remain registered until process exit is proven                 |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
@@ -99,7 +100,8 @@ Definition parsing and effective model, thinking, tools, skills, system-prompt, 
 1. Agent calls subagent()          → returns immediately ("started")
 2. Sub-agent runs in mux pane      → widget shows live status
 3. User keeps chatting             → main session fully interactive
-4. Sub-agent finishes              → result steered back as a normal completion/failure
+4. Sub-agent requests completion   → widget shows `finishing`; pane and registry stay present
+5. Child process exit is proven    → result steered back as a normal completion/failure
 5. Main agent processes result     → continues with new context
 ```
 
@@ -122,6 +124,7 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 - `starting` — launched, but no valid child snapshot has been observed yet
 - `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
 - `waiting` — the child finished a turn and is intentionally open for more input or another stage
+- `finishing` — completion was requested, but the parent is still waiting for proven process exit
 - `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
 - `running` — fallback for backends without child snapshots (e.g. Claude)
 
@@ -199,6 +202,12 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+
+### Hard termination
+
+`subagent_terminate` requests pane closure. For Pi-backed runs, an accepted close request is not treated as proof that the child exited: the watcher and registry entry remain until the correlated wrapper record appears or the previously recorded child PID is confirmed absent. The tool can therefore acknowledge `termination_requested_unconfirmed`; it does not invent an exit code or signal.
+
+Normal Pi completion uses the same two-phase rule. `subagent_done`, `caller_ping`, and autonomous settlement record completion intent first, producing `finishing`. Delivery and cleanup happen only after the foreground Pi command returns and its wrapper records the shell status. The one-shot wrapper uses `node` from the child pane's `PATH`; this repository's Node-based Pi deployment provides it, but other platform environments have not been validated. Failure to write the wrapper record is diagnostic and is not process-exit evidence. No dependency fallback or automatic provisioning is attempted.
 
 ---
 
@@ -306,7 +315,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown after the agent reaches `agent_settled` — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -336,12 +345,13 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true`, the agent session requests shutdown automatically after `agent_settled` — no explicit `subagent_done` call is needed. `agent_end` alone is not sufficient because retries, compaction, or queued continuation may still follow.
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
+- Shutdown is requested after the agent's final work reaches `agent_settled`
+- The parent reports `finishing` until the wrapper proves the foreground Pi process returned
+- If the user sends **any input** before the agent settles, auto-exit is permanently disabled for that session — the user takes over interactively
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**

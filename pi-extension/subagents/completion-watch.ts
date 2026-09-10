@@ -101,7 +101,7 @@ export function confirmOwnedProcessGone(state: VisibleCompletionState, probe: (p
 export async function waitForVisibleCompletion(params: {
   state: VisibleCompletionState; childSnapshotFile: string; wrapperExitFile: string; sessionFile: string;
   transcriptStartLine: number; sessionRef?: string; signal: AbortSignal; interval?: number; onTick?: () => void;
-  canComplete?: () => boolean; processProbe?: (pid: number, signal: 0) => void;
+  processProbe?: (pid: number, signal: 0) => void;
 }) {
   for (;;) {
     if (params.signal.aborted) throw new Error(`Aborted while waiting for subagent to finish: ${String(params.signal.reason ?? "no abort reason provided")}`);
@@ -115,7 +115,7 @@ export async function waitForVisibleCompletion(params: {
       confirmOwnedProcessGone(params.state, params.processProbe);
       status = projectAgentRunStatus(params.state.core);
     }
-    if (status.terminal && (params.canComplete?.() ?? true)) {
+    if (status.terminal) {
       let entries: ReturnType<typeof getNewEntries> = [];
       try { entries = getNewEntries(params.sessionFile, params.transcriptStartLine); } catch {}
       const assistant = extractLatestAssistantOutput(entries);

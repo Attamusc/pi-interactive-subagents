@@ -1128,6 +1128,10 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestState = "pending";
+  running.terminationRequestedAt = Date.now();
+  if (running.cli !== "claude" && running.completionState) {
+    recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: "herdr-pane-close" });
+  }
   try {
     await close(running.surface);
   } catch (error: any) {
@@ -1146,13 +1150,11 @@ async function handleSubagentTerminate(
     };
   }
 
-  running.terminationRequestedAt = Date.now();
   running.terminationRequestState = "accepted";
   if (running.cli === "claude") {
     releaseRunningSubagent(running.id);
     running.abortController?.abort("terminated_by_parent");
   } else if (running.completionState) {
-    recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: "herdr-pane-close" });
     confirmOwnedProcessGone(running.completionState);
   }
   updateWidget();
@@ -1668,7 +1670,6 @@ async function watchSubagent(
           signal: combinedSignal,
           interval: dependencies.visibleInterval ?? 1000,
           onTick() { observeRunningSubagent(running); },
-          canComplete: () => running.terminationRequestState !== "pending",
           processProbe: dependencies.processProbe,
         });
 
@@ -1714,14 +1715,13 @@ async function watchSubagent(
     // terminal projection backed by correlated process-exit evidence.
     const observed = result as Awaited<ReturnType<typeof waitForVisibleCompletion>>;
     const completion = observed.completion;
-    const processExit = completion.processExit;
     const exitCode = completionExitCode(completion);
     const summary = completion.output || (completion.errorMessage
       ? `Subagent error: ${completion.errorMessage}`
       : completion.execution === "terminated" ? "Subagent terminated by parent request."
       : completion.execution === "aborted" ? "Subagent process was aborted."
       : exitCode !== 0 ? "Sub-agent exited abnormally" : "Sub-agent exited without new output");
-    if (!running.terminationRequestedAt) await close(surface);
+    if (!running.terminationRequestState) await close(surface);
 
     return {
       name, task, summary, sessionFile, exitCode, elapsed,
@@ -2115,10 +2115,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_terminate",
       label: "Terminate Subagent",
       description:
-        "Hard-stop a running subagent by closing its pane, aborting its watcher, and removing its running entry. " +
-        "Unlike subagent_interrupt, this terminates the child process. The resulting failure includes the resumable session path.",
+        "Request a hard stop by closing a running subagent's pane. For Pi-backed runs, the watcher and registry entry remain until the wrapper reports exit or the recorded child PID is confirmed absent. " +
+        "The acknowledgement may therefore report that termination was requested but remains unconfirmed.",
       promptSnippet:
-        "Hard-stop a running subagent by closing its pane, aborting its watcher, and removing its running entry. " +
+        "Request a hard stop by closing a running subagent's pane. Pi-backed watchers remain registered until correlated process-exit proof arrives. " +
         "Use when an autonomous child must be stopped rather than merely interrupting its active model turn.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
