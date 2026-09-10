@@ -14,7 +14,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.ts test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "test:integration:herdr-completion": "PI_TEST_DETERMINISTIC_HERDR_LIVE=1 node --test test/integration/deterministic-herdr-completion-live.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
