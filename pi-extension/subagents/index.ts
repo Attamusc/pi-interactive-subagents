@@ -1724,8 +1724,9 @@ async function watchSubagent(
     const controlError = completion.execution === "terminated" ? "terminated"
       : completion.execution === "aborted" ? "cancelled"
       : undefined;
-    const summary = controlError === "terminated" ? "Subagent terminated by parent request."
-      : controlError === "cancelled" ? "Subagent cancelled by parent session."
+    const partialOutput = completion.output ? `\n\nPartial output:\n${completion.output}` : "";
+    const summary = controlError === "terminated" ? `Subagent terminated by parent request.${partialOutput}`
+      : controlError === "cancelled" ? `Subagent cancelled by parent session.${partialOutput}`
       : completion.output || (completion.errorMessage
         ? `Subagent error: ${completion.errorMessage}`
         : exitCode !== 0 ? "Sub-agent exited abnormally" : "Sub-agent exited without new output");

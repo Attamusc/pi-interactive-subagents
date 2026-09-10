@@ -1726,7 +1726,10 @@ describe("semantic Herdr blocked lifecycle", () => {
     const testApi = (subagentsModule as any).__test__;
     const paths = buildVisibleCompletionPaths(dir, "race");
     const sessionFile = join(dir, "race.jsonl");
-    writeFileSync(sessionFile, `${JSON.stringify({ type: "session" })}\n`);
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "session" })}\n${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "partial assistant result" }] } })}\n`,
+    );
     const recorder = createChildCompletionRecorder({ runId: "race", childPid: process.pid, sessionFile, snapshotFile: paths.childSnapshot });
     recorder.record({ kind: "completion-requested", reason: "done" }, { kind: "done" });
     recorder.record({ kind: "agent-settled" });
@@ -1747,11 +1750,13 @@ describe("semantic Herdr blocked lifecycle", () => {
     assert.equal(result.exitCode, 1);
     assert.equal(result.error, "terminated");
     assert.match(result.summary, /terminated by parent/);
+    assert.match(result.summary, /Partial output:\npartial assistant result/);
     const presentation = testApi.resolveResultPresentation(
       { ...result, errorMessage: "Operation aborted" },
       "Worker",
     );
     assert.match(presentation, /terminated by parent request/);
+    assert.match(presentation, /Partial output:\npartial assistant result/);
     assert.match(presentation, /Diagnostic: Operation aborted/);
     assert.doesNotMatch(presentation, /provider\/agent error|auto-retry exhausted/);
     assert.equal(testApi.runningSubagents.has("race"), false);
