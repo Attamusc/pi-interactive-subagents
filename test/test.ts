@@ -2723,6 +2723,45 @@ describe("subagent interruption", () => {
   });
 });
 
+describe("subagent result renderer", () => {
+  const theme = {
+    fg(_color: string, text: string) { return text; },
+    bg(_color: string, text: string) { return text; },
+    bold(text: string) { return text; },
+  };
+
+  it("renders control, provider, and normal results from the registered renderer", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const entry = registeredMessageRenderers.find((candidate) => candidate.name === "subagent_result");
+    assert.ok(entry);
+    const cases = [
+      { details: { name: "Terminated", exitCode: 1, elapsed: 2, error: "terminated", errorMessage: "Operation aborted" }, summary: "Subagent terminated by parent request.\n\nPartial output:\npartial", header: /terminated/, body: /Partial output:\s+partial[\s\S]*Diagnostic: Operation aborted/ },
+      { details: { name: "Cancelled", exitCode: 1, elapsed: 2, error: "cancelled", errorMessage: "Operation aborted" }, summary: "Subagent cancelled by parent session.", header: /cancelled/, body: /Diagnostic: Operation aborted/ },
+      { details: { name: "Provider", exitCode: 1, elapsed: 2, errorMessage: "overloaded" }, summary: "unused", header: /failed \(provider\/agent error\)/, body: /Error: overloaded/ },
+      { details: { name: "Normal", exitCode: 0, elapsed: 2 }, summary: "done", header: /completed/, body: /done/ },
+    ];
+    for (const testCase of cases) {
+      const content = (subagentsModule as any).__test__.resolveResultPresentation(
+        { ...testCase.details, summary: testCase.summary },
+        testCase.details.name,
+      );
+      const output = entry.renderer({ content, details: testCase.details }, { expanded: true }, theme).render(120).join("\n");
+      assert.match(output, testCase.header);
+      assert.match(output, testCase.body);
+      assert.equal((output.match(/failed \(provider\/agent error\)/g) ?? []).length, testCase.details.name === "Provider" ? 1 : 0);
+      assert.doesNotMatch(output, /auto-retry exhausted/);
+    }
+  });
+
+  it("projects the same control marker for initial and resumed delivery details", () => {
+    const result = { exitCode: 1, elapsed: 3, summary: "stopped", error: "terminated" };
+    const project = (subagentsModule as any).__test__.projectResultDetails;
+    assert.equal(project(result, { name: "Initial", task: "task", agent: "worker", sessionFile: "/tmp/a" }).error, "terminated");
+    assert.equal(project(result, { name: "Resumed", task: "resumed session", sessionFile: "/tmp/b" }).error, "terminated");
+  });
+});
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {

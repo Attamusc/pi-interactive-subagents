@@ -524,46 +524,86 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   return ` stalled${detail}${duration} `;
 }
 
-function resolveResultPresentation(
-  result: Pick<
-    SubagentResult,
-    | "exitCode"
-    | "elapsed"
-    | "summary"
-    | "sessionFile"
-    | "sessionFileExists"
-    | "error"
-    | "errorMessage"
-  >,
-  name: string,
-): string {
+type PresentableResult = Pick<
+  SubagentResult,
+  | "exitCode"
+  | "elapsed"
+  | "summary"
+  | "sessionFile"
+  | "sessionFileExists"
+  | "error"
+  | "errorMessage"
+>;
+
+function describeResultPresentation(result: PresentableResult, name: string) {
+  if (result.error === "terminated" || result.error === "cancelled") {
+    const status = result.error === "terminated" ? "terminated" : "cancelled";
+    const cause = status === "terminated" ? "terminated by parent request" : "cancelled by parent session";
+    return { failed: true, status, headline: `Sub-agent "${name}" was ${cause}.` };
+  }
+  if (result.errorMessage) {
+    return {
+      failed: true,
+      status: "failed (provider/agent error)",
+      headline: `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} (provider/agent error).`,
+    };
+  }
+  if (result.exitCode !== 0) {
+    return {
+      failed: true,
+      status: `failed (exit ${result.exitCode})`,
+      headline: `Sub-agent "${name}" failed (exit code ${result.exitCode}).`,
+    };
+  }
+  return {
+    failed: false,
+    status: "completed",
+    headline: `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).`,
+  };
+}
+
+function resolveResultPresentation(result: PresentableResult, name: string): string {
   const sessionRef = result.sessionFile
     ? result.sessionFileExists === false
       ? `\n\nPlanned session (not created): ${result.sessionFile}`
       : `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
 
+  const presentation = describeResultPresentation(result, name);
   if (result.error === "terminated" || result.error === "cancelled") {
-    const cause = result.error === "terminated"
-      ? "terminated by parent request"
-      : "cancelled by parent session";
     const diagnostic = result.errorMessage ? `\n\nDiagnostic: ${result.errorMessage}` : "";
-    return `Sub-agent "${name}" was ${cause}.\n\n${result.summary}${diagnostic}${sessionRef}`;
+    return `${presentation.headline}\n\n${result.summary}${diagnostic}${sessionRef}`;
   }
 
   if (result.errorMessage) {
     return (
-      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error).\n\n` +
+      `${presentation.headline}\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_resume.${sessionRef}`
     );
   }
 
-  return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+  return `${presentation.headline}\n\n${result.summary}${sessionRef}`;
+}
+
+function projectResultDetails(
+  result: SubagentResult,
+  context: { name: string; task: string; agent?: string; sessionFile?: string },
+) {
+  return {
+    name: context.name,
+    task: context.task,
+    ...(context.agent ? { agent: context.agent } : {}),
+    exitCode: result.exitCode,
+    elapsed: result.elapsed,
+    sessionFile: context.sessionFile ?? result.sessionFile,
+    sessionFileExists: result.sessionFileExists,
+    ...(result.error ? { error: result.error } : {}),
+    ...(result.failureContext ?? {}),
+    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+    ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+  };
 }
 
 /**
@@ -1293,6 +1333,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   handleSubagentTerminate,
   resolveResultPresentation,
+  projectResultDetails,
   completionExitCode,
   resolveResumeLaunchBehavior,
   registerRunningSubagent,
@@ -1955,19 +1996,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: presentation,
                 display: true,
-                details: {
+                details: projectResultDetails(result, {
                   name: running.name,
                   task: running.task,
                   agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  sessionFileExists: result.sessionFileExists,
-                  ...(result.error ? { error: result.error } : {}),
-                  ...(result.failureContext ?? {}),
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                },
+                }),
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -2455,14 +2488,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: presentation,
                 display: true,
-                details: {
+                details: projectResultDetails(result, {
                   name,
                   task: params.message ?? "resumed session",
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                },
+                }),
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -2544,20 +2574,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
-        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
-        const bgFn = failed
+        const presentation = describeResultPresentation({
+          exitCode,
+          elapsed: details.elapsed ?? 0,
+          summary: "",
+          error: details.error,
+          errorMessage: details.errorMessage,
+        }, name);
+        const bgFn = presentation.failed
           ? (text: string) => theme.bg("toolErrorBg", text)
           : (text: string) => theme.bg("toolSuccessBg", text);
-        const icon = failed
+        const icon = presentation.failed
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
-        const status = errorMessage
-          ? "failed (provider/agent error)"
-          : failed
-            ? `failed (exit ${exitCode})`
-            : "completed";
+        const status = presentation.status;
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
@@ -2566,14 +2597,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Clean summary (remove session ref and leading label for display)
         const summary = rawContent
           .replace(/\n\nSession: .+\nResume: .+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
-          .replace(
-            new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
-            ),
-            "",
-          );
+          .replace(`${presentation.headline}\n\n`, "");
 
         // Build content for the box
         const contentLines = [header];
