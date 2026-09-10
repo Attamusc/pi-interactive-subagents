@@ -20,6 +20,7 @@ export interface VisibleCompletionState {
   wrapperSequence: number;
   parentSequence: number;
   childPid?: number;
+  childSessionFile?: string;
   payload?: CompletionPayload;
   diagnostics: string[];
 }
@@ -31,7 +32,10 @@ export function createVisibleCompletionState(runId: string): VisibleCompletionSt
 function diagnostic(state: VisibleCompletionState, source: string, result: { reason: string; error?: string }): void {
   if (result.reason === "missing" || result.reason === "stale") return;
   const message = `${source}: ${result.reason}${result.error ? ` (${result.error})` : ""}`;
-  if (state.diagnostics.at(-1) !== message) state.diagnostics.push(message);
+  if (state.diagnostics.at(-1) !== message) {
+    state.diagnostics.push(message);
+    state.diagnostics = state.diagnostics.slice(-8);
+  }
 }
 
 export function observeVisibleCompletion(params: {
@@ -42,16 +46,23 @@ export function observeVisibleCompletion(params: {
   const { state } = params;
   const child = readChildCompletionSnapshot(params.childSnapshotFile, state.core.runId, state.childSequence);
   if (child.ok) {
-    if (state.childPid === undefined) {
-      state.childPid = child.value.childPid;
-      state.core = reduceAgentRunEvidence(state.core, {
-        kind: "host-started", runId: state.core.runId, sourceId: `parent:${state.core.runId}`,
-        sequence: ++state.parentSequence, observedAt: child.value.observedAt, hostRef: String(child.value.childPid),
-      });
+    const identityChanged = state.childPid !== undefined &&
+      (state.childPid !== child.value.childPid || state.childSessionFile !== child.value.sessionFile);
+    if (identityChanged) {
+      diagnostic(state, "child snapshot", { reason: "wrong-id", error: "child process identity changed" });
+    } else {
+      if (state.childPid === undefined) {
+        state.childPid = child.value.childPid;
+        state.childSessionFile = child.value.sessionFile;
+        state.core = reduceAgentRunEvidence(state.core, {
+          kind: "host-started", runId: state.core.runId, sourceId: `parent:${state.core.runId}`,
+          sequence: ++state.parentSequence, observedAt: child.value.observedAt, hostRef: String(child.value.childPid),
+        });
+      }
+      for (const fact of child.value.latestFacts) state.core = reduceAgentRunEvidence(state.core, fact);
+      state.childSequence = child.value.sequence;
+      state.payload = child.value.completionPayload;
     }
-    for (const fact of child.value.latestFacts) state.core = reduceAgentRunEvidence(state.core, fact);
-    state.childSequence = child.value.sequence;
-    state.payload = child.value.completionPayload;
   } else diagnostic(state, "child snapshot", child);
 
   const wrapper = readWrapperExitRecord(params.wrapperExitFile, state.core.runId, state.wrapperSequence);
@@ -65,8 +76,12 @@ export function observeVisibleCompletion(params: {
   return projectAgentRunStatus(state.core);
 }
 
-export function recordVisibleControl(state: VisibleCompletionState, evidence: Omit<Extract<AgentRunEvidence,
-  { kind: "interrupt-requested" | "terminate-requested" | "process-exited" }>, "runId" | "sourceId" | "sequence" | "observedAt">): void {
+export type VisibleControlEvidence =
+  | { kind: "interrupt-requested"; mode: "process-abort" | "turn-escape" }
+  | { kind: "terminate-requested"; mode: "process-signal" | "herdr-pane-close" }
+  | { kind: "process-exited"; exit: { kind: "native"; code: number | null; signal: string | null } | { kind: "shell"; shellStatus: number } | { kind: "process-not-found" } };
+
+export function recordVisibleControl(state: VisibleCompletionState, evidence: VisibleControlEvidence): void {
   state.core = reduceAgentRunEvidence(state.core, {
     ...evidence, runId: state.core.runId, sourceId: `parent:${state.core.runId}`,
     sequence: ++state.parentSequence, observedAt: new Date().toISOString(),
@@ -86,11 +101,21 @@ export function confirmOwnedProcessGone(state: VisibleCompletionState, probe: (p
 export async function waitForVisibleCompletion(params: {
   state: VisibleCompletionState; childSnapshotFile: string; wrapperExitFile: string; sessionFile: string;
   transcriptStartLine: number; sessionRef?: string; signal: AbortSignal; interval?: number; onTick?: () => void;
+  canComplete?: () => boolean; processProbe?: (pid: number, signal: 0) => void;
 }) {
   for (;;) {
     if (params.signal.aborted) throw new Error(`Aborted while waiting for subagent to finish: ${String(params.signal.reason ?? "no abort reason provided")}`);
-    const status = observeVisibleCompletion(params);
-    if (status.terminal) {
+    let status;
+    try { status = observeVisibleCompletion(params); }
+    catch (error) {
+      diagnostic(params.state, "completion observer", { reason: "invalid", error: error instanceof Error ? error.message : String(error) });
+      status = projectAgentRunStatus(params.state.core);
+    }
+    if (params.state.core.control.status === "terminate-requested") {
+      confirmOwnedProcessGone(params.state, params.processProbe);
+      status = projectAgentRunStatus(params.state.core);
+    }
+    if (status.terminal && (params.canComplete?.() ?? true)) {
       let entries: ReturnType<typeof getNewEntries> = [];
       try { entries = getNewEntries(params.sessionFile, params.transcriptStartLine); } catch {}
       const assistant = extractLatestAssistantOutput(entries);
@@ -103,7 +128,9 @@ export async function waitForVisibleCompletion(params: {
       if (!completion) throw new Error("terminal lifecycle projection produced no completion");
       return { completion, payload: params.state.payload };
     }
-    params.onTick?.();
+    try { params.onTick?.(); }
+    catch (error) { diagnostic(params.state, "observer callback", { reason: "invalid", error: error instanceof Error ? error.message : String(error) }); }
+    if (params.signal.aborted) throw new Error(`Aborted while waiting for subagent to finish: ${String(params.signal.reason ?? "no abort reason provided")}`);
     await new Promise<void>((resolve, reject) => {
       const onAbort = () => {
         clearTimeout(timer);

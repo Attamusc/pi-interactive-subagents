@@ -13,7 +13,7 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
-export function shouldAutoExitOnAgentEnd(
+export function shouldAutoExitOnAgentSettled(
   userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
@@ -39,7 +39,7 @@ export interface SubagentErrorInfo {
  * failure instead of silently treating the run as completed.
  *
  * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * aborted by the user (handled separately by shouldAutoExitOnAgentSettled).
  */
 export function findLatestAssistantError(
   messages: any[] | undefined,
@@ -187,7 +187,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     completionRecorder.record({ kind: "agent-settled" });
-    if (explicitCompletionRequested || !autoExit || !shouldAutoExitOnAgentEnd(userTookOver, latestMessages)) {
+    if (explicitCompletionRequested || !autoExit || !shouldAutoExitOnAgentSettled(userTookOver, latestMessages)) {
       return;
     }
 

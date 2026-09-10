@@ -54,10 +54,11 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
+import { buildVisibleCompletionPaths, createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import { createVisibleCompletionState } from "../pi-extension/subagents/completion-watch.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
+  shouldAutoExitOnAgentSettled,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 
@@ -1702,6 +1703,98 @@ describe("semantic Herdr blocked lifecycle", () => {
     assert.equal(testApi.runningSubagents.has(running.id), true);
   });
 
+  it("holds terminal delivery while pane close is pending and reports termination for shell zero", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    const testApi = (subagentsModule as any).__test__;
+    const paths = buildVisibleCompletionPaths(dir, "race");
+    const sessionFile = join(dir, "race.jsonl");
+    writeFileSync(sessionFile, `${JSON.stringify({ type: "session" })}\n`);
+    const recorder = createChildCompletionRecorder({ runId: "race", childPid: process.pid, sessionFile, snapshotFile: paths.childSnapshot });
+    recorder.record({ kind: "completion-requested", reason: "done" }, { kind: "done" });
+    recorder.record({ kind: "agent-settled" });
+    mkdirSync(dirname(paths.wrapperExit), { recursive: true });
+    const running = makeRunning({ id: "race", runId: "race", sessionFile, piSessionRef: sessionFile, transcriptStartLine: 0,
+      childSnapshotFile: paths.childSnapshot, wrapperExitFile: paths.wrapperExit, completionState: createVisibleCompletionState("race") });
+    testApi.registerRunningSubagent(runtime.api, running);
+    let acceptClose!: () => void;
+    const closePending = new Promise<void>((resolve) => { acceptClose = resolve; });
+    const watcher = testApi.watchSubagent(running, new AbortController().signal, { async closeSurface() {}, visibleInterval: 1 });
+    const termination = testApi.handleSubagentTerminate({ id: "race" }, async () => closePending, () => "");
+    writeFileSync(paths.wrapperExit, JSON.stringify({ version: 1, runId: "race", sourceId: "wrapper:race", sequence: 1, observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 } }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(testApi.runningSubagents.has("race"), true);
+    acceptClose();
+    await termination;
+    const result = await watcher;
+    assert.equal(result.exitCode, 1);
+    assert.equal(testApi.runningSubagents.has("race"), false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("releases registration when an accepted termination PID disappears later without a wrapper", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    const testApi = (subagentsModule as any).__test__;
+    const paths = buildVisibleCompletionPaths(dir, "late-gone");
+    const sessionFile = join(dir, "late-gone.jsonl");
+    writeFileSync(sessionFile, `${JSON.stringify({ type: "session" })}\n`);
+    const recorder = createChildCompletionRecorder({ runId: "late-gone", childPid: process.pid, sessionFile, snapshotFile: paths.childSnapshot });
+    recorder.record({ kind: "progress", estimated: false });
+    const running = makeRunning({ id: "late-gone", runId: "late-gone", sessionFile, piSessionRef: sessionFile, transcriptStartLine: 0,
+      childSnapshotFile: paths.childSnapshot, wrapperExitFile: paths.wrapperExit, completionState: createVisibleCompletionState("late-gone") });
+    testApi.registerRunningSubagent(runtime.api, running);
+    let probes = 0;
+    const watcher = testApi.watchSubagent(running, new AbortController().signal, {
+      async closeSurface() {}, visibleInterval: 1,
+      processProbe() { if (++probes < 3) return; throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+    });
+    const request = await testApi.handleSubagentTerminate({ id: "late-gone" }, async () => {}, () => "");
+    assert.equal(request.details.status, "termination_requested_unconfirmed");
+    const result = await watcher;
+    assert.equal(result.exitCode, 1);
+    assert.equal(probes, 3);
+    assert.equal(testApi.runningSubagents.has("late-gone"), false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("physically closes and releases on explicit parent cancellation without fabricating exit", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    const testApi = (subagentsModule as any).__test__;
+    const paths = buildVisibleCompletionPaths(dir, "cancel");
+    const sessionFile = join(dir, "cancel.jsonl");
+    writeFileSync(sessionFile, `${JSON.stringify({ type: "session" })}\n`);
+    const completionState = createVisibleCompletionState("cancel");
+    const controller = new AbortController();
+    const running = makeRunning({ id: "cancel", runId: "cancel", sessionFile, transcriptStartLine: 0,
+      childSnapshotFile: paths.childSnapshot, wrapperExitFile: paths.wrapperExit, completionState, abortController: controller });
+    testApi.registerRunningSubagent(runtime.api, running);
+    const closed: string[] = [];
+    const watcher = testApi.watchSubagent(running, controller.signal, { async closeSurface(surface: string) { closed.push(surface); }, visibleInterval: 1 });
+    controller.abort("session_shutdown:reload");
+    const result = await watcher;
+    assert.deepEqual(closed, ["pane-1"]);
+    assert.equal(result.error, "cancelled");
+    assert.equal(completionState.core.process.status, "not-started");
+    assert.equal(testApi.runningSubagents.has("cancel"), false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("maps agent errors and termination to failure even with shell status zero", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const base = { runId: "r", output: "", taskOutcome: "unknown", settled: true, processExit: { kind: "shell", shellStatus: 0 } };
+    assert.equal(testApi.completionExitCode({ ...base, execution: "agent-error" }), 1);
+    assert.equal(testApi.completionExitCode({ ...base, execution: "terminated" }), 1);
+    assert.equal(testApi.completionExitCode({ ...base, execution: "normal-exit" }), 0);
+  });
+
   it("emits nothing when a subagent request is rejected before launch", async () => {
     const runtime = createMockExtensionApi();
     const previousDenyTools = process.env.PI_DENY_TOOLS;
@@ -1791,28 +1884,28 @@ describe("subagent-done.ts", () => {
     });
   });
 
-  describe("shouldAutoExitOnAgentEnd", () => {
+  describe("shouldAutoExitOnAgentSettled", () => {
     it("auto-exits after normal completion when there was no takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+      assert.equal(shouldAutoExitOnAgentSettled(false, messages), true);
     });
 
     it("stays open after user takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), false);
+      assert.equal(shouldAutoExitOnAgentSettled(true, messages), false);
     });
 
     it("stays open after Escape aborts the run", () => {
       const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+      assert.equal(shouldAutoExitOnAgentSettled(false, messages), false);
     });
 
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
+      // parent is woken. The typed completion payload carries the failure
+      // detail; staying open would strand the worker.
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+      assert.equal(shouldAutoExitOnAgentSettled(false, messages), true);
     });
   });
 

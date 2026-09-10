@@ -79,4 +79,47 @@ describe("visible parent completion observer", () => {
     assert.equal(confirmOwnedProcessGone(f.state, () => { const error = Object.assign(new Error("gone"), { code: "ESRCH" }); throw error; }), true);
     assert.deepEqual(f.state.core.process, { status: "exited", exit: { kind: "process-not-found" } });
   });
+
+  it("rechecks an accepted termination until the recorded PID disappears", async () => {
+    const f = fixture();
+    f.recorder.record({ kind: "progress", estimated: false });
+    observeVisibleCompletion({ state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit });
+    recordVisibleControl(f.state, { kind: "terminate-requested", mode: "herdr-pane-close" });
+    let probes = 0;
+    const result = await waitForVisibleCompletion({
+      state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile, transcriptStartLine: 0, sessionRef: f.sessionFile,
+      signal: new AbortController().signal, interval: 1,
+      processProbe() { if (++probes < 3) return; throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+    });
+    assert.equal(probes, 3);
+    assert.equal(result.completion.execution, "terminated");
+    assert.deepEqual(result.completion.processExit, { kind: "process-not-found" });
+  });
+
+  it("rejects changed child identity and bounds alternating corruption diagnostics", () => {
+    const f = fixture();
+    f.recorder.record({ kind: "progress", estimated: false });
+    observeVisibleCompletion({ state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit });
+    const foreign = createChildCompletionRecorder({ runId: "run", childPid: process.pid + 1, sessionFile: "/foreign", snapshotFile: f.paths.childSnapshot });
+    foreign.record({ kind: "progress", estimated: false });
+    foreign.record({ kind: "agent-settled" });
+    for (let i = 0; i < 20; i++) {
+      writeFileSync(i % 2 ? f.paths.childSnapshot : f.paths.wrapperExit, "{");
+      observeVisibleCompletion({ state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit });
+    }
+    assert.equal(f.state.childPid, process.pid);
+    assert.ok(f.state.diagnostics.length <= 8);
+  });
+
+  it("observes an onTick abort without installing a missed timer", async () => {
+    const f = fixture();
+    const controller = new AbortController();
+    await assert.rejects(waitForVisibleCompletion({
+      state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile, transcriptStartLine: 0, signal: controller.signal, interval: 10_000,
+      onTick() { controller.abort("parent cancellation"); throw new Error("callback diagnostic"); },
+    }), /parent cancellation/);
+    assert.ok(f.state.diagnostics.some((message) => message.includes("callback diagnostic")));
+  });
 });

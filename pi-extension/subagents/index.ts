@@ -5,7 +5,7 @@ import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
   visibleHerdrCapabilities,
-  type AgentRunState,
+  type AgentRunCompletion,
   type AgentLaunchIntent,
   type NormalizedAgentDefinition,
 } from "pi-agent-execution";
@@ -624,6 +624,7 @@ interface RunningSubagent {
   sessionMtimeMs?: number;
   sessionProgressAt?: number;
   terminationRequestedAt?: number;
+  terminationRequestState?: "pending" | "accepted";
   terminationOutput?: string;
   blockedEventBus?: ExtensionAPI["events"];
   /**
@@ -1119,16 +1120,18 @@ async function handleSubagentTerminate(
       .trim();
   } catch {}
 
-  if (running.terminationRequestedAt) {
+  if (running.terminationRequestState) {
     return {
       content: [{ type: "text" as const, text: `Termination was already requested for subagent "${running.name}"; process exit remains unconfirmed.` }],
       details: { id: running.id, name: running.name, status: "termination_requested_unconfirmed", surface: running.surface, sessionFile: running.sessionFile },
     };
   }
 
+  running.terminationRequestState = "pending";
   try {
     await close(running.surface);
   } catch (error: any) {
+    running.terminationRequestState = undefined;
     const message =
       `Failed to terminate subagent "${running.name}": ${error?.message ?? String(error)}`;
     return {
@@ -1144,6 +1147,7 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestedAt = Date.now();
+  running.terminationRequestState = "accepted";
   if (running.cli === "claude") {
     releaseRunningSubagent(running.id);
     running.abortController?.abort("terminated_by_parent");
@@ -1245,6 +1249,13 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
+function completionExitCode(completion: AgentRunCompletion): number {
+  if (completion.execution === "normal-exit") return 0;
+  return completion.processExit?.kind === "shell" && completion.processExit.shellStatus !== 0
+    ? completion.processExit.shellStatus
+    : 1;
+}
+
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
   const autoExit = params.autoExit ?? true;
   return { autoExit, interactive: !autoExit };
@@ -1275,6 +1286,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   handleSubagentTerminate,
   resolveResultPresentation,
+  completionExitCode,
   resolveResumeLaunchBehavior,
   registerRunningSubagent,
   releaseRunningSubagent,
@@ -1627,6 +1639,8 @@ async function watchSubagent(
     pollForExit?: typeof pollForExit;
     closeSurface?: typeof closeSurface;
     readScreen?: typeof readScreen;
+    visibleInterval?: number;
+    processProbe?: (pid: number, signal: 0) => void;
   } = {},
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
@@ -1652,8 +1666,10 @@ async function watchSubagent(
           transcriptStartLine: running.transcriptStartLine,
           sessionRef: running.piSessionRef,
           signal: combinedSignal,
-          interval: 1000,
+          interval: dependencies.visibleInterval ?? 1000,
           onTick() { observeRunningSubagent(running); },
+          canComplete: () => running.terminationRequestState !== "pending",
+          processProbe: dependencies.processProbe,
         });
 
     terminalObserved = true;
@@ -1699,10 +1715,12 @@ async function watchSubagent(
     const observed = result as Awaited<ReturnType<typeof waitForVisibleCompletion>>;
     const completion = observed.completion;
     const processExit = completion.processExit;
-    const exitCode = processExit?.kind === "shell" ? processExit.shellStatus : completion.execution === "normal-exit" ? 0 : 1;
+    const exitCode = completionExitCode(completion);
     const summary = completion.output || (completion.errorMessage
       ? `Subagent error: ${completion.errorMessage}`
-      : exitCode !== 0 ? `Sub-agent exited abnormally` : "Sub-agent exited without new output");
+      : completion.execution === "terminated" ? "Subagent terminated by parent request."
+      : completion.execution === "aborted" ? "Subagent process was aborted."
+      : exitCode !== 0 ? "Sub-agent exited abnormally" : "Sub-agent exited without new output");
     if (!running.terminationRequestedAt) await close(surface);
 
     return {
@@ -1718,14 +1736,15 @@ async function watchSubagent(
         .trim();
     } catch {}
 
-    // Observation failures and pane disappearance are diagnostics, never exit
-    // proof. Parent-session cancellation owns its existing explicit cleanup.
-    if (running.cli === "claude") {
+    const watcherAborted = signal.aborted;
+    const moduleAborted = moduleSignal.aborted;
+    // Explicit parent-session cancellation owns physical pane cleanup. An
+    // observer/read failure alone leaves the live child and watcher ownership intact.
+    if (running.cli === "claude" || watcherAborted || moduleAborted) {
       try { await close(surface); } catch {}
     }
 
-    const watcherAborted = signal.aborted;
-    const moduleAborted = moduleSignal.aborted;
+
     const abortDetails = [
       watcherAborted
         ? `watcher=${String(signal.reason ?? "aborted")}`
@@ -2419,17 +2438,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, transcriptStartLine);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            );
+            const presentation = resolveResultPresentation(result, name);
 
             sendIfActive(pi,
               {
