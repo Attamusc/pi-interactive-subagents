@@ -26,14 +26,13 @@ async function waitForRelease() {
 }
 
 export default function (pi: any) {
-  let parentProviderCalls = 0;
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event: any, ctx: any) => {
     const entrypoint = process.argv[1];
     if (!entrypoint || entrypoint.endsWith("deterministic-herdr-provider.ts")) throw new Error(`invalid Pi entrypoint: ${entrypoint ?? "missing"}`);
     const version = spawnSync(process.execPath, [entrypoint, "--version"], { encoding: "utf8", timeout: 5000 });
     if (version.status !== 0 || version.signal || version.error) throw new Error(`Pi version probe failed: ${version.error ?? version.stderr}`);
     appendFileSync(versionsFile, `${JSON.stringify({ pid: process.pid, execPath: process.execPath, entrypoint, version: version.stdout.trim(), subagentId: process.env.PI_SUBAGENT_ID ?? null })}\n`);
-    record("session_start");
+    record("session_start", { sessionFile: ctx.sessionManager.getSessionFile() });
   });
   pi.on("agent_settled", () => record("agent_settled", { snapshot: snapshot() }));
   pi.on("session_shutdown", (event: any) => record("session_shutdown", { reason: event.reason, snapshot: snapshot() }));
@@ -61,10 +60,7 @@ export default function (pi: any) {
       const stream = createAssistantMessageEventStream();
       const child = Boolean(process.env.PI_SUBAGENT_ID);
       const hasToolResult = context.messages.some((message: any) => message.role === "toolResult");
-      if (!child) parentProviderCalls++;
-      const hasParentResult = !child && parentProviderCalls >= 3;
-      if (hasParentResult) record("parent_result_observed");
-      record("provider_invoked", { child, hasToolResult, hasParentResult });
+      record("provider_invoked", { child, hasToolResult });
       queueMicrotask(() => {
         const output: any = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },

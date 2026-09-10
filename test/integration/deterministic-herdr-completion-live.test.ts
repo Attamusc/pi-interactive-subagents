@@ -16,14 +16,17 @@ const providerExtension = join(here, "deterministic-herdr-provider.ts");
 const managedHerdr = join(homedir(), ".pi", "agent", "extensions", "herdr-agent-state.ts");
 
 function herdr(args: string[]) {
-  const output = execFileSync("herdr", args, { encoding: "utf8" }).trim();
+  const output = execFileSync("herdr", args, { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 }).trim();
   if (!output) return {};
   try { return JSON.parse(output).result; }
   catch { return { read: { text: output } }; }
 }
 function lines(file: string): any[] {
   if (!existsSync(file)) return [];
-  return readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const body = readFileSync(file, "utf8");
+  const complete = body.endsWith("\n") ? body.slice(0, -1) : body.slice(0, body.lastIndexOf("\n"));
+  if (!complete) return [];
+  return complete.split("\n").filter(Boolean).map(line => JSON.parse(line));
 }
 async function waitFor<T>(label: string, read: () => T | undefined, timeout = 90_000): Promise<T> {
   const deadline = Date.now() + timeout;
@@ -47,9 +50,26 @@ function findOne(dir: string, suffix: string): string | undefined {
   visit(dir);
   return matches.length === 1 ? matches[0] : undefined;
 }
-function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+function workspaceIsGone(workspaceId: string): boolean {
+  try { herdr(["workspace", "get", workspaceId]); return false; }
+  catch (error) {
+    const stderr = String((error as { stderr?: unknown }).stderr ?? "");
+    if (stderr.includes('"code":"workspace_not_found"')) return true;
+    throw error;
+  }
+}
+function parentResults(sessionFile: string): any[] {
+  return lines(sessionFile).filter(entry => entry.type === "custom_message" && entry.customType === "subagent_result");
+}
 
-it("delivers one real Herdr child result only after done settles and Pi exits", { skip: !enabled, timeout: 120_000 }, async () => {
+it("delivers one real Herdr child result only after done settles and Pi exits", { skip: !enabled, timeout: 120_000 }, async (t) => {
   assert.equal(process.env.HERDR_ENV, "1", "live test must run inside Herdr");
   assert.equal(execFileSync(exactPi, ["--version"], { encoding: "utf8" }).trim(), "0.85.1");
   assert.match(execFileSync("herdr", ["integration", "status"], { encoding: "utf8" }), /^pi: current \(v8\)/m);
@@ -61,10 +81,15 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
   const gate = join(temp, "gate");
   const release = join(temp, "release");
   const versions = join(temp, "versions.jsonl");
-  const forensicDir = resolve(root, "../evidence/herdr-live-repro/latest-run");
+  const evidenceBase = process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir();
+  mkdirSync(evidenceBase, { recursive: true });
+  const forensicDir = mkdtempSync(join(evidenceBase, "pi-herdr-live-evidence-"));
+  t.diagnostic(`Herdr live evidence: ${forensicDir}`);
   let workspaceId: string | undefined;
   let rootPane: string | undefined;
   let childPid: number | undefined;
+  let parentPid: number | undefined;
+  let parentSessionFile: string | undefined;
   let completed = false;
   try {
     mkdirSync(join(agentDir, "agents"), { recursive: true });
@@ -102,7 +127,12 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
       }).join("\n");
       throw new Error(`${error instanceof Error ? error.message : error}\nEvents:\n${readFileSync(events, "utf8")}\nPanes:\n${paneScreens}\nParent pane:\n${screen.read?.text ?? JSON.stringify(screen)}`);
     }
-    const gateEvent = lines(events).find(event => event.event === "child_done_tool_result_gate");
+    const observedEvents = lines(events);
+    const parentStart = observedEvents.find(event => event.event === "session_start" && event.subagentId === null);
+    const gateEvent = observedEvents.find(event => event.event === "child_done_tool_result_gate");
+    assert.ok(parentStart?.sessionFile, "parent must record its public session file");
+    parentPid = parentStart.pid;
+    parentSessionFile = parentStart.sessionFile;
     assert.ok(gateEvent, "real child subagent_done must reach tool_result");
     childPid = gateEvent.pid;
     assert.equal(gateEvent.processAlive, true);
@@ -116,14 +146,14 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
     const childSnapshot = findOne(sessions, ".child.json") ?? await waitFor("child snapshot path", () => findOne(sessions, ".child.json"));
     const wrapper = childSnapshot.replace(/\.child\.json$/, ".wrapper.json");
     assert.equal(existsSync(wrapper), false, "wrapper must not report exit at the done tool-result gate");
-    assert.equal(lines(events).filter(event => event.event === "parent_result_observed").length, 0);
+    assert.equal(parentResults(parentSessionFile).length, 0, "parent session must contain no result at the gate");
     const state = createVisibleCompletionState(gateEvent.snapshot.runId);
     const status = observeVisibleCompletion({ state, childSnapshotFile: childSnapshot, wrapperExitFile: wrapper });
     assert.deepEqual({ status: status.status, terminal: status.terminal }, { status: "finishing", terminal: false });
     assert.equal(herdr(["pane", "get", rootPane]).pane.agent_status, "blocked");
 
     writeFileSync(release, "release\n");
-    await waitFor("one parent delivery", () => lines(events).filter(event => event.event === "parent_result_observed").length === 1 ? true : undefined);
+    await waitFor("one parent delivery", () => parentResults(parentSessionFile!).length === 1 ? true : undefined);
     await waitFor("wrapper exit", () => existsSync(wrapper) ? true : undefined);
     await waitFor("child process exit", () => !alive(childPid!) ? true : undefined);
 
@@ -140,7 +170,12 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
     assert.equal(wrapperRecord.sourceId, `wrapper:${finalSnapshot.runId}`);
     assert.equal(wrapperRecord.exit.shellStatus, 0);
     assert.ok(Date.parse(wrapperRecord.observedAt) >= Date.parse(shutdown.observedAt));
-    assert.equal(lines(events).filter(event => event.event === "parent_result_observed").length, 1);
+    const delivered = parentResults(parentSessionFile);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].details.name, "DeterministicChild");
+    assert.equal(delivered[0].details.sessionFile, finalSnapshot.sessionFile);
+    assert.equal(delivered[0].details.exitCode, 0);
+    assert.match(delivered[0].content, /CHILD_POST_TOOL_STOP/);
     assert.ok(existsSync(finalSnapshot.sessionFile));
     assert.equal(lines(finalSnapshot.sessionFile)[0].type, "session");
 
@@ -154,20 +189,19 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
       const statusNow = herdr(["pane", "get", rootPane!]).pane.agent_status;
       return panes.length === 1 && statusNow !== "blocked" ? true : undefined;
     });
+    assert.equal(parentResults(parentSessionFile).length, 1, "cleanup must not duplicate delivery");
     completed = true;
   } finally {
+    const evidenceRun = join(forensicDir, "run");
+    if (existsSync(temp)) cpSync(temp, evidenceRun, { recursive: true });
+    writeFileSync(join(forensicDir, "result.json"), `${JSON.stringify({ completed, recordedAt: new Date().toISOString(), workspaceId, rootPane, parentPid, childPid, workingTemp: temp }, null, 2)}\n`);
     if (workspaceId) {
-      try { herdr(["workspace", "close", workspaceId]); } catch {}
-      await waitFor("owned workspace cleanup", () => {
-        try { herdr(["workspace", "get", workspaceId!]); return undefined; } catch { return true; }
-      }, 10_000).catch(() => undefined);
+      herdr(["workspace", "close", workspaceId]);
+      await waitFor("owned workspace cleanup", () => workspaceIsGone(workspaceId!) ? true : undefined, 10_000);
     }
-    if (childPid) assert.equal(alive(childPid), false, "owned child PID must be gone after cleanup");
-    if (existsSync(temp)) {
-      rmSync(forensicDir, { recursive: true, force: true });
-      cpSync(temp, forensicDir, { recursive: true });
-      writeFileSync(join(forensicDir, "result.json"), `${JSON.stringify({ completed, recordedAt: new Date().toISOString() }, null, 2)}\n`);
-    }
+    if (parentPid) await waitFor("owned parent PID exit", () => !alive(parentPid!) ? true : undefined, 10_000);
+    if (childPid) await waitFor("owned child PID exit", () => !alive(childPid!) ? true : undefined, 10_000);
+    writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ workspaceGone: workspaceId ? workspaceIsGone(workspaceId) : true, parentGone: parentPid ? !alive(parentPid) : null, childGone: childPid ? !alive(childPid) : null }, null, 2)}\n`);
     rmSync(temp, { recursive: true, force: true });
   }
 });
