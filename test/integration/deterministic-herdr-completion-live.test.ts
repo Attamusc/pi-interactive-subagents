@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -348,11 +348,11 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
   try {
     for (const dir of ["agents", "extensions", "packages", "models"]) mkdirSync(join(agentDir, dir), { recursive: true });
     mkdirSync(sessions, { recursive: true });
-    writeFileSync(join(agentDir, "settings.json"), "{\"packages\":[]}\n");
+    writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ packages: [], extensions: [sourceExtension] })}\n`);
     writeFileSync(join(agentDir, "models.json"), "{\"providers\":{}}\n");
     writeFileSync(join(agentDir, "extensions", "deterministic-herdr-provider.ts"), readFileSync(providerExtension, "utf8"));
     writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: join(temp, "unused-gate"), releaseFile: join(temp, "unused-release"), versionsFile: versions, siblingReleaseFile: siblingRelease, scenario: "siblings" }, null, 2)}\n`);
-    writeFileSync(join(agentDir, "agents", "deterministic-held-child.md"), `---\nname: deterministic-held-child\ndescription: held sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: false\ndisable-model-invocation: true\n---\nHold until terminated.\n`);
+    writeFileSync(join(agentDir, "agents", "deterministic-held-child.md"), `---\nname: deterministic-held-child\ndescription: held sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: false\nsystem-prompt: append\ndisable-model-invocation: true\n---\nHold until terminated.\n`);
     writeFileSync(join(agentDir, "agents", "deterministic-auto-child.md"), `---\nname: deterministic-auto-child\ndescription: auto-exit sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: true\nsession-mode: fork\ndisable-model-invocation: true\n---\nHold until released, then finish.\n`);
     const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST deterministic-siblings ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
     workspaceId = created.workspace.workspace_id;
@@ -453,6 +453,20 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     childPids.push(resumedStart.pid);
     assert.notEqual(resumedStart.pid, aHeld.pid);
     assert.equal(resumedStart.sessionFile, aSpawn.message.details.sessionFile);
+    assert.equal(resumedStart.agent, "deterministic-held-child");
+    assert.equal(resumedStart.cwd, realpathSync(temp));
+    assert.equal(resumedStart.agentDir, agentDir);
+    assert.deepEqual(resumedStart.activeTools.sort(), ["caller_ping", "subagent_done"]);
+    assert.deepEqual(
+      resumedStart.deniedTools.split(",").sort(),
+      ["subagent", "subagent_interrupt", "subagent_resume", "subagent_terminate", "subagents_list"].sort(),
+    );
+    const resumedPrompt = await waitFor("resumed system prompt", () => lines(events).find(event => event.event === "before_agent_start" && event.subagentName === "ResumedA"));
+    assert.match(resumedPrompt.systemPrompt, /Hold until terminated\./);
+    const resumePolicies = lines(aSpawn.message.details.sessionFile).filter(entry => entry.type === "custom" && entry.customType === "pi-interactive-subagents.resume-policy");
+    assert.equal(resumePolicies.length, 1);
+    assert.equal(resumePolicies[0].data.agent, "deterministic-held-child");
+    assert.deepEqual(resumePolicies[0].data.activeTools, ["caller_ping", "subagent_done"]);
     const resumedResult = await waitFor("fresh resumed result", () => parentResults(parentSessionFile!).find(result => result.details.name === "ResumedA"));
     assert.equal(resumedResult.details.exitCode, 0);
     assert.equal(resumedResult.details.sessionFile, aSpawn.message.details.sessionFile);

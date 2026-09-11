@@ -8,6 +8,13 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { createChildCompletionRecorder } from "./completion.ts";
+import { getDirectChildCount, setDirectChildCountObserver } from "./ownership.ts";
+import {
+  RESUME_POLICY_CUSTOM_TYPE,
+  RESUME_POLICY_ENV,
+  createResumePolicy,
+  parseLaunchPolicySeed,
+} from "./resume-policy.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -75,6 +82,9 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const launchPolicySeed = process.env[RESUME_POLICY_ENV]
+    ? parseLaunchPolicySeed(process.env[RESUME_POLICY_ENV])
+    : null;
   const runId = process.env.PI_SUBAGENT_ID;
   const snapshotFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
   const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -93,6 +103,7 @@ export default function (pi: ExtensionAPI) {
     runningChildId: runId,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  setDirectChildCountObserver((count) => recorder.directChildCount(count));
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -149,6 +160,7 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let latestMessages: any[] | undefined;
   let explicitCompletionRequested = false;
+  let launchPolicyPersisted = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -157,6 +169,15 @@ export default function (pi: ExtensionAPI) {
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
+
+    if (launchPolicySeed && !launchPolicyPersisted) {
+      pi.appendEntry(
+        RESUME_POLICY_CUSTOM_TYPE,
+        createResumePolicy(launchPolicySeed, ctx.sessionManager.getSessionId(), pi.getActiveTools()),
+      );
+      launchPolicyPersisted = true;
+      delete process.env[RESUME_POLICY_ENV];
+    }
 
     renderWidget(ctx, null);
   });
@@ -187,7 +208,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     completionRecorder.record({ kind: "agent-settled" });
-    if (explicitCompletionRequested || !autoExit || !shouldAutoExitOnAgentSettled(userTookOver, latestMessages)) {
+    if (
+      explicitCompletionRequested ||
+      !autoExit ||
+      getDirectChildCount() > 0 ||
+      !shouldAutoExitOnAgentSettled(userTookOver, latestMessages)
+    ) {
       return;
     }
 
@@ -249,6 +275,7 @@ export default function (pi: ExtensionAPI) {
     const reason = (event as any).reason;
     completionRecorder.record({ kind: "session-shutdown", reason });
     recorder.sessionShutdown(reason);
+    setDirectChildCountObserver(null);
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -271,6 +298,17 @@ export default function (pi: ExtensionAPI) {
       message: Type.String({ description: "What you need help with" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const directChildCount = getDirectChildCount();
+      if (directChildCount > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `Cannot exit while ${directChildCount} directly owned subagent${directChildCount === 1 ? " is" : "s are"} still running. Wait for or terminate them first.`,
+          }],
+          details: { error: "owned-subagents-active", count: directChildCount },
+        };
+      }
+
       const payload = {
         kind: "ping" as const,
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
@@ -296,6 +334,17 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const directChildCount = getDirectChildCount();
+      if (directChildCount > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `Cannot exit while ${directChildCount} directly owned subagent${directChildCount === 1 ? " is" : "s are"} still running. Wait for or terminate them first.`,
+          }],
+          details: { error: "owned-subagents-active", count: directChildCount },
+        };
+      }
+
       completionRecorder.record({ kind: "completion-requested", reason: "done" }, { kind: "done" });
       explicitCompletionRequested = true;
       recorder.subagentDone();

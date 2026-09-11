@@ -71,6 +71,14 @@ import {
   waitForVisibleCompletion,
   type VisibleCompletionState,
 } from "./completion-watch.ts";
+import { getDirectChildCount, notifyDirectChildCount, setDirectChildCountProvider } from "./ownership.ts";
+import {
+  RESUME_POLICY_ENV,
+  readResumePolicy,
+  serializeLaunchPolicySeed,
+  type LaunchPolicySeed,
+  type ResumePolicy,
+} from "./resume-policy.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -679,10 +687,29 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Whether this child can directly launch another visible subagent. */
+  canSpawnDirectChildren: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+let pendingOwnedLaunches = 0;
+
+function notifyOwnershipChanged(): void {
+  notifyDirectChildCount(getDirectChildCount());
+}
+
+function beginOwnedLaunch(): () => void {
+  pendingOwnedLaunches += 1;
+  notifyOwnershipChanged();
+  let finished = false;
+  return () => {
+    if (finished) return;
+    finished = true;
+    pendingOwnedLaunches = Math.max(0, pendingOwnedLaunches - 1);
+    notifyOwnershipChanged();
+  };
+}
 
 function emitHerdrBlocked(
   eventBus: ExtensionAPI["events"],
@@ -700,6 +727,7 @@ function registerRunningSubagent(pi: ExtensionAPI, running: RunningSubagent): vo
     active: true,
     label: "waiting on subagent",
   });
+  notifyOwnershipChanged();
 }
 
 function releaseRunningSubagent(id: string): boolean {
@@ -710,7 +738,28 @@ function releaseRunningSubagent(id: string): boolean {
   if (running.blockedEventBus) {
     emitHerdrBlocked(running.blockedEventBus, { active: false });
   }
+  notifyOwnershipChanged();
   return true;
+}
+
+async function shutdownOwnedSubagents(
+  reason: string,
+  close: (surface: string) => Promise<void> = closeSurface,
+): Promise<string[]> {
+  const owned = [...runningSubagents.values()];
+  for (const running of owned) {
+    running.abortController?.abort(`session_shutdown:${reason}`);
+    releaseRunningSubagent(running.id);
+  }
+  const failures: string[] = [];
+  await Promise.all(owned.map(async (running) => {
+    try {
+      await close(running.surface);
+    } catch (error) {
+      failures.push(`${running.name} [${running.id}]: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }));
+  return failures;
 }
 
 // ── Widget management ──
@@ -1156,6 +1205,25 @@ async function handleSubagentTerminate(
 
   const running = resolved.running;
   observeRunningSubagent(running);
+  const directChildCount = running.activityRead?.ok ? running.activity?.directChildCount : undefined;
+  if (running.canSpawnDirectChildren && directChildCount !== 0) {
+    const count = directChildCount;
+    const ownership = count == null ? "its direct-child ownership is not yet known" : `it owns ${count} running direct child${count === 1 ? "" : "ren"}`;
+    const message =
+      `Cannot hard-terminate subagent "${running.name}" because ${ownership}. ` +
+      "Wait for its children to finish or terminate them from their direct owner first.";
+    return {
+      content: [{ type: "text" as const, text: message }],
+      details: {
+        error: "owned-subagents-active",
+        id: running.id,
+        name: running.name,
+        directChildCount: count,
+        surface: running.surface,
+        sessionFile: running.sessionFile,
+      },
+    };
+  }
   if (running.cli !== "claude" && running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
     observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
   }
@@ -1308,6 +1376,33 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function canSpawnDirectChildren(activeTools: readonly string[] | null, deniedTools: ReadonlySet<string>): boolean {
+  return !deniedTools.has("subagent") && (activeTools === null || activeTools.includes("subagent"));
+}
+
+function createLaunchPolicySeed(params: {
+  agent?: string;
+  deniedTools: ReadonlySet<string>;
+  cwd: string;
+  agentDir: string;
+  systemPrompt: AgentLaunchIntent["effective"]["systemPrompt"];
+}): LaunchPolicySeed {
+  return {
+    version: 1,
+    agent: params.agent ?? null,
+    deniedTools: [...params.deniedTools].sort(),
+    cwd: params.cwd,
+    agentDir: params.agentDir,
+    systemPrompt: params.systemPrompt
+      ? { mode: params.systemPrompt.mode ?? null, text: params.systemPrompt.text }
+      : null,
+  };
+}
+
+function resumePolicyCanSpawn(policy: ResumePolicy): boolean {
+  return canSpawnDirectChildren(policy.activeTools, new Set(policy.deniedTools));
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1336,12 +1431,19 @@ export const __test__ = {
   projectResultDetails,
   completionExitCode,
   resolveResumeLaunchBehavior,
+  canSpawnDirectChildren,
+  beginOwnedLaunch,
+  createLaunchPolicySeed,
+  resumePolicyCanSpawn,
   registerRunningSubagent,
   releaseRunningSubagent,
+  shutdownOwnedSubagents,
   watchSubagent,
   runningSubagents,
   formatElapsed,
   getModuleAbortSignal,
+  abortModulePolls,
+  ensureModuleAbortController,
 };
 
 function startWidgetRefresh() {
@@ -1380,7 +1482,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs, ctx.cwd);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs, ctx.cwd);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1430,6 +1532,13 @@ async function launchSubagent(
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
+  const launchPolicySeed = createLaunchPolicySeed({
+    agent: params.agent,
+    deniedTools: denySet,
+    cwd: targetCwdForSession,
+    agentDir: effectiveAgentDir,
+    systemPrompt: launchIntent.effective.systemPrompt,
+  });
   const { identity, roleBlock, cliFlag } = resolveVisibleIdentityRouting(launchIntent);
   const fullTask = inheritsConversationContext
     ? params.task
@@ -1499,6 +1608,7 @@ async function launchSubagent(
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
+      canSpawnDirectChildren: false,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1542,27 +1652,16 @@ async function launchSubagent(
     parts.push("--tools", shellEscape(toolAllowlist));
   }
 
-  // Build env prefix: denied tools + subagent identity + config dir propagation
-  const envParts: string[] = [];
-
-  // If the target cwd has its own .pi/agent/, use that as the config root.
-  // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
-  } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
-  }
-
-  if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
-  }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
+  // Assign every authority-bearing variable explicitly so a nested launch
+  // cannot inherit the direct parent's identity, deny set, or lifetime mode.
+  const envParts: string[] = [
+    `PI_CODING_AGENT_DIR=${shellEscape(effectiveAgentDir)}`,
+    `PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`,
+    `PI_SUBAGENT_NAME=${shellEscape(params.name)}`,
+    `PI_SUBAGENT_AGENT=${shellEscape(params.agent ?? "")}`,
+    `${RESUME_POLICY_ENV}=${shellEscape(serializeLaunchPolicySeed(launchPolicySeed))}`,
+    `PI_SUBAGENT_AUTO_EXIT=${agentDefs?.autoExit ? "1" : "0"}`,
+  ];
   const completionPaths = buildVisibleCompletionPaths(artifactDir, id);
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -1645,6 +1744,10 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
+    canSpawnDirectChildren: canSpawnDirectChildren(
+      toolAllowlist ? toolAllowlist.split(",") : null,
+      denySet,
+    ),
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1852,10 +1955,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ensureModuleAbortController();
     latestCtx = ctx;
     sessionActive = true;
+    setDirectChildCountProvider(() => runningSubagents.size + pendingOwnedLaunches);
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (event, _ctx) => {
+  pi.on("session_shutdown", async (event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1867,14 +1971,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
     abortModulePolls(`session_shutdown:${event.reason}`);
-    for (const agent of [...runningSubagents.values()]) {
-      agent.abortController?.abort(`session_shutdown:${event.reason}`);
-      releaseRunningSubagent(agent.id);
+    try {
+      const failures = await shutdownOwnedSubagents(event.reason);
+      if (failures.length > 0) {
+        console.error(`Failed to close directly owned subagents during session shutdown: ${failures.join("; ")}`);
+      }
+    } finally {
+      // The runtime is invalid past this point. Drop the captured ctx and mark the
+      // session inactive so deferred callbacks short-circuit instead of throwing.
+      sessionActive = false;
+      latestCtx = null;
+      setDirectChildCountProvider(null);
     }
-    // The runtime is invalid past this point. Drop the captured ctx and mark the
-    // session inactive so deferred callbacks short-circuit instead of throwing.
-    sessionActive = false;
-    latestCtx = null;
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1940,9 +2048,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
-        registerRunningSubagent(pi, running);
+        // Reserve direct ownership before host creation so an enclosing parent
+        // cannot exit or be hard-terminated during the launch window.
+        const finishOwnedLaunch = beginOwnedLaunch();
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx);
+          registerRunningSubagent(pi, running);
+        } finally {
+          finishOwnedLaunch();
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2340,25 +2455,54 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        let resumePolicy: ResumePolicy;
+        try {
+          resumePolicy = readResumePolicy(params.sessionPath);
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `Error: cannot resume without trusted launch policy: ${error instanceof Error ? error.message : String(error)}`,
+            }],
+            details: { error: "invalid resume policy" },
+          };
+        }
+        if (!existsSync(resumePolicy.cwd) || !existsSync(resumePolicy.agentDir)) {
+          return {
+            content: [{
+              type: "text",
+              text: "Error: cannot resume because the recorded working directory or agent configuration root no longer exists.",
+            }],
+            details: { error: "resume policy path missing" },
+          };
+        }
+
         // Record the raw nonempty-line offset before resuming so extraction only
         // sees transcript entries appended by this run.
         const transcriptStartLine = countNonemptyLines(params.sessionPath);
-
-        const surface = await createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         const completionPaths = buildVisibleCompletionPaths(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+
+        // Build pi resume command from the immutable authority captured by the
+        // original child process. Display name and auto-exit are run-local only.
+        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+        parts.push("-e", shellEscape(subagentDonePath));
+        parts.push("--tools", shellEscape(resumePolicy.activeTools.join(",")));
+
+        let resumeSystemPromptFile: string | undefined;
+        if (resumePolicy.systemPrompt?.mode && resumePolicy.systemPrompt.text) {
+          resumeSystemPromptFile = join(artifactDir, "context", `resume-policy-${id}.md`);
+          mkdirSync(dirname(resumeSystemPromptFile), { recursive: true });
+          writeFileSync(resumeSystemPromptFile, resumePolicy.systemPrompt.text, "utf8");
+          parts.push(
+            resumePolicy.systemPrompt.mode === "replace" ? "--system-prompt" : "--append-system-prompt",
+            shellEscape(resumeSystemPromptFile),
+          );
+        }
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2378,46 +2522,58 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
+        const resumeEnvParts: string[] = [
+          `PI_CODING_AGENT_DIR=${shellEscape(resumePolicy.agentDir)}`,
+          `PI_SUBAGENT_NAME=${shellEscape(name)}`,
+          `PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`,
+          `PI_SUBAGENT_ID=${shellEscape(id)}`,
+          `PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`,
+          `PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`,
+        ];
+        resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(resumePolicy.agent ?? "")}`);
+        resumeEnvParts.push(`PI_DENY_TOOLS=${shellEscape(resumePolicy.deniedTools.join(","))}`);
+        resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = buildVisibleWrapperCommand({
-          piCommand: resumeEnvPrefix + parts.join(" "),
-          runId: id,
-          wrapperExitFile: completionPaths.wrapperExit,
-        });
-        const launchScriptFile = join(
-          artifactDir,
-          "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
-        );
-        await sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+        const finishOwnedLaunch = beginOwnedLaunch();
+        let surface: string;
+        let launchScriptFile: string;
+        try {
+          surface = await createSurface(name);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+
+          const command = buildVisibleWrapperCommand({
+            piCommand: `cd ${shellEscape(resumePolicy.cwd)} && ${resumeEnvPrefix}${parts.join(" ")}`,
+            runId: id,
+            wrapperExitFile: completionPaths.wrapperExit,
+          });
+          launchScriptFile = join(
+            artifactDir,
+            "subagent-scripts",
+            `${name
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, "")
+              .replace(/\s+/g, "-")
+              .replace(/-+/g, "-")
+              .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+          );
+          await sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${params.sessionPath}`,
+              `# Surface: ${surface}`,
+              `# Agent: ${resumePolicy.agent ?? "unnamed"}`,
+              `# Working directory: ${resumePolicy.cwd}`,
+              ...(resumeSystemPromptFile ? [`# System prompt file: ${resumeSystemPromptFile}`] : []),
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
+        } catch (error) {
+          finishOwnedLaunch();
+          throw error;
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2425,6 +2581,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           runId: id,
           name,
           task: params.message ?? "resumed session",
+          agent: resumePolicy.agent ?? undefined,
           surface,
           startTime,
           sessionFile: params.sessionPath,
@@ -2436,12 +2593,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          canSpawnDirectChildren: resumePolicyCanSpawn(resumePolicy),
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
           }),
         };
         registerRunningSubagent(pi, running);
+        finishOwnedLaunch();
 
         // Fire-and-forget watcher
         const watcherAbort = new AbortController();
@@ -2516,6 +2675,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             sessionPath: params.sessionPath,
+            agent: resumePolicy.agent ?? undefined,
             launchScriptFile,
             status: "started",
           },

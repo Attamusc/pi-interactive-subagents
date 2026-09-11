@@ -22,6 +22,7 @@ export type SubagentActivityEvent =
   | "tool_execution_end"
   | "caller_ping"
   | "subagent_done"
+  | "owned_subagents_changed"
   | "session_shutdown";
 
 export interface SubagentActivityState {
@@ -45,6 +46,7 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  directChildCount?: number;
 }
 
 export type ActivityReadResult =
@@ -72,6 +74,7 @@ export interface SubagentActivityRecorder {
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   callerPing(): void;
   subagentDone(): void;
+  directChildCount(count: number): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
 
@@ -97,6 +100,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_execution_end",
   "caller_ping",
   "subagent_done",
+  "owned_subagents_changed",
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
@@ -176,11 +180,15 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalInteger(object, "turnIndex"),
     validateOptionalFiniteNumber(object, "toolStartedAt"),
     validateOptionalFiniteNumber(object, "toolEndedAt"),
+    validateOptionalInteger(object, "directChildCount"),
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
+  if (typeof object.directChildCount === "number" && object.directChildCount < 0) {
+    return invalidActivity("directChildCount must be nonnegative when present");
+  }
 
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
@@ -241,6 +249,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionEnd() {},
     callerPing() {},
     subagentDone() {},
+    directChildCount() {},
     sessionShutdown() {},
   };
 }
@@ -314,6 +323,7 @@ export function createSubagentActivityRecorder(params: {
     turnActive: false,
     providerActive: false,
     toolActive: false,
+    directChildCount: 0,
   };
 
   let disabled = false;
@@ -502,6 +512,12 @@ export function createSubagentActivityRecorder(params: {
     },
     subagentDone() {
       markDone("subagent_done");
+    },
+    directChildCount(count) {
+      if (!Number.isSafeInteger(count) || count < 0) return;
+      record("owned_subagents_changed", (current) => {
+        current.directChildCount = count;
+      }, "immediate");
     },
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");

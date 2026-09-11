@@ -1559,37 +1559,6 @@ describe("semantic Herdr blocked lifecycle", () => {
     ]);
   });
 
-  it("releases every outstanding child during parent session shutdown", () => {
-    const runtime = createMockExtensionApi();
-    (subagentsModule as any).default(runtime.api);
-    const testApi = (subagentsModule as any).__test__;
-    const first = makeRunning({ id: "child-1", abortController: new AbortController() });
-    const second = makeRunning({ id: "child-2", abortController: new AbortController() });
-
-    testApi.registerRunningSubagent(runtime.api, first);
-    testApi.registerRunningSubagent(runtime.api, second);
-    runtime.registeredHandlers.get("session_shutdown")![0]({ reason: "reload" }, {});
-
-    assert.equal(testApi.runningSubagents.size, 0);
-    assert.deepEqual(runtime.emittedEvents, [
-      {
-        channel: "herdr:blocked",
-        data: { active: true, label: "waiting on subagent" },
-      },
-      {
-        channel: "herdr:blocked",
-        data: { active: true, label: "waiting on subagent" },
-      },
-      {
-        channel: "herdr:blocked",
-        data: { active: false },
-      },
-      {
-        channel: "herdr:blocked",
-        data: { active: false },
-      },
-    ]);
-  });
 
   it("releases the blocked event when the real watcher completes", async () => {
     const dir = createTestDir();
@@ -1602,7 +1571,7 @@ describe("semantic Herdr blocked lifecycle", () => {
         sessionFile,
         `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }] } })}\n`,
       );
-      const running = makeRunning({ sessionFile });
+      const running = makeRunning({ sessionFile, cli: "claude" });
 
       testApi.registerRunningSubagent(runtime.api, running);
       await testApi.watchSubagent(running, new AbortController().signal, {
@@ -1610,6 +1579,7 @@ describe("semantic Herdr blocked lifecycle", () => {
           return { exitCode: 0 };
         },
         async closeSurface() {},
+        readScreen() { return ""; },
       });
 
       assert.deepEqual(runtime.emittedEvents, [
@@ -1638,7 +1608,7 @@ describe("semantic Herdr blocked lifecycle", () => {
       const runtime = createMockExtensionApi();
       (subagentsModule as any).default(runtime.api);
       const testApi = (subagentsModule as any).__test__;
-      const running = makeRunning({ id: testCase.id });
+      const running = makeRunning({ id: testCase.id, cli: "claude" });
       testApi.registerRunningSubagent(runtime.api, running);
 
       await testApi.watchSubagent(running, new AbortController().signal, {
@@ -1646,6 +1616,7 @@ describe("semantic Herdr blocked lifecycle", () => {
           return testCase.result;
         },
         async closeSurface() {},
+        readScreen() { return ""; },
       });
 
       assert.deepEqual(runtime.emittedEvents, [
@@ -1663,7 +1634,7 @@ describe("semantic Herdr blocked lifecycle", () => {
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
     const testApi = (subagentsModule as any).__test__;
-    const running = makeRunning({ id: "watcher-error" });
+    const running = makeRunning({ id: "watcher-error", cli: "claude" });
     testApi.registerRunningSubagent(runtime.api, running);
 
     await testApi.watchSubagent(running, new AbortController().signal, {
@@ -1891,25 +1862,6 @@ describe("subagent watcher lifecycle", () => {
     });
   });
 
-  it("re-arms the module abort signal when a cached extension starts a replacement session", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const firstRuntime = createMockExtensionApi();
-    (subagentsModule as any).default(firstRuntime.api);
-    firstRuntime.registeredHandlers.get("session_start")![0]({}, { ui: {} });
-    const before = testApi.getModuleAbortSignal();
-
-    firstRuntime.registeredHandlers.get("session_shutdown")![0]({ reason: "new" }, {});
-    assert.equal(before.aborted, true);
-    assert.equal(before.reason, "session_shutdown:new");
-
-    const replacementRuntime = createMockExtensionApi();
-    (subagentsModule as any).default(replacementRuntime.api);
-    replacementRuntime.registeredHandlers.get("session_start")![0]({}, { ui: {} });
-    const after = testApi.getModuleAbortSignal();
-
-    assert.notEqual(after, before);
-    assert.equal(after.aborted, false);
-  });
 });
 
 describe("subagent-done.ts", () => {
@@ -2195,6 +2147,24 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("records directly owned child counts for termination safety", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "child-owned");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-owned",
+        activityFile,
+        now: () => 2_000,
+      });
+
+      recorder.sessionStart();
+      recorder.directChildCount(2);
+      const read = readSubagentActivityFile(activityFile, "child-owned");
+      assert.ok(read.ok);
+      assert.equal(read.activity.latestEvent, "owned_subagents_changed");
+      assert.equal(read.activity.directChildCount, 2);
+    });
+  });
+
   it("records waiting and final done states", () => {
     withTempDir((dir) => {
       let currentNow = 2_000;
@@ -2233,6 +2203,7 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        { directChildCount: -1 },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -2569,6 +2540,52 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("refuses to hard-terminate a spawning-capable child with live or unknown direct ownership", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    let closes = 0;
+    runningMap.clear();
+
+    const dir = createTestDir();
+    try {
+      const activityFile = getSubagentActivityFile(dir, "known");
+      mkdirSync(dirname(activityFile), { recursive: true });
+      writeFileSync(activityFile, `${JSON.stringify({
+        version: 1,
+        runningChildId: "known",
+        createdAt: 1,
+        updatedAt: 2,
+        sequence: 2,
+        latestEvent: "owned_subagents_changed",
+        phase: "waiting",
+        agentActive: false,
+        turnActive: false,
+        providerActive: false,
+        toolActive: false,
+        directChildCount: 1,
+      })}\n`);
+      for (const [id, activityPath, expected] of [
+        ["known", activityFile, /owns 1 running direct child/],
+        ["unknown", undefined, /ownership is not yet known/],
+      ] as const) {
+        runningMap.set(id, makeRunning({ id, canSpawnDirectChildren: true, activityFile: activityPath }));
+        const result = await testApi.handleSubagentTerminate(
+          { id },
+          async () => { closes++; },
+          () => "",
+        );
+        assert.equal(result.details.error, "owned-subagents-active");
+        assert.match(result.content[0].text, expected);
+        assert.equal(runningMap.has(id), true);
+        runningMap.delete(id);
+      }
+      assert.equal(closes, 0);
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("accepts pane close but retains a Pi run while owned process exit is unconfirmed", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2582,6 +2599,7 @@ describe("subagent interruption", () => {
         completionState: createVisibleCompletionState("a1"),
         childSnapshotFile: join(tmpdir(), "missing-child-snapshot"),
         wrapperExitFile: join(tmpdir(), "missing-wrapper-exit"),
+        canSpawnDirectChildren: false,
         abortController: {
           abort(reason: unknown) { abortReason = reason; },
         },

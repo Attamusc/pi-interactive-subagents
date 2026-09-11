@@ -205,7 +205,7 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ### Hard termination
 
-`subagent_terminate` requests pane closure. For Pi-backed runs, an accepted close request is not treated as proof that the child exited: the watcher and registry entry remain until the correlated wrapper record appears or the previously recorded child PID is confirmed absent. The tool can therefore acknowledge `termination_requested_unconfirmed`; it does not invent an exit code or signal.
+`subagent_terminate` requests pane closure. For Pi-backed runs, an accepted close request is not treated as proof that the child exited: the watcher and registry entry remain until the correlated wrapper record appears or the previously recorded child PID is confirmed absent. The tool can therefore acknowledge `termination_requested_unconfirmed`; it does not invent an exit code or signal. A spawning-capable child is not hard-terminated while its direct-child ownership is nonzero or unknown; the direct owner must finish or terminate those children first. Session shutdown requests closure of every directly owned child pane before relinquishing the process-local registry.
 
 Normal Pi completion uses the same two-phase rule. `subagent_done`, `caller_ping`, and autonomous settlement record completion intent first, producing `finishing`. Delivery and cleanup happen only after the foreground Pi command returns and its wrapper records the shell status. The one-shot wrapper uses `node` from the child pane's `PATH`; this repository's Node-based Pi deployment provides it, but other platform environments have not been validated. Failure to write the wrapper record is diagnostic and is not process-exit evidence. No dependency fallback or automatic provisioning is attempted.
 
@@ -230,6 +230,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
 4. Parent resumes the child session via `subagent_resume` with the response
 5. Child picks up where it left off with the parent's guidance
+
+A Pi subagent records a versioned resume policy in its session when it first starts. Resume restores that session's agent identity, active-tool ceiling, denied tools, working directory, agent configuration root, and explicit system-prompt routing. The `autoExit` argument may change the resumed run's lifetime behavior, but it cannot widen authority. Sessions without valid package-owned resume policy are rejected before a pane is created; use `pi --session` directly when intentionally opening an unrelated Pi session.
 
 **Example:**
 ```typescript
@@ -352,6 +354,7 @@ When set to `true`, the agent session requests shutdown automatically after `age
 - Shutdown is requested after the agent's final work reaches `agent_settled`
 - The parent reports `finishing` until the wrapper proves the foreground Pi process returned
 - If the user sends **any input** before the agent settles, auto-exit is permanently disabled for that session — the user takes over interactively
+- If the process directly owns running subagents, auto-exit waits for their results instead of abandoning their process-local ownership. `subagent_done` and `caller_ping` likewise refuse to exit until directly owned children finish.
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
