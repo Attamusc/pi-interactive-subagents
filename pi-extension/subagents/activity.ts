@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -104,6 +105,22 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
+const NON_DISPLAY_SAFE_ACTIVITY_ID = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Keep the activity copy of an opaque provider tool-call ID bounded and safe
+ * for snapshots/widgets. Pi messages and tool events retain the original ID.
+ */
+function observeToolCallId(toolCallId: string | undefined): string | undefined {
+  if (toolCallId == null) return undefined;
+  if (
+    toolCallId.length <= MAX_ACTIVITY_STRING_LENGTH &&
+    !NON_DISPLAY_SAFE_ACTIVITY_ID.test(toolCallId)
+  ) {
+    return toolCallId;
+  }
+  return `sha256:${createHash("sha256").update(toolCallId, "utf8").digest("hex")}`;
+}
 
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
@@ -469,7 +486,7 @@ export function createSubagentActivityRecorder(params: {
     toolExecutionStart(toolCallId, toolName) {
       record("tool_execution_start", (current, observedAt) => {
         current.toolActive = true;
-        current.toolCallId = toolCallId;
+        current.toolCallId = observeToolCallId(toolCallId);
         current.toolName = toolName;
         current.toolStartedAt = observedAt;
         markActive(current, "tool", observedAt, true);
@@ -478,7 +495,7 @@ export function createSubagentActivityRecorder(params: {
     toolCall(toolCallId, toolName) {
       record("tool_call", (current, observedAt) => {
         current.toolActive = true;
-        current.toolCallId = toolCallId ?? current.toolCallId;
+        current.toolCallId = observeToolCallId(toolCallId) ?? current.toolCallId;
         current.toolName = toolName ?? current.toolName;
         markActive(current, "tool", observedAt);
       }, "immediate");
@@ -486,14 +503,14 @@ export function createSubagentActivityRecorder(params: {
     toolExecutionUpdate(toolCallId, toolName) {
       record("tool_execution_update", (current, observedAt) => {
         current.toolActive = true;
-        current.toolCallId = toolCallId ?? current.toolCallId;
+        current.toolCallId = observeToolCallId(toolCallId) ?? current.toolCallId;
         current.toolName = toolName ?? current.toolName;
         markActive(current, "tool", observedAt);
       }, "throttled");
     },
     toolResult(toolCallId, toolName) {
       record("tool_result", (current) => {
-        current.toolCallId = toolCallId ?? current.toolCallId;
+        current.toolCallId = observeToolCallId(toolCallId) ?? current.toolCallId;
         current.toolName = toolName ?? current.toolName;
         refreshActiveScope(current);
       }, "immediate");
@@ -501,7 +518,7 @@ export function createSubagentActivityRecorder(params: {
     toolExecutionEnd(toolCallId, toolName) {
       record("tool_execution_end", (current, observedAt) => {
         current.toolActive = false;
-        current.toolCallId = toolCallId ?? current.toolCallId;
+        current.toolCallId = observeToolCallId(toolCallId) ?? current.toolCallId;
         current.toolName = toolName ?? current.toolName;
         current.toolEndedAt = observedAt;
         refreshActiveScope(current);

@@ -2147,6 +2147,93 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("bounds opaque tool call observations without changing provider ids", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "child-opaque");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-opaque",
+        activityFile,
+        now: () => 2_000,
+      });
+      const event = { toolCallId: "x".repeat(512) };
+
+      recorder.sessionStart();
+      recorder.toolExecutionStart(event.toolCallId, "bash");
+      let read = readSubagentActivityFile(activityFile, "child-opaque");
+      assert.ok(read.ok);
+      assert.equal(
+        read.activity.toolCallId,
+        "sha256:64164443bb63e338ef1cfdb12a57117cd1212270cc935a798f6e8a665cdf4659",
+      );
+      assert.equal(event.toolCallId, "x".repeat(512));
+
+      recorder.toolExecutionUpdate(event.toolCallId, "bash");
+      read = readSubagentActivityFile(activityFile, "child-opaque");
+      assert.ok(read.ok);
+      assert.equal(
+        read.activity.toolCallId,
+        "sha256:64164443bb63e338ef1cfdb12a57117cd1212270cc935a798f6e8a665cdf4659",
+      );
+
+      recorder.toolExecutionEnd("short-id", "bash");
+      read = readSubagentActivityFile(activityFile, "child-opaque");
+      assert.ok(read.ok);
+      assert.equal(read.activity.toolCallId, "short-id");
+    });
+  });
+
+  it("keeps watchdog activity healthy for provider-expanded tool call ids", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "child-watchdog");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-watchdog",
+        activityFile,
+        now: () => 2_000,
+      });
+      recorder.sessionStart();
+      recorder.toolExecutionStart("x".repeat(512), "bash");
+
+      const running = {
+        id: "child-watchdog",
+        name: "Worker",
+        task: "",
+        surface: "pane-1",
+        startTime: 1_000,
+        sessionFile: join(dir, "child.jsonl"),
+        activityFile,
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: 1_000 }),
+      };
+      const testApi = (subagentsModule as any).__test__;
+      testApi.observeRunningSubagent(running, 2_000);
+
+      assert.deepEqual(running.activityRead, { ok: true });
+      const snapshot = classifyStatus(running.statusState, 2_000);
+      assert.equal(snapshot.kind, "active");
+      assert.equal(snapshot.activityLabel, "bash");
+    });
+  });
+
+  it("digests non-display-safe opaque tool call ids", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "child-control");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-control",
+        activityFile,
+        now: () => 2_000,
+      });
+
+      recorder.sessionStart();
+      recorder.toolCall("provider\nexpanded", "bash");
+      const read = readSubagentActivityFile(activityFile, "child-control");
+      assert.ok(read.ok);
+      assert.equal(
+        read.activity.toolCallId,
+        "sha256:ec443626959aa8ee6bbdcb4a473fadb0affae73f00798907558c564dea6b9460",
+      );
+    });
+  });
+
   it("records directly owned child counts for termination safety", () => {
     withTempDir((dir) => {
       const activityFile = getSubagentActivityFile(dir, "child-owned");
@@ -2203,6 +2290,7 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        { toolCallId: "x".repeat(201) },
         { directChildCount: -1 },
       ];
 
