@@ -72,6 +72,13 @@ function workspaceIsGone(workspaceId: string): boolean {
 function parentResults(sessionFile: string): any[] {
   return lines(sessionFile).filter(entry => entry.type === "custom_message" && entry.customType === "subagent_result");
 }
+function messageText(message: any): string {
+  if (typeof message?.content === "string") return message.content;
+  return message?.content?.filter((part: any) => part.type === "text").map((part: any) => part.text).join("") ?? "";
+}
+function childProviderRequests(events: string, name?: string): any[] {
+  return lines(events).filter(event => event.event === "provider_invoked" && event.child === true && (!name || event.subagentName === name));
+}
 
 it("delivers one real Herdr child result only after done settles and Pi exits", { skip: !enabled, timeout: 120_000 }, async (t) => {
   assert.equal(process.env.HERDR_ENV, "1", "live test must run inside Herdr");
@@ -181,10 +188,13 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
     assert.equal(delivered[0].details.exitCode, 0);
     assert.match(delivered[0].content, /CHILD_COMPLETION_SUMMARY/);
     assert.doesNotMatch(delivered[0].content, /CHILD_POST_TOOL_STOP/);
-    const childProviderInvocations = lines(events).filter(
-      (event) => event.event === "provider_invoked" && event.child === true,
-    );
+    const childProviderInvocations = childProviderRequests(events);
     assert.equal(childProviderInvocations.length, 1, "subagent_done must not trigger a trailing provider request");
+    const initialUserMessages = childProviderInvocations[0].requestMessages.filter((message: any) => message.role === "user");
+    assert.equal(initialUserMessages.length, 1, "child bootstrap and task must be one initial user prompt");
+    const initialInput = messageText(initialUserMessages[0]);
+    assert.match(initialInput, /Call subagent_done exactly once\./);
+    assert.doesNotMatch(initialInput, /<skill name=/, "zero-skill launch must not synthesize a skill block");
     assert.ok(existsSync(finalSnapshot.sessionFile));
     assert.equal(lines(finalSnapshot.sessionFile)[0].type, "session");
 
@@ -351,14 +361,16 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
   let parentSessionFile: string | undefined;
   let completed = false;
   try {
-    for (const dir of ["agents", "extensions", "packages", "models"]) mkdirSync(join(agentDir, dir), { recursive: true });
+    for (const dir of ["agents", "extensions", "packages", "models", "skills/matrix-first", "skills/matrix-second"]) mkdirSync(join(agentDir, dir), { recursive: true });
     mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(agentDir, "skills", "matrix-first", "SKILL.md"), "---\nname: matrix-first\ndescription: deterministic first marker\n---\nMATRIX_SKILL_FIRST\n");
+    writeFileSync(join(agentDir, "skills", "matrix-second", "SKILL.md"), "---\nname: matrix-second\ndescription: deterministic second marker\n---\nMATRIX_SKILL_SECOND\n");
     writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ packages: [], extensions: [sourceExtension] })}\n`);
     writeFileSync(join(agentDir, "models.json"), "{\"providers\":{}}\n");
     writeFileSync(join(agentDir, "extensions", "deterministic-herdr-provider.ts"), readFileSync(providerExtension, "utf8"));
     writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: join(temp, "unused-gate"), releaseFile: join(temp, "unused-release"), versionsFile: versions, siblingReleaseFile: siblingRelease, scenario: "siblings" }, null, 2)}\n`);
-    writeFileSync(join(agentDir, "agents", "deterministic-held-child.md"), `---\nname: deterministic-held-child\ndescription: held sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: false\nsystem-prompt: append\ndisable-model-invocation: true\n---\nHold until terminated.\n`);
-    writeFileSync(join(agentDir, "agents", "deterministic-auto-child.md"), `---\nname: deterministic-auto-child\ndescription: auto-exit sibling\nmodel: deterministic-herdr/probe\ntools: none\nspawning: false\nauto-exit: true\nsession-mode: fork\ndisable-model-invocation: true\n---\nHold until released, then finish.\n`);
+    writeFileSync(join(agentDir, "agents", "deterministic-held-child.md"), `---\nname: deterministic-held-child\ndescription: held sibling\nmodel: deterministic-herdr/probe\ntools: none\nskills: matrix-first,matrix-second\nspawning: false\nauto-exit: false\nsystem-prompt: append\ndisable-model-invocation: true\n---\nHold until terminated.\n`);
+    writeFileSync(join(agentDir, "agents", "deterministic-auto-child.md"), `---\nname: deterministic-auto-child\ndescription: auto-exit sibling\nmodel: deterministic-herdr/probe\ntools: none\nskills: matrix-first\nspawning: false\nauto-exit: true\nsession-mode: fork\ndisable-model-invocation: true\n---\nHold until released, then finish.\n`);
     const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST deterministic-siblings ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
     workspaceId = created.workspace.workspace_id;
     rootPane = created.root_pane.pane_id;
@@ -379,6 +391,17 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     const bHeld = held.find((event: any) => event.subagentName === "SiblingB");
     assert.ok(aHeld && bHeld);
     childPids.push(aHeld.pid, bHeld.pid);
+    const aRequest = childProviderRequests(events, "SiblingA")[0];
+    const bRequest = childProviderRequests(events, "SiblingB")[0];
+    const aUsers = aRequest.requestMessages.filter((message: any) => message.role === "user");
+    const bUsers = bRequest.requestMessages.filter((message: any) => message.role === "user");
+    assert.equal(aUsers.length, 1, "multiple skills and task must share one initial prompt");
+    assert.equal(bUsers.length, 1, "one skill and task must share one initial prompt");
+    const aInput = messageText(aUsers[0]);
+    const bInput = messageText(bUsers[0]);
+    assert.ok(aInput.indexOf("MATRIX_SKILL_FIRST") < aInput.indexOf("MATRIX_SKILL_SECOND"));
+    assert.ok(aInput.indexOf("MATRIX_SKILL_SECOND") < aInput.indexOf("hold sibling A"));
+    assert.ok(bInput.indexOf("MATRIX_SKILL_FIRST") < bInput.indexOf("hold sibling B until release"));
     const parentStart = lines(events).find(event => event.event === "session_start" && event.subagentId === null);
     assert.ok(parentStart?.sessionFile);
     parentPid = parentStart.pid;

@@ -71,7 +71,19 @@ export default function (pi: any) {
       const child = Boolean(process.env.PI_SUBAGENT_ID);
       const latest = context.messages.at(-1);
       const hasToolResult = context.messages.some((message: any) => message.role === "toolResult");
-      record("provider_invoked", { child, hasToolResult });
+      const requestMessages = context.messages.map((message: any) => ({
+        role: message.role,
+        content: typeof message.content === "string"
+          ? message.content
+          : message.content?.map((part: any) => part.type === "text"
+            ? { type: "text", text: part.text }
+            : part.type === "toolCall"
+              ? { type: "toolCall", id: part.id, name: part.name, arguments: part.arguments }
+              : part),
+        toolCallId: message.toolCallId,
+        toolName: message.toolName,
+      }));
+      record("provider_invoked", { child, hasToolResult, requestMessages });
 
       const output: any = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
