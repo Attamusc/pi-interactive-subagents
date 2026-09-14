@@ -1388,7 +1388,7 @@ function createLaunchPolicySeed(params: {
   systemPrompt: AgentLaunchIntent["effective"]["systemPrompt"];
 }): LaunchPolicySeed {
   return {
-    version: 1,
+    version: 2,
     agent: params.agent ?? null,
     deniedTools: [...params.deniedTools].sort(),
     cwd: params.cwd,
@@ -1396,6 +1396,7 @@ function createLaunchPolicySeed(params: {
     systemPrompt: params.systemPrompt
       ? { mode: params.systemPrompt.mode ?? null, text: params.systemPrompt.text }
       : null,
+    requestedSkills: [],
   };
 }
 

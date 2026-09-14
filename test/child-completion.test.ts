@@ -91,12 +91,13 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
   it("persists the original launch policy with the child's actual active tools", () => {
     const h = createHarness({
       launchPolicy: {
-        version: 1,
+        version: 2,
         agent: "worker",
         deniedTools: ["subagent"],
         cwd: "/work/project",
         agentDir: "/work/agent",
         systemPrompt: { mode: "append", text: "Worker role" },
+        requestedSkills: [],
       },
     });
     try {
@@ -105,14 +106,16 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
       assert.deepEqual(h.customEntries, [{
         customType: RESUME_POLICY_CUSTOM_TYPE,
         data: {
-          version: 1,
+          version: 2,
           agent: "worker",
           deniedTools: ["subagent"],
           cwd: "/work/project",
           agentDir: "/work/agent",
           systemPrompt: { mode: "append", text: "Worker role" },
+          requestedSkills: [],
           sessionId: "session-1",
           activeTools: ["read", "subagent_done"],
+          skills: [],
         },
       }]);
     } finally { h.cleanup(); }

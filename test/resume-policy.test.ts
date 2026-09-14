@@ -12,13 +12,29 @@ import {
 } from "../pi-extension/subagents/resume-policy.ts";
 
 const seed = {
-  version: 1 as const,
+  version: 2 as const,
   agent: "worker",
   deniedTools: ["subagent", "subagent_resume"],
   cwd: "/work/project",
   agentDir: "/work/agent",
   systemPrompt: { mode: "append" as const, text: "Worker role" },
+  requestedSkills: ["tdd", "commit"],
 };
+
+const skills = [
+  {
+    name: "tdd",
+    filePath: "/work/agent/skills/tdd/SKILL.md",
+    baseDir: "/work/agent/skills/tdd",
+    content: "# TDD\n",
+  },
+  {
+    name: "commit",
+    filePath: "/work/agent/skills/commit/SKILL.md",
+    baseDir: "/work/agent/skills/commit",
+    content: "# Commit\n",
+  },
+];
 
 function withSession(lines: unknown[], run: (path: string) => void) {
   const dir = mkdtempSync(join(tmpdir(), "resume-policy-"));
@@ -35,23 +51,47 @@ describe("resume launch policy", () => {
       /deniedTools/,
     );
     assert.throws(
+      () => parseLaunchPolicySeed(JSON.stringify({ ...seed, requestedSkills: ["tdd", "tdd"] })),
+      /requestedSkills/,
+    );
+    assert.throws(
+      () => parseLaunchPolicySeed(JSON.stringify({ ...seed, version: 1 })),
+      /version must be 2/,
+    );
+    assert.throws(
       () => parseLaunchPolicySeed(JSON.stringify({ ...seed, extra: true })),
       /unexpected field/,
     );
   });
 
-  it("binds captured active tools to the Pi session id", () => {
-    const policy = createResumePolicy(seed, "session-1", ["read", "caller_ping", "subagent_done"]);
+  it("binds captured tools and canonical skills to the Pi session id", () => {
+    const policy = createResumePolicy(seed, "session-1", ["read", "caller_ping", "subagent_done"], skills);
     assert.deepEqual(policy, {
       ...seed,
       sessionId: "session-1",
       activeTools: ["caller_ping", "read", "subagent_done"],
+      skills,
     });
-    assert.throws(() => createResumePolicy(seed, "session-1", ["read", "read"]), /activeTools/);
+    assert.throws(() => createResumePolicy(seed, "session-1", ["read", "read"], skills), /activeTools/);
+    assert.throws(
+      () => createResumePolicy(seed, "session-1", ["read"], [skills[1], skills[0]]),
+      /skills must match requestedSkills in order/,
+    );
+    assert.throws(
+      () => createResumePolicy(seed, "session-1", ["read"], [{ ...skills[0], extra: true }] as any),
+      /unexpected field/,
+    );
+    assert.throws(
+      () => createResumePolicy(seed, "session-1", ["read"], [
+        { ...skills[0], filePath: "/other/tdd/SKILL.md" },
+        skills[1],
+      ]),
+      /filePath must be inside baseDir/,
+    );
   });
 
   it("reads exactly one valid policy bound to the session header", () => {
-    const policy = createResumePolicy(seed, "session-1", ["read", "subagent_done"]);
+    const policy = createResumePolicy(seed, "session-1", ["read", "subagent_done"], skills);
     withSession([
       { type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00Z", cwd: "/work/project" },
       { type: "custom", id: "a", parentId: null, timestamp: "2026-01-01T00:00:01Z", customType: RESUME_POLICY_CUSTOM_TYPE, data: policy },
@@ -59,19 +99,22 @@ describe("resume launch policy", () => {
   });
 
   it("fails closed for missing, malformed, mismatched, or conflicting provenance", () => {
-    const policy = createResumePolicy(seed, "session-1", ["read"]);
+    const policy = createResumePolicy(seed, "session-1", ["read"], skills);
     const header = { type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00Z", cwd: "/work/project" };
     const entry = { type: "custom", id: "a", parentId: null, timestamp: "2026-01-01T00:00:01Z", customType: RESUME_POLICY_CUSTOM_TYPE, data: policy };
 
     withSession([header], (path) => assert.throws(() => readResumePolicy(path), /missing trusted resume policy/));
     withSession([header, { ...entry, data: { ...policy, activeTools: "read" } }], (path) => assert.throws(() => readResumePolicy(path), /invalid resume policy/));
+    withSession([header, { ...entry, data: { ...policy, skills: [skills[1], skills[0]] } }], (path) => assert.throws(() => readResumePolicy(path), /skills must match requestedSkills in order/));
+    withSession([header, { ...entry, data: { ...policy, skills: [{ ...skills[0], extra: true }, skills[1]] } }], (path) => assert.throws(() => readResumePolicy(path), /unexpected field/));
+    withSession([header, { ...entry, data: { ...policy, version: 1 } }], (path) => assert.throws(() => readResumePolicy(path), /version must be 2/));
     withSession([header, { ...entry, data: { ...policy, sessionId: "other" } }], (path) => assert.throws(() => readResumePolicy(path), /missing trusted resume policy/));
     withSession([header, entry, { ...entry, id: "b" }], (path) => assert.throws(() => readResumePolicy(path), /conflicting resume policies/));
   });
 
   it("ignores an inherited parent policy bound to another session id", () => {
-    const own = createResumePolicy(seed, "session-1", ["read"]);
-    const inherited = createResumePolicy(seed, "parent-session", ["bash"]);
+    const own = createResumePolicy(seed, "session-1", ["read"], skills);
+    const inherited = createResumePolicy(seed, "parent-session", ["bash"], skills);
     withSession([
       { type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00Z", cwd: "/work/project" },
       { type: "custom", id: "parent", parentId: null, timestamp: "2026-01-01T00:00:01Z", customType: RESUME_POLICY_CUSTOM_TYPE, data: inherited },

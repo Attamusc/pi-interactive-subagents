@@ -1,21 +1,30 @@
 import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, sep } from "node:path";
 
 export const RESUME_POLICY_CUSTOM_TYPE = "pi-interactive-subagents.resume-policy";
 export const RESUME_POLICY_ENV = "PI_SUBAGENT_LAUNCH_POLICY";
 
+export interface CanonicalSkillSnapshot {
+  name: string;
+  filePath: string;
+  baseDir: string;
+  content: string;
+}
+
 export interface LaunchPolicySeed {
-  version: 1;
+  version: 2;
   agent: string | null;
   deniedTools: string[];
   cwd: string;
   agentDir: string;
   systemPrompt: { mode: "append" | "replace" | null; text: string } | null;
+  requestedSkills: string[];
 }
 
 export interface ResumePolicy extends LaunchPolicySeed {
   sessionId: string;
   activeTools: string[];
+  skills: CanonicalSkillSnapshot[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -57,10 +66,50 @@ function parseSystemPrompt(value: unknown): LaunchPolicySeed["systemPrompt"] {
   return { mode: value.mode, text: value.text } as LaunchPolicySeed["systemPrompt"];
 }
 
+function parseSkillSnapshot(value: unknown, index: number): CanonicalSkillSnapshot {
+  const label = `skills[${index}]`;
+  if (!isRecord(value)) throw new Error(`${label} must be an object`);
+  assertExactKeys(value, ["name", "filePath", "baseDir", "content"], label);
+  if (typeof value.name !== "string" || !value.name.trim()) {
+    throw new Error(`${label}.name must be a nonblank string`);
+  }
+  if (typeof value.filePath !== "string" || !isAbsolute(value.filePath)) {
+    throw new Error(`${label}.filePath must be an absolute path`);
+  }
+  if (typeof value.baseDir !== "string" || !isAbsolute(value.baseDir)) {
+    throw new Error(`${label}.baseDir must be an absolute path`);
+  }
+  const relativePath = relative(value.baseDir, value.filePath);
+  if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+    throw new Error(`${label}.filePath must be inside baseDir`);
+  }
+  if (typeof value.content !== "string") throw new Error(`${label}.content must be a string`);
+  return {
+    name: value.name.trim(),
+    filePath: value.filePath,
+    baseDir: value.baseDir,
+    content: value.content,
+  };
+}
+
+function parseSkillSnapshots(value: unknown, requestedSkills: readonly string[]): CanonicalSkillSnapshot[] {
+  if (!Array.isArray(value)) throw new Error("skills must be an array");
+  const skills = value.map(parseSkillSnapshot);
+  const names = skills.map((skill) => skill.name);
+  if (names.length !== requestedSkills.length || names.some((name, index) => name !== requestedSkills[index])) {
+    throw new Error("skills must match requestedSkills in order");
+  }
+  return skills;
+}
+
 function parseSeedObject(value: unknown): LaunchPolicySeed {
   if (!isRecord(value)) throw new Error("launch policy must be an object");
-  assertExactKeys(value, ["version", "agent", "deniedTools", "cwd", "agentDir", "systemPrompt"], "launch policy");
-  if (value.version !== 1) throw new Error("launch policy version must be 1");
+  assertExactKeys(
+    value,
+    ["version", "agent", "deniedTools", "cwd", "agentDir", "systemPrompt", "requestedSkills"],
+    "launch policy",
+  );
+  if (value.version !== 2) throw new Error("launch policy version must be 2");
   if (value.agent !== null && (typeof value.agent !== "string" || !value.agent.trim())) {
     throw new Error("launch policy agent must be null or a nonblank string");
   }
@@ -71,12 +120,13 @@ function parseSeedObject(value: unknown): LaunchPolicySeed {
     throw new Error("launch policy agentDir must be an absolute path");
   }
   return {
-    version: 1,
+    version: 2,
     agent: value.agent === null ? null : value.agent.trim(),
     deniedTools: parseStringList(value.deniedTools, "deniedTools"),
     cwd: value.cwd,
     agentDir: value.agentDir,
     systemPrompt: parseSystemPrompt(value.systemPrompt),
+    requestedSkills: parseStringList(value.requestedSkills, "requestedSkills"),
   };
 }
 
@@ -98,18 +148,31 @@ export function createResumePolicy(
   seed: LaunchPolicySeed,
   sessionId: string,
   activeTools: readonly string[],
+  skills: readonly CanonicalSkillSnapshot[],
 ): ResumePolicy {
   const parsedSeed = parseSeedObject(seed);
   if (!sessionId.trim()) throw new Error("sessionId must be a nonblank string");
   const parsedTools = parseStringList(activeTools, "activeTools").sort();
-  return { ...parsedSeed, sessionId: sessionId.trim(), activeTools: parsedTools };
+  const parsedSkills = parseSkillSnapshots(skills, parsedSeed.requestedSkills);
+  return { ...parsedSeed, sessionId: sessionId.trim(), activeTools: parsedTools, skills: parsedSkills };
 }
 
 function parseResumePolicy(value: unknown): ResumePolicy {
   if (!isRecord(value)) throw new Error("resume policy must be an object");
   assertExactKeys(
     value,
-    ["version", "agent", "deniedTools", "cwd", "agentDir", "systemPrompt", "sessionId", "activeTools"],
+    [
+      "version",
+      "agent",
+      "deniedTools",
+      "cwd",
+      "agentDir",
+      "systemPrompt",
+      "requestedSkills",
+      "sessionId",
+      "activeTools",
+      "skills",
+    ],
     "resume policy",
   );
   const seed = parseSeedObject({
@@ -119,6 +182,7 @@ function parseResumePolicy(value: unknown): ResumePolicy {
     cwd: value.cwd,
     agentDir: value.agentDir,
     systemPrompt: value.systemPrompt,
+    requestedSkills: value.requestedSkills,
   });
   if (typeof value.sessionId !== "string" || !value.sessionId.trim()) {
     throw new Error("resume policy sessionId must be a nonblank string");
@@ -127,6 +191,7 @@ function parseResumePolicy(value: unknown): ResumePolicy {
     ...seed,
     sessionId: value.sessionId.trim(),
     activeTools: parseStringList(value.activeTools, "activeTools").sort(),
+    skills: parseSkillSnapshots(value.skills, seed.requestedSkills),
   };
 }
 

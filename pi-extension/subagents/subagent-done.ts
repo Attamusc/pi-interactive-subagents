@@ -173,7 +173,7 @@ export default function (pi: ExtensionAPI) {
     if (launchPolicySeed && !launchPolicyPersisted) {
       pi.appendEntry(
         RESUME_POLICY_CUSTOM_TYPE,
-        createResumePolicy(launchPolicySeed, ctx.sessionManager.getSessionId(), pi.getActiveTools()),
+        createResumePolicy(launchPolicySeed, ctx.sessionManager.getSessionId(), pi.getActiveTools(), []),
       );
       launchPolicyPersisted = true;
       delete process.env[RESUME_POLICY_ENV];
