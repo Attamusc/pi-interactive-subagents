@@ -394,6 +394,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
         details: {},
+        terminate: true,
       };
     },
   });
@@ -425,6 +426,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
         details: {},
+        terminate: true,
       };
     },
   });

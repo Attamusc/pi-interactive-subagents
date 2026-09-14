@@ -179,7 +179,12 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
     assert.equal(delivered[0].details.name, "DeterministicChild");
     assert.equal(delivered[0].details.sessionFile, finalSnapshot.sessionFile);
     assert.equal(delivered[0].details.exitCode, 0);
-    assert.match(delivered[0].content, /CHILD_POST_TOOL_STOP/);
+    assert.match(delivered[0].content, /CHILD_COMPLETION_SUMMARY/);
+    assert.doesNotMatch(delivered[0].content, /CHILD_POST_TOOL_STOP/);
+    const childProviderInvocations = lines(events).filter(
+      (event) => event.event === "provider_invoked" && event.child === true,
+    );
+    assert.equal(childProviderInvocations.length, 1, "subagent_done must not trigger a trailing provider request");
     assert.ok(existsSync(finalSnapshot.sessionFile));
     assert.equal(lines(finalSnapshot.sessionFile)[0].type, "session");
 

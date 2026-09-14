@@ -313,6 +313,7 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
       assert.equal(h.shutdowns(), 1);
       assert.equal(existsSync(`${h.sessionFile}.exit`), false);
       assert.match(result.content[0].text, /Shutting down/);
+      assert.equal(result.terminate, true);
     } finally { h.cleanup(); }
   });
 
@@ -350,6 +351,7 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
         const result = await execute(h.tools.get(name), params, h.ctx);
         assert.equal(result.details.error, "owned-subagents-active");
         assert.equal(result.details.count, 2);
+        assert.equal(result.terminate, undefined);
         assert.match(result.content[0].text, /2 directly owned subagents/);
       }
       assert.equal(h.shutdowns(), 0);
@@ -406,7 +408,8 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
 
     const ping = createHarness({ autoExit: true });
     try {
-      await execute(ping.tools.get("caller_ping"), { message: "need input" }, ping.ctx);
+      const result = await execute(ping.tools.get("caller_ping"), { message: "need input" }, ping.ctx);
+      assert.equal(result.terminate, true);
       ping.handlers.get("agent_end")!({ messages: assistant("stop") }, ping.ctx);
       ping.handlers.get("agent_settled")!({}, ping.ctx);
       ping.handlers.get("session_shutdown")!({ reason: "quit" }, ping.ctx);
