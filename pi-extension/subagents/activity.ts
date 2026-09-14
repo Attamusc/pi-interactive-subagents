@@ -105,7 +105,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
-const NON_DISPLAY_SAFE_ACTIVITY_ID = /[\u0000-\u001f\u007f]/;
+const NON_DISPLAY_SAFE_ACTIVITY_STRING = /[\u0000-\u001f\u007f-\u009f]/;
 
 /**
  * Keep the activity copy of an opaque provider tool-call ID bounded and safe
@@ -115,7 +115,7 @@ function observeToolCallId(toolCallId: string | undefined): string | undefined {
   if (toolCallId == null) return undefined;
   if (
     toolCallId.length <= MAX_ACTIVITY_STRING_LENGTH &&
-    !NON_DISPLAY_SAFE_ACTIVITY_ID.test(toolCallId)
+    !NON_DISPLAY_SAFE_ACTIVITY_STRING.test(toolCallId)
   ) {
     return toolCallId;
   }
@@ -157,7 +157,9 @@ function validateOptionalActivityString(object: Record<string, unknown>, fieldNa
   const value = object[fieldName];
   if (value == null) return null;
   if (typeof value !== "string") return `${fieldName} must be a string when present`;
-  if (/\r|\n/.test(value)) return `${fieldName} must not contain newlines`;
+  if (NON_DISPLAY_SAFE_ACTIVITY_STRING.test(value)) {
+    return `${fieldName} must not contain control characters`;
+  }
   return value.length <= MAX_ACTIVITY_STRING_LENGTH ? null : `${fieldName} is too long`;
 }
 

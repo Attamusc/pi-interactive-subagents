@@ -2225,11 +2225,19 @@ describe("subagent activity snapshots", () => {
 
       recorder.sessionStart();
       recorder.toolCall("provider\nexpanded", "bash");
-      const read = readSubagentActivityFile(activityFile, "child-control");
+      let read = readSubagentActivityFile(activityFile, "child-control");
       assert.ok(read.ok);
       assert.equal(
         read.activity.toolCallId,
         "sha256:ec443626959aa8ee6bbdcb4a473fadb0affae73f00798907558c564dea6b9460",
+      );
+
+      recorder.toolCall("provider\u009b31mspoofed", "bash");
+      read = readSubagentActivityFile(activityFile, "child-control");
+      assert.ok(read.ok);
+      assert.equal(
+        read.activity.toolCallId,
+        "sha256:10c960bf9d274615f0aca4efbfc4767d9e9cacc69a0b594ef36ec3688be55090",
       );
     });
   });
@@ -2291,6 +2299,8 @@ describe("subagent activity snapshots", () => {
         { toolActive: "yes" },
         { toolName: "bad\nname" },
         { toolCallId: "x".repeat(201) },
+        { toolCallId: "provider\u001b[31mspoofed" },
+        { toolCallId: "provider\u009b31mspoofed" },
         { directChildCount: -1 },
       ];
 
