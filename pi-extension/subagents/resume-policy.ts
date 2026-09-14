@@ -3,6 +3,7 @@ import { isAbsolute, relative, sep } from "node:path";
 
 export const RESUME_POLICY_CUSTOM_TYPE = "pi-interactive-subagents.resume-policy";
 export const RESUME_POLICY_ENV = "PI_SUBAGENT_LAUNCH_POLICY";
+export const RESUME_POLICY_RESTORE_ENV = "PI_SUBAGENT_RESTORE_POLICY";
 
 export interface CanonicalSkillSnapshot {
   name: string;

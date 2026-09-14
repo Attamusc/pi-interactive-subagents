@@ -40,6 +40,17 @@ function skillBlock(skill: CanonicalSkillSnapshot): string {
     `${skill.content}\n</skill>`;
 }
 
+function prependSkills(input: string, skills: readonly CanonicalSkillSnapshot[]): string {
+  return skills.length === 0 ? input : `${skills.map(skillBlock).join("\n\n")}\n\n${input}`;
+}
+
+export function buildSkillBootstrappedInputFromSnapshots(params: {
+  input: string;
+  skills: readonly CanonicalSkillSnapshot[];
+}): { text: string } {
+  return { text: prependSkills(params.input, params.skills) };
+}
+
 export function buildSkillBootstrappedInput(params: {
   input: string;
   requestedNames: readonly string[];
@@ -121,7 +132,7 @@ export function buildSkillBootstrappedInput(params: {
 
   return {
     ok: true,
-    text: `${skills.map(skillBlock).join("\n\n")}\n\n${params.input}`,
+    text: prependSkills(params.input, skills),
     skills,
   };
 }

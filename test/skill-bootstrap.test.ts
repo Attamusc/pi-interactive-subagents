@@ -1,7 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
-import { buildSkillBootstrappedInput } from "../pi-extension/subagents/skill-bootstrap.ts";
+import {
+  buildSkillBootstrappedInput,
+  buildSkillBootstrappedInputFromSnapshots,
+} from "../pi-extension/subagents/skill-bootstrap.ts";
 
 function skillCommand(name: string, path = `/skills/${name}/SKILL.md`): SlashCommandInfo {
   return {
@@ -75,6 +78,20 @@ describe("skill bootstrap", () => {
     ]);
     assert.equal(result.text.indexOf("# Second instructions") < result.text.indexOf("PROJECT FIRST"), true);
     assert.equal(result.text.endsWith("</skill>\n\nTASK"), true);
+  });
+
+  it("replays persisted snapshots without rediscovering or rereading skills", () => {
+    assert.deepEqual(buildSkillBootstrappedInputFromSnapshots({
+      input: "RESUME_TASK",
+      skills: [{
+        name: "first",
+        filePath: "/original/first/SKILL.md",
+        baseDir: "/original/first",
+        content: "ORIGINAL INSTRUCTIONS",
+      }],
+    }), {
+      text: '<skill name="first" location="/original/first/SKILL.md">\nReferences are relative to /original/first.\n\nORIGINAL INSTRUCTIONS\n</skill>\n\nRESUME_TASK',
+    });
   });
 
   it("returns structured diagnostics before reading unavailable or duplicate skills", () => {

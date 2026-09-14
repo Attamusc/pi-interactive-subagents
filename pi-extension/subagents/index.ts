@@ -74,6 +74,7 @@ import {
 import { getDirectChildCount, notifyDirectChildCount, setDirectChildCountProvider } from "./ownership.ts";
 import {
   RESUME_POLICY_ENV,
+  RESUME_POLICY_RESTORE_ENV,
   readResumePolicy,
   serializeLaunchPolicySeed,
   type LaunchPolicySeed,
@@ -1629,6 +1630,7 @@ async function launchSubagent(
     `PI_SUBAGENT_NAME=${shellEscape(params.name)}`,
     `PI_SUBAGENT_AGENT=${shellEscape(params.agent ?? "")}`,
     `${RESUME_POLICY_ENV}=${shellEscape(serializeLaunchPolicySeed(launchPolicySeed))}`,
+    `${RESUME_POLICY_RESTORE_ENV}=0`,
     `PI_SUBAGENT_AUTO_EXIT=${agentDefs?.autoExit ? "1" : "0"}`,
   ];
   const completionPaths = buildVisibleCompletionPaths(artifactDir, id);
@@ -2495,6 +2497,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ];
         resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(resumePolicy.agent ?? "")}`);
         resumeEnvParts.push(`PI_DENY_TOOLS=${shellEscape(resumePolicy.deniedTools.join(","))}`);
+        resumeEnvParts.push(`${RESUME_POLICY_ENV}=''`);
+        resumeEnvParts.push(`${RESUME_POLICY_RESTORE_ENV}=1`);
         resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 

@@ -6,11 +6,16 @@ import { tmpdir } from "node:os";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { readChildCompletionSnapshot } from "../pi-extension/subagents/completion.ts";
 import { setDirectChildCountProvider } from "../pi-extension/subagents/ownership.ts";
-import { RESUME_POLICY_CUSTOM_TYPE, RESUME_POLICY_ENV } from "../pi-extension/subagents/resume-policy.ts";
+import {
+  RESUME_POLICY_CUSTOM_TYPE,
+  RESUME_POLICY_ENV,
+  RESUME_POLICY_RESTORE_ENV,
+} from "../pi-extension/subagents/resume-policy.ts";
 
 function createHarness(options: {
   autoExit?: boolean;
   launchPolicy?: object;
+  resumePolicy?: object;
   commands?: any[];
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "child-completion-"));
@@ -26,6 +31,15 @@ function createHarness(options: {
   process.env.PI_SUBAGENT_AUTO_EXIT = options.autoExit ? "1" : "0";
   if (options.launchPolicy) process.env[RESUME_POLICY_ENV] = JSON.stringify(options.launchPolicy);
   else delete process.env[RESUME_POLICY_ENV];
+  if (options.resumePolicy) {
+    process.env[RESUME_POLICY_RESTORE_ENV] = "1";
+    writeFileSync(sessionFile, [
+      { type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00Z", cwd: "/work/project" },
+      { type: "custom", id: "policy", parentId: null, timestamp: "2026-01-01T00:00:01Z", customType: RESUME_POLICY_CUSTOM_TYPE, data: options.resumePolicy },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  } else {
+    delete process.env[RESUME_POLICY_RESTORE_ENV];
+  }
 
   const handlers = new Map<string, Function>();
   const tools = new Map<string, any>();
@@ -187,6 +201,73 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
       h.cleanup();
       rmSync(skillDir, { recursive: true, force: true });
     }
+  });
+
+  it("replays immutable skill snapshots on the first resumed input", () => {
+    const h = createHarness({
+      resumePolicy: {
+        version: 2,
+        agent: "worker",
+        deniedTools: ["subagent"],
+        cwd: "/work/project",
+        agentDir: "/work/agent",
+        systemPrompt: null,
+        requestedSkills: ["tdd"],
+        sessionId: "session-1",
+        activeTools: ["read", "subagent_done"],
+        skills: [{
+          name: "tdd",
+          filePath: "/original/tdd/SKILL.md",
+          baseDir: "/original/tdd",
+          content: "ORIGINAL TDD",
+        }],
+      },
+      commands: [{
+        name: "skill:tdd",
+        source: "skill",
+        sourceInfo: {
+          path: "/changed/tdd/SKILL.md",
+          source: "local",
+          scope: "user",
+          origin: "top-level",
+          baseDir: "/changed/tdd",
+        },
+      }],
+    });
+    try {
+      assert.equal(process.env[RESUME_POLICY_RESTORE_ENV], undefined);
+      h.handlers.get("session_start")!({}, h.ctx);
+      assert.equal(h.customEntries.length, 0);
+      assert.deepEqual(h.handlers.get("input")!({ text: "RESUME TASK" }, h.ctx), {
+        action: "transform",
+        text: '<skill name="tdd" location="/original/tdd/SKILL.md">\nReferences are relative to /original/tdd.\n\nORIGINAL TDD\n</skill>\n\nRESUME TASK',
+      });
+      assert.equal(h.customEntries.length, 0);
+    } finally { h.cleanup(); }
+  });
+
+  it("reports invalid resumed policy through structured completion before provider work", () => {
+    const h = createHarness({
+      resumePolicy: {
+        version: 1,
+        agent: "worker",
+        deniedTools: [],
+        cwd: "/work/project",
+        agentDir: "/work/agent",
+        systemPrompt: null,
+        sessionId: "session-1",
+        activeTools: ["read"],
+      },
+    });
+    try {
+      h.handlers.get("session_start")!({}, h.ctx);
+      assert.equal(h.shutdowns(), 1);
+      assert.deepEqual(h.snapshot().completionPayload, {
+        kind: "error",
+        errorMessage: "Unable to restore subagent policy: invalid resume policy: resume policy is missing required fields",
+        stopReason: "error",
+      });
+    } finally { h.cleanup(); }
   });
 
   it("fails closed before the provider when a requested skill is unavailable", () => {

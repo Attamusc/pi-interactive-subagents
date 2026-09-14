@@ -10,12 +10,19 @@ import { Type } from "@sinclair/typebox";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { createChildCompletionRecorder } from "./completion.ts";
 import { getDirectChildCount, setDirectChildCountObserver } from "./ownership.ts";
-import { buildSkillBootstrappedInput } from "./skill-bootstrap.ts";
+import {
+  buildSkillBootstrappedInput,
+  buildSkillBootstrappedInputFromSnapshots,
+} from "./skill-bootstrap.ts";
 import {
   RESUME_POLICY_CUSTOM_TYPE,
   RESUME_POLICY_ENV,
+  RESUME_POLICY_RESTORE_ENV,
   createResumePolicy,
   parseLaunchPolicySeed,
+  readResumePolicy,
+  type LaunchPolicySeed,
+  type ResumePolicy,
 } from "./resume-policy.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -85,8 +92,9 @@ export default function (pi: ExtensionAPI) {
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const launchPolicyValue = process.env[RESUME_POLICY_ENV];
-  const launchPolicySeed = launchPolicyValue ? parseLaunchPolicySeed(launchPolicyValue) : null;
+  const restoreResumePolicy = process.env[RESUME_POLICY_RESTORE_ENV] === "1";
   delete process.env[RESUME_POLICY_ENV];
+  delete process.env[RESUME_POLICY_RESTORE_ENV];
   const runId = process.env.PI_SUBAGENT_ID;
   const snapshotFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
   const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -101,6 +109,18 @@ export default function (pi: ExtensionAPI) {
     sessionFile,
     childPid: process.pid,
   });
+  let launchPolicySeed: LaunchPolicySeed | null = null;
+  let resumePolicy: ResumePolicy | null = null;
+  let startupPolicyError: string | null = null;
+  try {
+    if (launchPolicyValue && restoreResumePolicy) {
+      throw new Error("cannot combine fresh and resumed policy authority");
+    }
+    launchPolicySeed = launchPolicyValue ? parseLaunchPolicySeed(launchPolicyValue) : null;
+    resumePolicy = restoreResumePolicy ? readResumePolicy(sessionFile) : null;
+  } catch (error) {
+    startupPolicyError = `Unable to restore subagent policy: ${error instanceof Error ? error.message : String(error)}`;
+  }
   const recorder = createSubagentActivityRecorder({
     runningChildId: runId,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -162,12 +182,23 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let latestMessages: any[] | undefined;
   let explicitCompletionRequested = false;
-  let launchPolicyPersisted = false;
+  let skillBootstrapApplied = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
-    completionRecorder.record({ kind: "progress", activity: "session-start", estimated: false });
     recorder.sessionStart();
+    if (startupPolicyError) {
+      explicitCompletionRequested = true;
+      completionRecorder.record(
+        { kind: "completion-requested", reason: "agent-error" },
+        { kind: "error", errorMessage: startupPolicyError, stopReason: "error" },
+      );
+      recorder.agentEndDone();
+      ctx.shutdown();
+      return;
+    }
+
+    completionRecorder.record({ kind: "progress", activity: "session-start", estimated: false });
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -177,13 +208,22 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", (event, ctx) => {
     recorder.input();
-    if (launchPolicySeed && !launchPolicyPersisted) {
-      const result = buildSkillBootstrappedInput({
-        input: event.text,
-        requestedNames: launchPolicySeed.requestedSkills,
-        commands: pi.getCommands(),
-        readSkill: (path) => readFileSync(path, "utf8"),
-      });
+    if (!skillBootstrapApplied && (launchPolicySeed || resumePolicy)) {
+      const result = launchPolicySeed
+        ? buildSkillBootstrappedInput({
+            input: event.text,
+            requestedNames: launchPolicySeed.requestedSkills,
+            commands: pi.getCommands(),
+            readSkill: (path) => readFileSync(path, "utf8"),
+          })
+        : {
+            ok: true as const,
+            ...buildSkillBootstrappedInputFromSnapshots({
+              input: event.text,
+              skills: resumePolicy!.skills,
+            }),
+            skills: resumePolicy!.skills,
+          };
       if (!result.ok) {
         explicitCompletionRequested = true;
         completionRecorder.record(
@@ -195,18 +235,24 @@ export default function (pi: ExtensionAPI) {
         return { action: "handled" as const };
       }
 
-      pi.appendEntry(
-        RESUME_POLICY_CUSTOM_TYPE,
-        createResumePolicy(
-          launchPolicySeed,
-          ctx.sessionManager.getSessionId(),
-          pi.getActiveTools(),
-          result.skills,
-        ),
-      );
-      launchPolicyPersisted = true;
+      if (launchPolicySeed) {
+        pi.appendEntry(
+          RESUME_POLICY_CUSTOM_TYPE,
+          createResumePolicy(
+            launchPolicySeed,
+            ctx.sessionManager.getSessionId(),
+            pi.getActiveTools(),
+            result.skills,
+          ),
+        );
+      }
+      skillBootstrapApplied = true;
       if (result.text !== event.text) {
-        return { action: "transform" as const, text: result.text, images: event.images };
+        return {
+          action: "transform" as const,
+          text: result.text,
+          ...(event.images === undefined ? {} : { images: event.images }),
+        };
       }
       return { action: "continue" as const };
     }
