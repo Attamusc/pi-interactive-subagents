@@ -948,18 +948,6 @@ function updateWidget() {
   );
 }
 
-/**
- * Build the positional prompt args for a Pi CLI subagent launch.
- *
- * In artifact-backed launches (lineage-only, standalone), Pi's buildInitialMessage()
- * concatenates @file content with messages[0] into one initial prompt. That breaks
- * /skill: expansion because the message no longer starts with "/skill:". Only
- * messages[1..] are sent as separate follow-up prompts where /skill: is recognized.
- *
- * When there are skill prompts AND artifact-backed delivery, we prepend an empty
- * first positional message so that /skill: args land in messages[1..] and arrive
- * as standalone prompts in the child session.
- */
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
 /**
@@ -990,26 +978,6 @@ function buildPiModelArgs(effectiveModel?: string, effectiveThinking?: string): 
   if (!effectiveModel) return [];
   const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
   return ["--model", shellEscape(model)];
-}
-
-function buildPiPromptArgs(params: {
-  effectiveSkills?: string;
-  taskDelivery: "direct" | "artifact";
-  taskArg: string;
-}): string[] {
-  const skillPrompts = (params.effectiveSkills ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((skill) => `/skill:${skill}`);
-
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
-
-  return [
-    ...(needsSeparator ? [""] : []),
-    ...skillPrompts,
-    params.taskArg,
-  ];
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
@@ -1386,6 +1354,7 @@ function createLaunchPolicySeed(params: {
   cwd: string;
   agentDir: string;
   systemPrompt: AgentLaunchIntent["effective"]["systemPrompt"];
+  requestedSkills: readonly string[];
 }): LaunchPolicySeed {
   return {
     version: 2,
@@ -1396,7 +1365,7 @@ function createLaunchPolicySeed(params: {
     systemPrompt: params.systemPrompt
       ? { mode: params.systemPrompt.mode ?? null, text: params.systemPrompt.text }
       : null,
-    requestedSkills: [],
+    requestedSkills: [...params.requestedSkills],
   };
 }
 
@@ -1420,7 +1389,6 @@ export const __test__ = {
   visibleHerdrCapabilities,
   buildSubagentToolAllowlist,
   buildPiModelArgs,
-  buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
   resolveDenyTools,
@@ -1474,7 +1442,6 @@ async function launchSubagent(
   const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
   const effectiveModel = launchIntent.effective.model;
   const effectiveTools = launchIntent.effective.tools?.join(",");
-  const effectiveSkills = launchIntent.effective.skills?.join(",");
   const effectiveThinking = launchIntent.effective.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
@@ -1539,6 +1506,7 @@ async function launchSubagent(
     cwd: targetCwdForSession,
     agentDir: effectiveAgentDir,
     systemPrompt: launchIntent.effective.systemPrompt,
+    requestedSkills: launchIntent.effective.skills ?? [],
   });
   const { identity, roleBlock, cliFlag } = resolveVisibleIdentityRouting(launchIntent);
   const fullTask = inheritsConversationContext
@@ -1671,7 +1639,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
-  // Pass task and skill prompts to the sub-agent.
+  // Pass exactly one task prompt; the child bootstraps skills from launch policy.
   // Only full-context fork mode gets a direct task argument because it already
   // inherits the parent conversation. Blank-session modes use artifact-backed
   // handoff so the wrapper instructions arrive as the initial user message.
@@ -1693,13 +1661,7 @@ async function launchSubagent(
     taskArg = `@${artifactPath}`;
   }
 
-  for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
-    taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
-  }
+  parts.push(shellEscape(taskArg));
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.

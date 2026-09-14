@@ -1275,25 +1275,23 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
-    );
-  });
-
-  it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["@artifact.md"],
-    );
-  });
-
-  it("buildPiPromptArgs omits separator for direct launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
-      ["/skill:review", "do the task"],
-    );
+  it("preserves ordered skill authority in the launch policy", () => {
+    assert.deepEqual(testApi.createLaunchPolicySeed({
+      agent: "worker",
+      deniedTools: new Set(["subagent"]),
+      cwd: "/work/project",
+      agentDir: "/work/agent",
+      systemPrompt: null,
+      requestedSkills: ["review", "lint"],
+    }), {
+      version: 2,
+      agent: "worker",
+      deniedTools: ["subagent"],
+      cwd: "/work/project",
+      agentDir: "/work/agent",
+      systemPrompt: null,
+      requestedSkills: ["review", "lint"],
+    });
   });
 
   it("lists visible agents from discovery", async () => {
