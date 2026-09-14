@@ -8,7 +8,11 @@ import { readChildCompletionSnapshot } from "../pi-extension/subagents/completio
 import { setDirectChildCountProvider } from "../pi-extension/subagents/ownership.ts";
 import { RESUME_POLICY_CUSTOM_TYPE, RESUME_POLICY_ENV } from "../pi-extension/subagents/resume-policy.ts";
 
-function createHarness(options: { autoExit?: boolean; launchPolicy?: object } = {}) {
+function createHarness(options: {
+  autoExit?: boolean;
+  launchPolicy?: object;
+  commands?: any[];
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), "child-completion-"));
   const runId = "test-run";
   const snapshotFile = join(dir, "completion.json");
@@ -32,6 +36,7 @@ function createHarness(options: { autoExit?: boolean; launchPolicy?: object } = 
     registerShortcut() {},
     getAllTools() { return [{ name: "read" }, { name: "subagent_done" }]; },
     getActiveTools() { return ["read", "subagent_done"]; },
+    getCommands() { return options.commands ?? []; },
     appendEntry(customType: string, data: unknown) { customEntries.push({ customType, data }); },
   } as any);
   let shutdowns = 0;
@@ -103,6 +108,8 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
     try {
       h.handlers.get("session_start")!({}, h.ctx);
       h.handlers.get("session_start")!({}, h.ctx);
+      assert.deepEqual(h.customEntries, []);
+      assert.deepEqual(h.handlers.get("input")!({ text: "TASK" }, h.ctx), { action: "continue" });
       assert.deepEqual(h.customEntries, [{
         customType: RESUME_POLICY_CUSTOM_TYPE,
         data: {
@@ -118,6 +125,92 @@ describe("child completion lifecycle hooks", { concurrency: 1 }, () => {
           skills: [],
         },
       }]);
+    } finally { h.cleanup(); }
+  });
+
+  it("bootstraps canonical skills and persists their immutable snapshot before the first agent run", () => {
+    const skillDir = mkdtempSync(join(tmpdir(), "child-skill-"));
+    const skillFile = join(skillDir, "SKILL.md");
+    writeFileSync(skillFile, "---\nname: tdd\ndescription: Test first\n---\n# TDD\n\nRed then green.\n");
+    const h = createHarness({
+      launchPolicy: {
+        version: 2,
+        agent: "worker",
+        deniedTools: ["subagent"],
+        cwd: "/work/project",
+        agentDir: "/work/agent",
+        systemPrompt: { mode: "append", text: "Worker role" },
+        requestedSkills: ["tdd"],
+      },
+      commands: [{
+        name: "skill:tdd",
+        source: "skill",
+        sourceInfo: {
+          path: skillFile,
+          source: "local",
+          scope: "user",
+          origin: "top-level",
+          baseDir: skillDir,
+        },
+      }],
+    });
+    try {
+      h.handlers.get("session_start")!({}, h.ctx);
+      const images = [{ type: "image", source: { type: "base64", mediaType: "image/png", data: "AA==" } }];
+      const result = h.handlers.get("input")!({ text: "TASK", images }, h.ctx);
+      assert.deepEqual(result, {
+        action: "transform",
+        text: `<skill name="tdd" location="${skillFile}">\nReferences are relative to ${skillDir}.\n\n# TDD\n\nRed then green.\n</skill>\n\nTASK`,
+        images,
+      });
+      assert.deepEqual(h.customEntries[0]?.data, {
+        version: 2,
+        agent: "worker",
+        deniedTools: ["subagent"],
+        cwd: "/work/project",
+        agentDir: "/work/agent",
+        systemPrompt: { mode: "append", text: "Worker role" },
+        requestedSkills: ["tdd"],
+        sessionId: "session-1",
+        activeTools: ["read", "subagent_done"],
+        skills: [{
+          name: "tdd",
+          filePath: skillFile,
+          baseDir: skillDir,
+          content: "# TDD\n\nRed then green.",
+        }],
+      });
+      h.handlers.get("agent_start")!({}, h.ctx);
+      assert.equal(h.handlers.get("input")!({ text: "FOLLOW UP" }, h.ctx), undefined);
+      assert.equal(h.customEntries.length, 1);
+    } finally {
+      h.cleanup();
+      rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed before the provider when a requested skill is unavailable", () => {
+    const h = createHarness({
+      launchPolicy: {
+        version: 2,
+        agent: "worker",
+        deniedTools: ["subagent"],
+        cwd: "/work/project",
+        agentDir: "/work/agent",
+        systemPrompt: null,
+        requestedSkills: ["missing"],
+      },
+    });
+    try {
+      h.handlers.get("session_start")!({}, h.ctx);
+      assert.deepEqual(h.handlers.get("input")!({ text: "TASK" }, h.ctx), { action: "handled" });
+      assert.equal(h.customEntries.length, 0);
+      assert.equal(h.shutdowns(), 1);
+      assert.deepEqual(h.snapshot().completionPayload, {
+        kind: "error",
+        errorMessage: 'Requested skill "missing" is unavailable in the child session',
+        stopReason: "error",
+      });
     } finally { h.cleanup(); }
   });
 

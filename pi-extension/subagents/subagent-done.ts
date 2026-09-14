@@ -4,11 +4,13 @@
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { createChildCompletionRecorder } from "./completion.ts";
 import { getDirectChildCount, setDirectChildCountObserver } from "./ownership.ts";
+import { buildSkillBootstrappedInput } from "./skill-bootstrap.ts";
 import {
   RESUME_POLICY_CUSTOM_TYPE,
   RESUME_POLICY_ENV,
@@ -82,9 +84,9 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-  const launchPolicySeed = process.env[RESUME_POLICY_ENV]
-    ? parseLaunchPolicySeed(process.env[RESUME_POLICY_ENV])
-    : null;
+  const launchPolicyValue = process.env[RESUME_POLICY_ENV];
+  const launchPolicySeed = launchPolicyValue ? parseLaunchPolicySeed(launchPolicyValue) : null;
+  delete process.env[RESUME_POLICY_ENV];
   const runId = process.env.PI_SUBAGENT_ID;
   const snapshotFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
   const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -170,20 +172,45 @@ export default function (pi: ExtensionAPI) {
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
 
-    if (launchPolicySeed && !launchPolicyPersisted) {
-      pi.appendEntry(
-        RESUME_POLICY_CUSTOM_TYPE,
-        createResumePolicy(launchPolicySeed, ctx.sessionManager.getSessionId(), pi.getActiveTools(), []),
-      );
-      launchPolicyPersisted = true;
-      delete process.env[RESUME_POLICY_ENV];
-    }
-
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event, ctx) => {
     recorder.input();
+    if (launchPolicySeed && !launchPolicyPersisted) {
+      const result = buildSkillBootstrappedInput({
+        input: event.text,
+        requestedNames: launchPolicySeed.requestedSkills,
+        commands: pi.getCommands(),
+        readSkill: (path) => readFileSync(path, "utf8"),
+      });
+      if (!result.ok) {
+        explicitCompletionRequested = true;
+        completionRecorder.record(
+          { kind: "completion-requested", reason: "agent-error" },
+          { kind: "error", errorMessage: result.diagnostic.message, stopReason: "error" },
+        );
+        recorder.agentEndDone();
+        ctx.shutdown();
+        return { action: "handled" as const };
+      }
+
+      pi.appendEntry(
+        RESUME_POLICY_CUSTOM_TYPE,
+        createResumePolicy(
+          launchPolicySeed,
+          ctx.sessionManager.getSessionId(),
+          pi.getActiveTools(),
+          result.skills,
+        ),
+      );
+      launchPolicyPersisted = true;
+      if (result.text !== event.text) {
+        return { action: "transform" as const, text: result.text, images: event.images };
+      }
+      return { action: "continue" as const };
+    }
+
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
