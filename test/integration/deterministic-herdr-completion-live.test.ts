@@ -80,6 +80,46 @@ function childProviderRequests(events: string, name?: string): any[] {
   return lines(events).filter(event => event.event === "provider_invoked" && event.child === true && (!name || event.subagentName === name));
 }
 
+async function createMatrixFixture(scenario: string, extraConfig: Record<string, unknown> = {}) {
+  const temp = mkdtempSync(join(tmpdir(), `pi-herdr-${scenario}-`));
+  const agentDir = join(temp, "agent");
+  const sessions = join(temp, "sessions");
+  const events = join(temp, "events.jsonl");
+  const gate = join(temp, "gate");
+  const release = join(temp, "release");
+  const versions = join(temp, "versions.jsonl");
+  for (const dir of ["agents", "extensions", "packages", "models"]) mkdirSync(join(agentDir, dir), { recursive: true });
+  mkdirSync(sessions, { recursive: true });
+  writeFileSync(join(agentDir, "settings.json"), "{\"packages\":[]}\n");
+  writeFileSync(join(agentDir, "models.json"), "{\"providers\":{}}\n");
+  writeFileSync(join(agentDir, "extensions", "deterministic-herdr-provider.ts"), readFileSync(providerExtension, "utf8"));
+  writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: gate, releaseFile: release, versionsFile: versions, scenario, ...extraConfig }, null, 2)}\n`);
+  writeFileSync(join(agentDir, "agents", "deterministic-child.md"), `---\nname: deterministic-child\ndescription: matrix child\nmodel: deterministic-herdr/probe\ntools: subagent_done\nspawning: false\nauto-exit: false\ndisable-model-invocation: true\n---\nComplete deterministically.\n`);
+  writeFileSync(join(agentDir, "agents", "deterministic-planner.md"), `---\nname: deterministic-planner\ndescription: interactive matrix planner\nmodel: deterministic-herdr/probe\ntools: subagent_done\nspawning: false\nauto-exit: false\ninteractive: true\ndisable-model-invocation: true\n---\nDraft, wait for approval, then summarize and call subagent_done.\n`);
+  const beforePanes = (herdr(["pane", "list"]).panes ?? []).map((pane: any) => pane.pane_id).sort();
+  const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST ${scenario} ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
+  const workspaceId = created.workspace.workspace_id;
+  const rootPane = created.root_pane.pane_id;
+  const command = [
+    "env -u PI_SUBAGENT_ID -u PI_SUBAGENT_SESSION -u PI_SUBAGENT_COMPLETION_FILE -u PI_SUBAGENT_ACTIVITY_FILE -u PI_SUBAGENT_NAME -u PI_SUBAGENT_AGENT -u PI_SUBAGENT_SURFACE",
+    `${JSON.stringify(exactPi)} -ne`, `-e ${JSON.stringify(sourceExtension)}`, `-e ${JSON.stringify(managedHerdr)}`, `-e ${JSON.stringify(providerExtension)}`,
+    "--offline --provider deterministic-herdr --model probe", `--session-dir ${JSON.stringify(sessions)}`,
+    "--no-builtin-tools --tools subagent --no-skills --no-prompt-templates --no-context-files --no-themes",
+    JSON.stringify(`Run deterministic ${scenario} fixture.`),
+  ].join(" ");
+  herdr(["pane", "run", rootPane, command]);
+  return { temp, agentDir, sessions, events, gate, release, versions, workspaceId, rootPane, beforePanes };
+}
+
+async function cleanupMatrixFixture(fixture: Awaited<ReturnType<typeof createMatrixFixture>>, pids: number[]) {
+  herdr(["workspace", "close", fixture.workspaceId]);
+  await waitFor("matrix workspace cleanup", () => workspaceIsGone(fixture.workspaceId) ? true : undefined, 10_000);
+  for (const pid of pids) await waitFor(`matrix PID ${pid} cleanup`, () => !alive(pid) ? true : undefined, 10_000);
+  const afterPanes = (herdr(["pane", "list"]).panes ?? []).map((pane: any) => pane.pane_id).sort();
+  assert.deepEqual(afterPanes, fixture.beforePanes, "matrix case must restore the original Herdr pane inventory");
+  rmSync(fixture.temp, { recursive: true, force: true });
+}
+
 it("delivers one real Herdr child result only after done settles and Pi exits", { skip: !enabled, timeout: 120_000 }, async (t) => {
   assert.equal(process.env.HERDR_ENV, "1", "live test must run inside Herdr");
   assert.equal(execFileSync(exactPi, ["--version"], { encoding: "utf8" }).trim(), "0.85.1");
@@ -222,6 +262,110 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
     if (childPid) await waitFor("owned child PID exit", () => !alive(childPid!) ? true : undefined, 10_000);
     writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ workspaceGone: workspaceId ? workspaceIsGone(workspaceId) : true, parentGone: parentPid ? !alive(parentPid) : null, childGone: childPid ? !alive(childPid) : null }, null, 2)}\n`);
     rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+it("fails closed for a missing direct fork skill before child provider work", { skip: !enabled, timeout: 120_000 }, async (t) => {
+  const fixture = await createMatrixFixture("missing-skill", { childName: "MissingSkillChild" });
+  const evidenceBase = process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir();
+  const forensicDir = mkdtempSync(join(evidenceBase, "pi-herdr-missing-skill-evidence-"));
+  t.diagnostic(`Herdr missing-skill evidence: ${forensicDir}`);
+  const pids: number[] = [];
+  try {
+    const childStart = await waitFor("missing-skill child start", () => lines(fixture.events).find(event => event.event === "session_start" && event.subagentId !== null), 30_000);
+    const parentStart = lines(fixture.events).find(event => event.event === "session_start" && event.subagentId === null);
+    pids.push(parentStart.pid, childStart.pid);
+    const result = await waitFor("missing-skill parent result", () => parentResults(parentStart.sessionFile)[0]);
+    assert.match(result.content, /missing-live-skill/);
+    assert.match(result.content, /not found|unavailable/i);
+    assert.equal(result.details.exitCode, 1, "bootstrap rejection must remain a failed disposition");
+    assert.equal(childProviderRequests(fixture.events).length, 0, "missing skills must fail before child provider work");
+    const snapshotPath = await waitFor("missing-skill sidecar", () => findOne(fixture.sessions, `${childStart.subagentId}.child.json`));
+    const wrapperPath = snapshotPath.replace(/\.child\.json$/, ".wrapper.json");
+    await waitFor("missing-skill wrapper", () => existsSync(wrapperPath) ? true : undefined);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    const wrapper = JSON.parse(readFileSync(wrapperPath, "utf8"));
+    assert.equal(snapshot.runId, childStart.subagentId);
+    assert.equal(wrapper.runId, childStart.subagentId);
+    assert.equal(wrapper.exit.shellStatus, 0, "structured failure shuts the child shell down gracefully");
+    assert.equal(snapshot.latestFacts.some((fact: any) => fact.kind === "completion-requested"), true);
+    await waitFor("missing-skill child exit", () => !alive(childStart.pid) ? true : undefined);
+    cpSync(fixture.temp, join(forensicDir, "run"), { recursive: true });
+  } finally {
+    await cleanupMatrixFixture(fixture, pids);
+    writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ pidsGone: pids.every(pid => !alive(pid)), workspaceGone: workspaceIsGone(fixture.workspaceId) }, null, 2)}\n`);
+  }
+});
+
+it("bounds live oversized and control-bearing tool call observations without changing raw IDs", { skip: !enabled, timeout: 180_000 }, async (t) => {
+  const vectors = [
+    { label: "long", raw: "x".repeat(512), digest: "sha256:64164443bb63e338ef1cfdb12a57117cd1212270cc935a798f6e8a665cdf4659" },
+    { label: "control", raw: "provider\nexpanded", digest: "sha256:ec443626959aa8ee6bbdcb4a473fadb0affae73f00798907558c564dea6b9460" },
+  ];
+  for (const vector of vectors) {
+    const fixture = await createMatrixFixture(`tool-id-${vector.label}`, { scenario: "completion", childName: `ToolId${vector.label}`, fixtureToolCallId: vector.raw });
+    const forensicDir = mkdtempSync(join(process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir(), `pi-herdr-tool-id-${vector.label}-evidence-`));
+    t.diagnostic(`Herdr ${vector.label} tool-id evidence: ${forensicDir}`);
+    const pids: number[] = [];
+    try {
+      await waitFor(`${vector.label} done gate`, () => existsSync(fixture.gate) ? true : undefined, 30_000);
+      const starts = lines(fixture.events).filter(event => event.event === "session_start");
+      pids.push(...starts.map(event => event.pid));
+      const childStart = starts.find(event => event.subagentId !== null);
+      const execution = lines(fixture.events).find(event => event.event === "tool_execution_start" && event.subagentId === childStart.subagentId);
+      assert.equal(execution.rawToolCallId, vector.raw);
+      assert.equal(execution.activity.toolCallId, vector.digest);
+      assert.ok(execution.activity.toolCallId.length < 80);
+      const emitted = lines(fixture.events).find(event => event.event === "provider_emitted_tool_call" && event.child === true);
+      assert.equal(emitted.toolCallId, vector.raw, "provider seam must retain the original opaque ID");
+      assert.equal(lines(childStart.sessionFile).some(entry => entry.message?.content?.some?.((part: any) => part.type === "toolCall" && part.id === vector.raw)), true, "transcript must retain the original opaque ID");
+      assert.equal(lines(fixture.events).some(event => /stalled|recovered/.test(event.event)), false);
+      writeFileSync(fixture.release, "release\n");
+      await waitFor(`${vector.label} child exit`, () => !alive(childStart.pid) ? true : undefined);
+      const parentStart = starts.find(event => event.subagentId === null);
+      await waitFor(`${vector.label} parent result`, () => parentResults(parentStart.sessionFile).length === 1 ? true : undefined);
+      assert.equal(childProviderRequests(fixture.events).length, 1, "completion tool must not cause a trailing request");
+      cpSync(fixture.temp, join(forensicDir, "run"), { recursive: true });
+    } finally {
+      await cleanupMatrixFixture(fixture, pids);
+      writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ pidsGone: pids.every(pid => !alive(pid)), workspaceGone: workspaceIsGone(fixture.workspaceId) }, null, 2)}\n`);
+    }
+  }
+});
+
+it("keeps a planner interactive until approval then returns its final summary through done", { skip: !enabled, timeout: 120_000 }, async (t) => {
+  const fixture = await createMatrixFixture("planner", { childName: "PlannerFixture" });
+  const forensicDir = mkdtempSync(join(process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir(), "pi-herdr-planner-evidence-"));
+  t.diagnostic(`Herdr planner evidence: ${forensicDir}`);
+  const pids: number[] = [];
+  try {
+    const draft = await waitFor("planner draft settlement", () => lines(fixture.events).find(event => event.event === "agent_settled" && event.subagentName === "PlannerFixture"), 30_000);
+    const starts = lines(fixture.events).filter(event => event.event === "session_start");
+    pids.push(...starts.map(event => event.pid));
+    const parentStart = starts.find(event => event.subagentId === null);
+    const plannerStart = starts.find(event => event.subagentName === "PlannerFixture");
+    assert.equal(alive(plannerStart.pid), true, "interactive planner must remain open after its draft settles");
+    assert.equal(parentResults(parentStart.sessionFile).length, 0);
+    assert.equal(draft.snapshot.latestFacts.some((fact: any) => fact.kind === "completion-requested"), false);
+    const childPane = await waitFor("planner pane", () => (herdr(["pane", "list", "--workspace", fixture.workspaceId]).panes ?? []).find((pane: any) => pane.pane_id !== fixture.rootPane));
+    herdr(["pane", "send-text", childPane.pane_id, "fixture approve plan"]);
+    herdr(["pane", "send-keys", childPane.pane_id, "enter"]);
+    await waitFor("planner done gate", () => existsSync(fixture.gate) ? true : undefined);
+    const requests = childProviderRequests(fixture.events, "PlannerFixture");
+    assert.equal(requests.length, 2, "planner gets its initial draft and one approval turn");
+    assert.equal(messageText(requests[1].requestMessages.at(-1)), "fixture approve plan");
+    const emittedDone = lines(fixture.events).find(event => event.event === "provider_emitted_tool_call" && event.subagentName === "PlannerFixture" && event.toolName === "subagent_done");
+    assert.ok(emittedDone);
+    writeFileSync(fixture.release, "release\n");
+    const result = await waitFor("planner parent summary", () => parentResults(parentStart.sessionFile)[0]);
+    assert.match(result.content, /PLANNER_FINAL_SUMMARY/);
+    assert.doesNotMatch(result.content, /PLANNER_DRAFT_WAITING_FOR_APPROVAL/);
+    await waitFor("planner exit", () => !alive(plannerStart.pid) ? true : undefined);
+    assert.equal(childProviderRequests(fixture.events, "PlannerFixture").length, 2, "done must not trigger a trailing planner request");
+    cpSync(fixture.temp, join(forensicDir, "run"), { recursive: true });
+  } finally {
+    await cleanupMatrixFixture(fixture, pids);
+    writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ pidsGone: pids.every(pid => !alive(pid)), workspaceGone: workspaceIsGone(fixture.workspaceId) }, null, 2)}\n`);
   }
 });
 
