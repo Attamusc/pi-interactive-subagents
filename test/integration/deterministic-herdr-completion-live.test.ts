@@ -96,7 +96,7 @@ async function createMatrixFixture(scenario: string, extraConfig: Record<string,
   writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: gate, releaseFile: release, versionsFile: versions, scenario, ...extraConfig }, null, 2)}\n`);
   writeFileSync(join(agentDir, "agents", "deterministic-child.md"), `---\nname: deterministic-child\ndescription: matrix child\nmodel: deterministic-herdr/probe\ntools: subagent_done\nspawning: false\nauto-exit: false\ndisable-model-invocation: true\n---\nComplete deterministically.\n`);
   writeFileSync(join(agentDir, "agents", "deterministic-planner.md"), `---\nname: deterministic-planner\ndescription: interactive matrix planner\nmodel: deterministic-herdr/probe\ntools: subagent_done\nspawning: false\nauto-exit: false\ninteractive: true\ndisable-model-invocation: true\n---\nDraft, wait for approval, then summarize and call subagent_done.\n`);
-  const beforePanes = (herdr(["pane", "list"]).panes ?? []).map((pane: any) => pane.pane_id).sort();
+  writeFileSync(join(agentDir, "agents", "deterministic-missing-artifact.md"), `---\nname: deterministic-missing-artifact\ndescription: standalone artifact with unavailable skill\nmodel: deterministic-herdr/probe\ntools: subagent_done\nskills: missing-live-skill\nspawning: false\nauto-exit: true\nsession-mode: standalone\ndisable-model-invocation: true\n---\nFail closed before provider work.\n`);
   const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST ${scenario} ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
   const workspaceId = created.workspace.workspace_id;
   const rootPane = created.root_pane.pane_id;
@@ -108,15 +108,18 @@ async function createMatrixFixture(scenario: string, extraConfig: Record<string,
     JSON.stringify(`Run deterministic ${scenario} fixture.`),
   ].join(" ");
   herdr(["pane", "run", rootPane, command]);
-  return { temp, agentDir, sessions, events, gate, release, versions, workspaceId, rootPane, beforePanes };
+  return { temp, agentDir, sessions, events, gate, release, versions, workspaceId, rootPane }; 
 }
 
 async function cleanupMatrixFixture(fixture: Awaited<ReturnType<typeof createMatrixFixture>>, pids: number[]) {
+  for (const pid of pids.filter(pid => pid !== pids[0])) await waitFor(`matrix child PID ${pid} cleanup`, () => !alive(pid) ? true : undefined, 10_000);
+  await waitFor("matrix child pane cleanup", () => {
+    const panes = herdr(["pane", "list", "--workspace", fixture.workspaceId]).panes ?? [];
+    return panes.length === 1 && panes[0].pane_id === fixture.rootPane ? true : undefined;
+  }, 10_000);
   herdr(["workspace", "close", fixture.workspaceId]);
   await waitFor("matrix workspace cleanup", () => workspaceIsGone(fixture.workspaceId) ? true : undefined, 10_000);
   for (const pid of pids) await waitFor(`matrix PID ${pid} cleanup`, () => !alive(pid) ? true : undefined, 10_000);
-  const afterPanes = (herdr(["pane", "list"]).panes ?? []).map((pane: any) => pane.pane_id).sort();
-  assert.deepEqual(afterPanes, fixture.beforePanes, "matrix case must restore the original Herdr pane inventory");
   rmSync(fixture.temp, { recursive: true, force: true });
 }
 
@@ -265,35 +268,49 @@ it("delivers one real Herdr child result only after done settles and Pi exits", 
   }
 });
 
-it("fails closed for a missing direct fork skill before child provider work", { skip: !enabled, timeout: 120_000 }, async (t) => {
-  const fixture = await createMatrixFixture("missing-skill", { childName: "MissingSkillChild" });
-  const evidenceBase = process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir();
-  const forensicDir = mkdtempSync(join(evidenceBase, "pi-herdr-missing-skill-evidence-"));
-  t.diagnostic(`Herdr missing-skill evidence: ${forensicDir}`);
-  const pids: number[] = [];
-  try {
-    const childStart = await waitFor("missing-skill child start", () => lines(fixture.events).find(event => event.event === "session_start" && event.subagentId !== null), 30_000);
-    const parentStart = lines(fixture.events).find(event => event.event === "session_start" && event.subagentId === null);
-    pids.push(parentStart.pid, childStart.pid);
-    const result = await waitFor("missing-skill parent result", () => parentResults(parentStart.sessionFile)[0]);
-    assert.match(result.content, /missing-live-skill/);
-    assert.match(result.content, /not found|unavailable/i);
-    assert.equal(result.details.exitCode, 1, "bootstrap rejection must remain a failed disposition");
-    assert.equal(childProviderRequests(fixture.events).length, 0, "missing skills must fail before child provider work");
-    const snapshotPath = await waitFor("missing-skill sidecar", () => findOne(fixture.sessions, `${childStart.subagentId}.child.json`));
-    const wrapperPath = snapshotPath.replace(/\.child\.json$/, ".wrapper.json");
-    await waitFor("missing-skill wrapper", () => existsSync(wrapperPath) ? true : undefined);
-    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
-    const wrapper = JSON.parse(readFileSync(wrapperPath, "utf8"));
-    assert.equal(snapshot.runId, childStart.subagentId);
-    assert.equal(wrapper.runId, childStart.subagentId);
-    assert.equal(wrapper.exit.shellStatus, 0, "structured failure shuts the child shell down gracefully");
-    assert.equal(snapshot.latestFacts.some((fact: any) => fact.kind === "completion-requested"), true);
-    await waitFor("missing-skill child exit", () => !alive(childStart.pid) ? true : undefined);
-    cpSync(fixture.temp, join(forensicDir, "run"), { recursive: true });
-  } finally {
-    await cleanupMatrixFixture(fixture, pids);
-    writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ pidsGone: pids.every(pid => !alive(pid)), workspaceGone: workspaceIsGone(fixture.workspaceId) }, null, 2)}\n`);
+it("fails closed for missing skills in direct-fork and standalone artifact launches", { skip: !enabled, timeout: 120_000 }, async (t) => {
+  const variants = [
+    { label: "direct-fork", config: { childName: "MissingDirectSkillChild" } },
+    { label: "artifact-standalone", config: { childName: "MissingArtifactSkillChild", missingSkillAgent: "deterministic-missing-artifact" } },
+  ];
+  for (const variant of variants) {
+    const fixture = await createMatrixFixture("missing-skill", variant.config);
+    const forensicDir = mkdtempSync(join(process.env.PI_TEST_EVIDENCE_DIR ?? tmpdir(), `pi-herdr-missing-skill-${variant.label}-evidence-`));
+    t.diagnostic(`Herdr missing-skill ${variant.label} evidence: ${forensicDir}`);
+    const pids: number[] = [];
+    try {
+      const childStart = await waitFor(`${variant.label} child start`, () => lines(fixture.events).find(event => event.event === "session_start" && event.subagentId !== null), 30_000);
+      const parentStart = lines(fixture.events).find(event => event.event === "session_start" && event.subagentId === null);
+      pids.push(parentStart.pid, childStart.pid);
+      const result = await waitFor(`${variant.label} parent result`, () => parentResults(parentStart.sessionFile)[0]);
+      assert.match(result.content, /missing-live-skill/);
+      assert.match(result.content, /not found|unavailable/i);
+      assert.equal(result.details.exitCode, 1, "bootstrap rejection must remain a failed disposition");
+      assert.equal(childProviderRequests(fixture.events).length, 0, "missing skills must fail before child provider work");
+      const snapshotPath = await waitFor(`${variant.label} sidecar`, () => findOne(fixture.sessions, `${childStart.subagentId}.child.json`));
+      const wrapperPath = snapshotPath.replace(/\.child\.json$/, ".wrapper.json");
+      await waitFor(`${variant.label} wrapper`, () => existsSync(wrapperPath) ? true : undefined);
+      const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+      const wrapper = JSON.parse(readFileSync(wrapperPath, "utf8"));
+      assert.equal(snapshot.runId, childStart.subagentId);
+      assert.equal(wrapper.runId, childStart.subagentId);
+      assert.equal(wrapper.exit.shellStatus, 0, "structured failure shuts the child shell down gracefully");
+      assert.equal(snapshot.latestFacts.some((fact: any) => fact.kind === "completion-requested" && fact.reason === "agent-error"), true);
+      if (variant.label === "artifact-standalone") {
+        assert.equal(childStart.agent, "deterministic-missing-artifact", "artifact variant must resolve the agent definition");
+        const launchCall = lines(fixture.events).find(event => event.event === "provider_emitted_tool_call" && event.child === false);
+        assert.equal(launchCall.toolName, "subagent");
+        assert.equal(launchCall.toolCallId, "spawn-missing");
+        assert.equal(launchCall.toolCallArguments.agent, "deterministic-missing-artifact");
+        assert.equal(launchCall.toolCallArguments.skills, undefined);
+        assert.equal(launchCall.toolCallArguments.fork, undefined);
+      }
+      await waitFor(`${variant.label} child exit`, () => !alive(childStart.pid) ? true : undefined);
+      cpSync(fixture.temp, join(forensicDir, "run"), { recursive: true });
+    } finally {
+      await cleanupMatrixFixture(fixture, pids);
+      writeFileSync(join(forensicDir, "cleanup.json"), `${JSON.stringify({ pidsGone: pids.every(pid => !alive(pid)), workspaceGone: workspaceIsGone(fixture.workspaceId) }, null, 2)}\n`);
+    }
   }
 });
 
@@ -543,6 +560,12 @@ it("keeps sibling ownership through termination, auto-exit, and resume", { skip:
     assert.equal(bUsers.length, 1, "one skill and task must share one initial prompt");
     const aInput = messageText(aUsers[0]);
     const bInput = messageText(bUsers[0]);
+    for (const marker of ["MATRIX_SKILL_FIRST", "MATRIX_SKILL_SECOND", "hold sibling A"]) {
+      assert.notEqual(aInput.indexOf(marker), -1, `SiblingA input must contain ${marker}`);
+    }
+    for (const marker of ["MATRIX_SKILL_FIRST", "hold sibling B until release"]) {
+      assert.notEqual(bInput.indexOf(marker), -1, `SiblingB input must contain ${marker}`);
+    }
     assert.ok(aInput.indexOf("MATRIX_SKILL_FIRST") < aInput.indexOf("MATRIX_SKILL_SECOND"));
     assert.ok(aInput.indexOf("MATRIX_SKILL_SECOND") < aInput.indexOf("hold sibling A"));
     assert.ok(bInput.indexOf("MATRIX_SKILL_FIRST") < bInput.indexOf("hold sibling B until release"));

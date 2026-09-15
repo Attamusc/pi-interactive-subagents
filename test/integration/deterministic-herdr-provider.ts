@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 const agentDir = process.env.PI_CODING_AGENT_DIR;
 if (!agentDir) throw new Error("deterministic provider requires PI_CODING_AGENT_DIR");
 const config = JSON.parse(readFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), "utf8"));
-const { eventsFile, gateFile, releaseFile, versionsFile, scenario = "completion", childName = "DeterministicChild", siblingReleaseFile, invalidSessionFile, fixtureToolCallId } = config;
+const { eventsFile, gateFile, releaseFile, versionsFile, scenario = "completion", childName = "DeterministicChild", siblingReleaseFile, invalidSessionFile, fixtureToolCallId, missingSkillAgent } = config;
 
 function record(event: string, details: Record<string, unknown> = {}) {
   appendFileSync(eventsFile, `${JSON.stringify({ event, at: new Date().toISOString(), pid: process.pid, subagentId: process.env.PI_SUBAGENT_ID ?? null, subagentName: process.env.PI_SUBAGENT_NAME ?? null, ...details })}\n`);
@@ -202,11 +202,13 @@ export default function (pi: any) {
                   : initialControl
                     ? { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: childName, agent: "deterministic-child", task: "hold for control test" } }
                     : initialMissing
-                      ? { type: "toolCall", id: "spawn-missing", name: "subagent", arguments: { name: childName, task: "This request must fail before provider work.", skills: "missing-live-skill", fork: true } }
+                      ? { type: "toolCall", id: "spawn-missing", name: "subagent", arguments: missingSkillAgent
+                        ? { name: childName, agent: missingSkillAgent, task: "This artifact request must fail before provider work." }
+                        : { name: childName, task: "This direct request must fail before provider work.", skills: "missing-live-skill", fork: true } }
                       : child
                         ? { type: "toolCall", id: fixtureToolCallId ?? "done-1", name: "subagent_done", arguments: {} }
                         : { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: childName, agent: scenario === "planner" ? "deterministic-planner" : "deterministic-child", task: scenario === "planner" ? "Draft a plan, wait for approval, then finalize." : "Call subagent_done exactly once." } };
-          record("provider_emitted_tool_call", { child, toolCallId: toolCall.id, toolName: toolCall.name });
+          record("provider_emitted_tool_call", { child, toolCallId: toolCall.id, toolName: toolCall.name, toolCallArguments: toolCall.arguments });
           output.content.push(toolCall);
           stream.push({ type: "toolcall_start", contentIndex: 1, partial: output });
           stream.push({ type: "toolcall_end", contentIndex: 1, toolCall, partial: output });
