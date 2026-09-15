@@ -7,7 +7,7 @@ import {
   type AgentRunEvidence,
   type AgentRunState,
 } from "pi-agent-execution";
-import { getNewEntries } from "./session.ts";
+import { findLastAssistantMessage, getNewEntries } from "./session.ts";
 import {
   readChildCompletionSnapshot,
   readWrapperExitRecord,
@@ -119,9 +119,13 @@ export async function waitForVisibleCompletion(params: {
       let entries: ReturnType<typeof getNewEntries> = [];
       try { entries = getNewEntries(params.sessionFile, params.transcriptStartLine); } catch {}
       const assistant = extractLatestAssistantOutput(entries);
+      const explicitDoneSummary =
+        assistant.output === "" && params.state.core.completionIntent?.reason === "done"
+          ? findLastAssistantMessage(entries) ?? ""
+          : assistant.output;
       const payloadError = params.state.payload?.kind === "error" ? params.state.payload.errorMessage : undefined;
       const completion = projectAgentRunCompletion(params.state.core, {
-        output: assistant.output,
+        output: explicitDoneSummary,
         errorMessage: payloadError ?? assistant.errorMessage,
         sessionRef: params.sessionRef,
       });

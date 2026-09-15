@@ -46,6 +46,52 @@ describe("visible parent completion observer", () => {
     assert.equal(observeVisibleCompletion({ state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit }).terminal, true);
   });
 
+  it("returns the preceding summary when explicit done is a tool-only assistant message", async () => {
+    const f = fixture();
+    writeFileSync(f.sessionFile, [
+      { type: "session", id: "session-1" },
+      { type: "message", id: "summary", message: { role: "assistant", content: [{ type: "text", text: "FINAL REVIEW" }] } },
+      { type: "message", id: "done", message: { role: "assistant", content: [{ type: "toolCall", name: "subagent_done", arguments: {} }] } },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    f.recorder.record({ kind: "completion-requested", reason: "done" }, { kind: "done" });
+    f.recorder.record({ kind: "agent-settled" });
+    writeWrapper(f.paths, "run");
+
+    const result = await waitForVisibleCompletion({
+      state: f.state,
+      childSnapshotFile: f.paths.childSnapshot,
+      wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile,
+      transcriptStartLine: 1,
+      signal: new AbortController().signal,
+      interval: 1,
+    });
+    assert.equal(result.completion.output, "FINAL REVIEW");
+  });
+
+  it("does not recover stale text for non-explicit completion", async () => {
+    const f = fixture();
+    writeFileSync(f.sessionFile, [
+      { type: "session", id: "session-1" },
+      { type: "message", id: "stale", message: { role: "assistant", content: [{ type: "text", text: "STALE TEXT" }] } },
+      { type: "message", id: "empty", message: { role: "assistant", content: [] } },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    f.recorder.record({ kind: "completion-requested", reason: "auto-exit" }, { kind: "done" });
+    f.recorder.record({ kind: "agent-settled" });
+    writeWrapper(f.paths, "run");
+
+    const result = await waitForVisibleCompletion({
+      state: f.state,
+      childSnapshotFile: f.paths.childSnapshot,
+      wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile,
+      transcriptStartLine: 1,
+      signal: new AbortController().signal,
+      interval: 1,
+    });
+    assert.equal(result.completion.output, "");
+  });
+
   it("ignores malformed, wrong-run, legacy exit, and screen-like files", () => {
     const f = fixture();
     mkdirSync(join(f.dir, "subagent-completion"), { recursive: true });
