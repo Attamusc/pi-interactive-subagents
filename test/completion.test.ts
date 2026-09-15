@@ -1,13 +1,23 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentRunState, projectAgentRunStatus, reduceAgentRunEvidence } from "pi-agent-execution";
 import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, createChildCompletionRecorder, readChildCompletionSnapshot, readWrapperExitRecord } from "../pi-extension/subagents/completion.ts";
 
-function tempDir() { return mkdtempSync(join(tmpdir(), "completion-")); }
+const tempDirs = new Set<string>();
+function tempDir() {
+  const dir = mkdtempSync(join(tmpdir(), "completion-"));
+  tempDirs.add(dir);
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  tempDirs.clear();
+});
 
 describe("visible completion sidecars", () => {
   it("builds unique owned paths and rejects traversal", () => {

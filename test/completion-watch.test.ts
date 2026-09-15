@@ -1,21 +1,27 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { projectAgentRunStatus } from "pi-agent-execution";
 import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import { confirmOwnedProcessGone, createVisibleCompletionState, observeVisibleCompletion, recordVisibleControl, waitForVisibleCompletion } from "../pi-extension/subagents/completion-watch.ts";
 
+const tempDirs = new Set<string>();
 function fixture(runId = "run") {
   const dir = mkdtempSync(join(tmpdir(), "completion-watch-"));
+  tempDirs.add(dir);
   const paths = buildVisibleCompletionPaths(dir, runId);
   const sessionFile = join(dir, "session.jsonl");
   writeFileSync(sessionFile, `${JSON.stringify({ type: "session" })}\n`);
   const recorder = createChildCompletionRecorder({ runId, childPid: process.pid, sessionFile, snapshotFile: paths.childSnapshot });
   return { dir, paths, sessionFile, recorder, state: createVisibleCompletionState(runId) };
 }
+afterEach(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  tempDirs.clear();
+});
 function writeWrapper(paths: ReturnType<typeof buildVisibleCompletionPaths>, runId: string, status = 0) {
   execFileSync("/bin/sh", ["-c", buildVisibleWrapperCommand({ piCommand: `/bin/sh -c 'exit ${status}'`, runId, wrapperExitFile: paths.wrapperExit })]);
 }
