@@ -128,7 +128,7 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 - `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
 - `running` — fallback for backends without child snapshots (e.g. Claude)
 
-These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. Opaque provider tool-call IDs are preserved when short and display-safe; oversized or control-bearing IDs become stable SHA-256 observations in this snapshot only. The original Pi messages and tool correlation IDs are unchanged. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
 **Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
@@ -185,6 +185,12 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 Optional string overrides are trimmed. Blank or whitespace-only `model`, `skills`, `tools`, and `cwd` values are treated as omitted, so a named agent's configured default still applies.
 
+### Skill bootstrap
+
+Selected skills are resolved inside the child session, using that child's resource discovery, trust, precedence, and collision winner. The child prepends the canonical skill blocks to its first task input before the first provider request; it does not queue separate `/skill:` prompts or spend extra model turns loading them. Missing or unreadable required skills fail before provider work with a specific completion error.
+
+The canonical selected skill content and source metadata are stored in the session's strict resume policy. A resumed child replays that immutable snapshot instead of rediscovering names or rereading files, so local skill changes cannot silently change an existing session's authority. `subagent_resume` cannot supply replacement skills.
+
 ---
 
 ## Interrupting a running subagent
@@ -207,7 +213,7 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 `subagent_terminate` requests pane closure. For Pi-backed runs, an accepted close request is not treated as proof that the child exited: the watcher and registry entry remain until the correlated wrapper record appears or the previously recorded child PID is confirmed absent. The tool can therefore acknowledge `termination_requested_unconfirmed`; it does not invent an exit code or signal. A spawning-capable child is not hard-terminated while its direct-child ownership is nonzero or unknown; the direct owner must finish or terminate those children first. Session shutdown requests closure of every directly owned child pane before relinquishing the process-local registry.
 
-Normal Pi completion uses the same two-phase rule. `subagent_done`, `caller_ping`, and autonomous settlement record completion intent first, producing `finishing`. Delivery and cleanup happen only after the foreground Pi command returns and its wrapper records the shell status. The one-shot wrapper uses `node` from the child pane's `PATH`; this repository's Node-based Pi deployment provides it, but other platform environments have not been validated. Failure to write the wrapper record is diagnostic and is not process-exit evidence. No dependency fallback or automatic provisioning is attempted.
+Normal Pi completion uses the same two-phase rule. `subagent_done`, `caller_ping`, and autonomous settlement record completion intent first, producing `finishing`. Successful explicit completion tools terminate their current tool batch, so Pi does not issue a trailing provider request that could replace the summary preceding the tool call. Delivery and cleanup happen only after the foreground Pi command returns and its wrapper records the shell status. The one-shot wrapper uses `node` from the child pane's `PATH`; this repository's Node-based Pi deployment provides it, but other platform environments have not been validated. Failure to write the wrapper record is diagnostic and is not process-exit evidence. No dependency fallback or automatic provisioning is attempted.
 
 ---
 
@@ -231,7 +237,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 4. Parent resumes the child session via `subagent_resume` with the response
 5. Child picks up where it left off with the parent's guidance
 
-A Pi subagent records a versioned resume policy in its session when it first starts. Resume restores that session's agent identity, active-tool ceiling, denied tools, working directory, agent configuration root, and explicit system-prompt routing. The `autoExit` argument may change the resumed run's lifetime behavior, but it cannot widen authority. Sessions without valid package-owned resume policy are rejected before a pane is created; use `pi --session` directly when intentionally opening an unrelated Pi session.
+A Pi subagent records a versioned resume policy in its session when it first starts. Resume restores that session's agent identity, active-tool ceiling, denied tools, working directory, agent configuration root, explicit system-prompt routing, and canonical skill snapshot. The `autoExit` argument may change the resumed run's lifetime behavior, but it cannot widen authority or replace skills. Sessions without one valid package-owned policy bound to their exact session ID are rejected before a pane is created; use `pi --session` directly when intentionally opening an unrelated Pi session.
 
 **Example:**
 ```typescript
