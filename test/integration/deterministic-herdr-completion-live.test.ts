@@ -95,7 +95,7 @@ async function createMatrixFixture(scenario: string, extraConfig: Record<string,
   writeFileSync(join(agentDir, "extensions", "deterministic-herdr-provider.ts"), readFileSync(providerExtension, "utf8"));
   writeFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), `${JSON.stringify({ eventsFile: events, gateFile: gate, releaseFile: release, versionsFile: versions, scenario, ...extraConfig }, null, 2)}\n`);
   writeFileSync(join(agentDir, "agents", "deterministic-child.md"), `---\nname: deterministic-child\ndescription: matrix child\nmodel: deterministic-herdr/probe\ntools: subagent_done\nspawning: false\nauto-exit: false\ndisable-model-invocation: true\n---\nComplete deterministically.\n`);
-  writeFileSync(join(agentDir, "agents", "deterministic-planner.md"), `---\nname: deterministic-planner\ndescription: interactive matrix planner\nmodel: deterministic-herdr/probe\ntools: subagent_done\nspawning: false\nauto-exit: false\ninteractive: true\ndisable-model-invocation: true\n---\nDraft, wait for approval, then summarize and call subagent_done.\n`);
+  writeFileSync(join(agentDir, "agents", "deterministic-planner.md"), `---\nname: deterministic-planner\ndescription: interactive matrix planner\nmodel: deterministic-herdr/probe\ntools: planner_checkpoint,subagent_done\nspawning: false\nauto-exit: false\ninteractive: true\ndisable-model-invocation: true\n---\nDraft, wait for approval, then summarize and call subagent_done.\n`);
   writeFileSync(join(agentDir, "agents", "deterministic-missing-artifact.md"), `---\nname: deterministic-missing-artifact\ndescription: standalone artifact with unavailable skill\nmodel: deterministic-herdr/probe\ntools: subagent_done\nskills: missing-live-skill\nspawning: false\nauto-exit: true\nsession-mode: standalone\ndisable-model-invocation: true\n---\nFail closed before provider work.\n`);
   const created = herdr(["workspace", "create", "--cwd", temp, "--label", `TEST ${scenario} ${Date.now()}`, "--env", "PATH=/opt/homebrew/bin:/usr/bin:/bin", "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr", "--no-focus"]);
   const workspaceId = created.workspace.workspace_id;
@@ -369,7 +369,7 @@ it("keeps a planner interactive until approval then returns its final summary th
     herdr(["pane", "send-keys", childPane.pane_id, "enter"]);
     await waitFor("planner done gate", () => existsSync(fixture.gate) ? true : undefined);
     const requests = childProviderRequests(fixture.events, "PlannerFixture");
-    assert.equal(requests.length, 2, "planner gets its initial draft and one approval turn");
+    assert.equal(requests.length, 3, "planner gets its draft, approval summary, and tool-only done turn");
     assert.equal(messageText(requests[1].requestMessages.at(-1)), "fixture approve plan");
     const emittedDone = lines(fixture.events).find(event => event.event === "provider_emitted_tool_call" && event.subagentName === "PlannerFixture" && event.toolName === "subagent_done");
     assert.ok(emittedDone);
@@ -378,7 +378,7 @@ it("keeps a planner interactive until approval then returns its final summary th
     assert.match(result.content, /PLANNER_FINAL_SUMMARY/);
     assert.doesNotMatch(result.content, /PLANNER_DRAFT_WAITING_FOR_APPROVAL/);
     await waitFor("planner exit", () => !alive(plannerStart.pid) ? true : undefined);
-    assert.equal(childProviderRequests(fixture.events, "PlannerFixture").length, 2, "done must not trigger a trailing planner request");
+    assert.equal(childProviderRequests(fixture.events, "PlannerFixture").length, 3, "done must not trigger a trailing planner request");
     cpSync(fixture.temp, join(forensicDir, "run"), { recursive: true });
   } finally {
     await cleanupMatrixFixture(fixture, pids);

@@ -1,6 +1,7 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR;
@@ -26,6 +27,16 @@ async function waitForRelease() {
 }
 
 export default function (pi: any) {
+  pi.registerTool({
+    name: "planner_checkpoint",
+    label: "Planner checkpoint",
+    description: "Deterministic no-op between a planner summary and completion",
+    parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: "text", text: "checkpoint recorded" }], details: {} };
+    },
+  });
+
   pi.on("session_start", (_event: any, ctx: any) => {
     const entrypoint = process.argv[1];
     if (!entrypoint || entrypoint.endsWith("deterministic-herdr-provider.ts")) throw new Error(`invalid Pi entrypoint: ${entrypoint ?? "missing"}`);
@@ -155,22 +166,29 @@ export default function (pi: any) {
           : scenario === "nested" && latestUserText === "fixture invalid resume" ? "subagent_resume" : undefined;
         const initialControl = scenario === "control" && !hasToolResult && !controlTool;
         const initialMissing = scenario === "missing-skill" && !hasToolResult && !child;
+        const plannerCheckpointRecorded = scenario === "planner" && child && context.messages.some(
+          (message: any) => message.role === "toolResult" && message.toolName === "planner_checkpoint",
+        );
         const plannerDraft = scenario === "planner" && child && !hasToolResult && latestUserText !== "fixture approve plan";
         const plannerFinal = scenario === "planner" && child && latestUserText === "fixture approve plan";
+        const plannerDone = scenario === "planner" && child && plannerCheckpointRecorded;
         const initialSiblings = scenario === "siblings" && !hasToolResult && !controlTool && !child;
         const initialNestedRoot = scenario === "nested" && !hasToolResult && !controlTool && !child;
         const initialNestedOrchestrator = scenario === "nested" && !hasToolResult && !controlTool && process.env.PI_SUBAGENT_NAME === "Orchestrator";
-        output.stopReason = hasToolResult && !controlTool ? "stop" : plannerDraft ? "stop" : "toolUse";
+        output.stopReason = plannerDone ? "toolUse" : hasToolResult && !controlTool ? "stop" : plannerDraft ? "stop" : "toolUse";
         stream.push({ type: "start", partial: output });
         const text = plannerDraft ? "PLANNER_DRAFT_WAITING_FOR_APPROVAL"
           : plannerFinal ? "PLANNER_FINAL_SUMMARY"
+          : plannerDone ? ""
           : scenario === "siblings" && child ? "RESUMED_A_FRESH_RESULT"
           : scenario === "nested" && process.env.PI_SUBAGENT_NAME === "Orchestrator" && hasToolResult ? "ORCHESTRATOR_WAITING_FOR_CHILD"
           : hasToolResult && !controlTool ? (child ? "CHILD_POST_TOOL_STOP" : "PARENT_RECEIVED_RESULT") : (child ? "CHILD_COMPLETION_SUMMARY" : "PARENT_LAUNCHING_CHILD");
-        output.content.push({ type: "text", text });
-        stream.push({ type: "text_start", contentIndex: 0, partial: output });
-        stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
-        stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+        if (text) {
+          output.content.push({ type: "text", text });
+          stream.push({ type: "text_start", contentIndex: 0, partial: output });
+          stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
+          stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+        }
         if (plannerDraft) {
           // Deliberately settle without completing: the interactive planner remains open.
         } else if (initialSiblings) {
@@ -183,7 +201,7 @@ export default function (pi: any) {
             stream.push({ type: "toolcall_start", contentIndex: index + 1, partial: output });
             stream.push({ type: "toolcall_end", contentIndex: index + 1, toolCall, partial: output });
           });
-        } else if (initialNestedRoot || initialNestedOrchestrator || !hasToolResult || controlTool || plannerFinal) {
+        } else if (initialNestedRoot || initialNestedOrchestrator || !hasToolResult || controlTool || plannerFinal || plannerDone) {
           const terminated = [...context.messages].reverse().find((message: any) => message.role === "toolResult" && message.toolName === "subagent_terminate");
           const nestedControlName = latestUserText === "fixture ancestor terminate grandchild" ? "Grandchild" : "Orchestrator";
           const controlCallId = scenario === "nested"
@@ -205,8 +223,10 @@ export default function (pi: any) {
                       ? { type: "toolCall", id: "spawn-missing", name: "subagent", arguments: missingSkillAgent
                         ? { name: childName, agent: missingSkillAgent, task: "This artifact request must fail before provider work." }
                         : { name: childName, task: "This direct request must fail before provider work.", skills: "missing-live-skill", fork: true } }
-                      : child
-                        ? { type: "toolCall", id: fixtureToolCallId ?? "done-1", name: "subagent_done", arguments: {} }
+                      : plannerFinal
+                        ? { type: "toolCall", id: "planner-checkpoint", name: "planner_checkpoint", arguments: {} }
+                        : child
+                          ? { type: "toolCall", id: fixtureToolCallId ?? "done-1", name: "subagent_done", arguments: {} }
                         : { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: childName, agent: scenario === "planner" ? "deterministic-planner" : "deterministic-child", task: scenario === "planner" ? "Draft a plan, wait for approval, then finalize." : "Call subagent_done exactly once." } };
           record("provider_emitted_tool_call", { child, toolCallId: toolCall.id, toolName: toolCall.name, toolCallArguments: toolCall.arguments });
           output.content.push(toolCall);
