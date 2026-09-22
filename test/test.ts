@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -982,6 +982,54 @@ describe("subagent discovery", () => {
       testApi.resolveSubagentPaths({ name: "Worker", task: "work" }, parsed, "/different-caller").effectiveCwd,
       process.cwd(),
     );
+  });
+
+  it("keeps the configured agent directory when the target cwd matches the caller", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      mkdirSync(join(projectDir, ".pi", "agent"), { recursive: true });
+
+      assert.equal(
+        testApi.resolveSubagentPaths(
+          { name: "Scout", task: "inspect", cwd: projectDir },
+          null,
+          projectDir,
+        ).effectiveAgentDir,
+        globalDir,
+      );
+    });
+  });
+
+  it("keeps the configured agent directory when cwd is a symlink to the caller", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      mkdirSync(join(projectDir, ".pi", "agent"), { recursive: true });
+      const aliasedProjectDir = join(dirname(projectDir), "project-link");
+      symlinkSync(projectDir, aliasedProjectDir, "dir");
+
+      assert.equal(
+        testApi.resolveSubagentPaths(
+          { name: "Scout", task: "inspect", cwd: aliasedProjectDir },
+          null,
+          projectDir,
+        ).effectiveAgentDir,
+        globalDir,
+      );
+    });
+  });
+
+  it("uses an isolated agent directory when the target cwd changes projects", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const localAgentDir = join(projectDir, ".pi", "agent");
+      mkdirSync(localAgentDir, { recursive: true });
+
+      assert.equal(
+        testApi.resolveSubagentPaths(
+          { name: "Scout", task: "inspect", cwd: projectDir },
+          null,
+          globalDir,
+        ).effectiveAgentDir,
+        localAgentDir,
+      );
+    });
   });
 
   it("loads session-mode from frontmatter", async () => {

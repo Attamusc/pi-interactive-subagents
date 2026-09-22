@@ -472,6 +472,8 @@ spawning: false
 ---
 ```
 
+A `cwd` that resolves to the caller's current directory keeps the caller's Pi profile. When `cwd` switches to another directory containing `.pi/agent/`, that directory becomes the child's isolated `PI_CODING_AGENT_DIR`, including its settings, packages, authentication, and session storage. Use standard project resources such as `.pi/settings.json`, `.pi/agents/`, and `.pi/skills/` when the child should keep the caller's profile instead of replacing it.
+
 ---
 
 ## Tools Widget

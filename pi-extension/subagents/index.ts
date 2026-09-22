@@ -10,7 +10,7 @@ import {
   type NormalizedAgentDefinition,
 } from "pi-agent-execution";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -21,6 +21,7 @@ import {
   copyFileSync,
   unlinkSync,
   statSync,
+  realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -370,7 +371,7 @@ function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
   callerCwd = process.cwd(),
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
+): { effectiveCwd: string | null; effectiveAgentDir: string } {
   const explicitCwd = normalizeOptionalString(params.cwd);
   const hasConfiguredCwd = explicitCwd != null || agentDefs?.definition.cwd != null;
   const rawCwd = hasConfiguredCwd ? resolveVisibleLaunchIntent(params, agentDefs, callerCwd).cwd : null;
@@ -383,8 +384,13 @@ function resolveSubagentPaths(
     : null;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
+    localAgentDir &&
+    effectiveCwd &&
+    existsSync(localAgentDir) &&
+    realpathSync(resolve(effectiveCwd)) !== realpathSync(resolve(callerCwd))
+      ? localAgentDir
+      : getAgentConfigDir();
+  return { effectiveCwd, effectiveAgentDir };
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
