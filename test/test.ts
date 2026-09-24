@@ -31,6 +31,7 @@ import {
   parseHerdrSocketResponse,
   extractHerdrReadText,
   pollForExit,
+  ClaudeExitTimeoutError,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -84,6 +85,40 @@ function withTempDir(run: (dir: string) => void) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe("Claude CLI launch", () => {
+  it("restricts built-in and MCP tools for read-only review, including resume", () => {
+    const command = subagentsModule.__test__.buildClaudeCommand({
+      resultFile: "/tmp/claude-result.json",
+      processIdFile: "/tmp/claude.pid",
+      runId: "review-1",
+      model: "sonnet",
+      systemPrompt: "Review only",
+      resumeSessionId: "session-123",
+      task: "Check this file",
+      cwd: "/tmp/project",
+    });
+
+    assert.match(command, /claude --safe-mode --restricted --strict-mcp-config --permission-mode dontAsk --tools 'Read,Glob,Grep' --allowedTools 'Read' 'Glob' 'Grep' --disallowedTools 'mcp__\*' -p --output-format json --max-turns 16/);
+    assert.doesNotMatch(command, /dangerously-skip-permissions|bypassPermissions|--tools '.*Bash|PI_CLAUDE_SENTINEL|--plugin-dir/);
+    assert.match(command, /--model 'sonnet'/);
+    assert.match(command, /--append-system-prompt 'Review only'/);
+    assert.match(command, /--resume 'session-123' -- 'Check this file'/);
+    assert.match(command, /\(cd '\/tmp\/project' && exec claude /);
+    assert.match(command, /'Check this file' > '\/tmp\/claude-result.json'\) &/);
+    assert.match(command, /review-1.*'\/tmp\/claude.pid'/s);
+    assert.match(command, /wait "\$_claude_pid"\nelse\n[\s\S]*false\nfi$/);
+  });
+
+  it("passes the bundled review instructions to Claude", () => {
+    const agentFile = join(dirname(fileURLToPath(import.meta.url)), "..", "agents", "claude-code.md");
+    const agent = subagentsModule.__test__.parseVisibleAgentDefinition(agentFile, readFileSync(agentFile, "utf8"));
+    assert.ok(agent);
+    assert.equal(agent.cli, "claude");
+    assert.equal(agent.definition.systemPrompt?.mode, "append");
+    assert.match(agent.definition.systemPrompt?.text ?? "", /Read, Glob, and Grep/);
+  });
+});
 
 describe("agent definition contracts", () => {
   it("grants explicitly referenced tools", () => {
@@ -1606,6 +1641,96 @@ describe("semantic Herdr blocked lifecycle", () => {
   });
 
 
+  it("delivers Claude's real session ID only after a correlated process exit", async () => {
+    const dir = createTestDir();
+    try {
+      const runtime = createMockExtensionApi();
+      (subagentsModule as any).default(runtime.api);
+      const testApi = (subagentsModule as any).__test__;
+      const wrapperExitFile = join(dir, "wrapper.json");
+      const claudeResultFile = join(dir, "result.json");
+      writeFileSync(claudeResultFile, JSON.stringify({
+        type: "result", subtype: "success", is_error: false, result: "Found config mismatch",
+        session_id: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
+      }));
+      const running = makeRunning({ id: "claude-run", runId: "claude-run", cli: "claude", wrapperExitFile, claudeResultFile });
+      let closes = 0;
+      testApi.registerRunningSubagent(runtime.api, running);
+      const watcher = testApi.watchSubagent(running, new AbortController().signal, {
+        async closeSurface() { closes++; },
+        readScreen() { return "a misleading Stop-hook sentinel"; },
+        visibleInterval: 1,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(closes, 0, "an assistant message is not process exit evidence");
+      writeFileSync(wrapperExitFile, JSON.stringify({
+        version: 1, runId: "claude-run", sourceId: "wrapper:claude-run", sequence: 1,
+        observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 },
+      }));
+      const result = await watcher;
+      assert.equal(result.summary, "Found config mismatch");
+      assert.equal(result.claudeSessionId, "2ff3b2c1-d633-4200-b9da-87e1aaefb767");
+      assert.equal(closes, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a verified Claude review if Herdr pane cleanup fails", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    try {
+      const claudeResultFile = join(dir, "result.json");
+      writeFileSync(claudeResultFile, JSON.stringify({
+        type: "result", subtype: "success", is_error: false, result: "Verified consumer mismatch",
+        session_id: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
+      }));
+      const running = makeRunning({ id: "close-failed", cli: "claude", claudeResultFile });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { return { exitCode: 0 }; },
+        async closeSurface() { throw new Error("Herdr pane did not close"); },
+        readScreen() { return ""; },
+      });
+      assert.equal(result.exitCode, 0);
+      assert.match(result.summary, /Verified consumer mismatch/);
+      assert.match(result.summary, /pane cleanup failed/i);
+      assert.equal(result.claudeSessionId, "2ff3b2c1-d633-4200-b9da-87e1aaefb767");
+      assert.equal(testApi.runningSubagents.has("close-failed"), false);
+    } finally {
+      testApi.releaseRunningSubagent("close-failed");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps bounded partial Claude findings when max turns prevents a successful result", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    try {
+      const claudeResultFile = join(dir, "result.json");
+      writeFileSync(claudeResultFile, JSON.stringify({
+        type: "result", subtype: "error_max_turns", is_error: true,
+        result: "Partial finding: caller still sends V1", session_id: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
+      }));
+      const running = makeRunning({ id: "partial-claude", cli: "claude", claudeResultFile });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { return { exitCode: 0 }; },
+        async closeSurface() {},
+        readScreen() { return ""; },
+      });
+      assert.equal(result.exitCode, 1);
+      assert.match(result.summary, /Partial finding: caller still sends V1/);
+      assert.equal(result.claudeSessionId, undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("releases the blocked event when the real watcher completes", async () => {
     const dir = createTestDir();
     try {
@@ -1681,28 +1806,102 @@ describe("semantic Herdr blocked lifecycle", () => {
     (subagentsModule as any).default(runtime.api);
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning({ id: "watcher-error", cli: "claude" });
+    let closes = 0;
     testApi.registerRunningSubagent(runtime.api, running);
 
     await testApi.watchSubagent(running, new AbortController().signal, {
       async pollForExit() {
         throw new Error("watch failed");
       },
-      async closeSurface() {},
+      async closeSurface() { closes++; },
       readScreen() {
         return "";
       },
     });
 
-    assert.deepEqual(runtime.emittedEvents, [
-      {
-        channel: "herdr:blocked",
-        data: { active: true, label: "waiting on subagent" },
-      },
-      {
-        channel: "herdr:blocked",
-        data: { active: false },
-      },
-    ]);
+    assert.deepEqual(runtime.emittedEvents, [{
+      channel: "herdr:blocked",
+      data: { active: true, label: "waiting on subagent" },
+    }]);
+    assert.equal(testApi.runningSubagents.has("watcher-error"), true);
+    assert.equal(closes, 1, "a lost Claude watcher must request pane closure");
+    testApi.releaseRunningSubagent("watcher-error");
+  });
+
+  it("closes a lost Claude watcher and settles only after its CLI PID disappears", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    let closed = false;
+    try {
+      const claudeProcessIdFile = join(dir, "claude.pid");
+      writeFileSync(claudeProcessIdFile, "lost-review 4321\n");
+      const running = makeRunning({ id: "lost-review", runId: "lost-review", cli: "claude", claudeProcessIdFile });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { throw new Error("corrupt wrapper record"); },
+        async closeSurface() { closed = true; },
+        readScreen() { return ""; },
+        processProbe(pid: number) {
+          assert.equal(pid, 4321);
+          if (!closed) return;
+          throw Object.assign(new Error("gone"), { code: "ESRCH" });
+        },
+      });
+      assert.equal(closed, true);
+      assert.match(result.summary, /corrupt wrapper record/);
+      assert.equal(testApi.runningSubagents.has("lost-review"), false);
+    } finally {
+      testApi.releaseRunningSubagent("lost-review");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("requests Claude pane closure on deadline but reports exit as unconfirmed", async () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({ id: "claude-timeout", cli: "claude" });
+    let closes = 0;
+    testApi.registerRunningSubagent(runtime.api, running);
+    try {
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { throw new ClaudeExitTimeoutError(); },
+        async closeSurface() { closes++; },
+        readScreen() { return ""; },
+      });
+      assert.equal(closes, 1);
+      assert.equal(result.error, "exit_unconfirmed");
+      assert.match(result.summary, /process exit unconfirmed/);
+      assert.equal(testApi.runningSubagents.has("claude-timeout"), true);
+    } finally {
+      testApi.releaseRunningSubagent("claude-timeout");
+    }
+  });
+
+  it("settles a timed-out Claude run when its CLI PID is confirmed gone", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    try {
+      const claudeProcessIdFile = join(dir, "claude.pid");
+      writeFileSync(claudeProcessIdFile, "timed-claude 4321\n");
+      const running = makeRunning({ id: "timed-claude", runId: "timed-claude", cli: "claude", claudeProcessIdFile });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { throw new ClaudeExitTimeoutError(); },
+        async closeSurface() {},
+        readScreen() { return ""; },
+        processProbe(pid: number) { assert.equal(pid, 4321); throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      });
+      assert.match(result.summary, /process exit confirmed/);
+      assert.equal(testApi.runningSubagents.has("timed-claude"), false);
+    } finally {
+      testApi.releaseRunningSubagent("timed-claude");
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("hard termination keeps Pi registration until process exit is proven", async () => {
@@ -1991,7 +2190,9 @@ describe("subagent-done.ts", () => {
 describe("cmux.ts pollForExit", () => {
   it("includes the abort reason instead of normalizing it away", async () => {
     await assert.rejects(
-      pollForExit("unused", AbortSignal.abort("session_shutdown:new"), { interval: 1 }),
+      pollForExit("unused", AbortSignal.abort("session_shutdown:new"), {
+        interval: 1, wrapperExitFile: "/unused/wrapper.json", runId: "unused",
+      }),
       /Aborted while waiting for subagent to finish: session_shutdown:new/,
     );
   });
@@ -2767,6 +2968,74 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("does not claim Claude exited merely because its pane closed", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      runningMap.set("claude-run", makeRunning({
+        id: "claude-run", runId: "claude-run", cli: "claude",
+        wrapperExitFile: join(tmpdir(), "missing-claude-wrapper-record"),
+      }));
+      const result = await testApi.handleSubagentTerminate(
+        { id: "claude-run" }, async () => {}, () => "",
+      );
+      assert.equal(result.details.status, "termination_requested_unconfirmed");
+      assert.equal(runningMap.has("claude-run"), true);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("confirms Claude termination when its recorded CLI PID is absent", async () => {
+    const dir = createTestDir();
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      const claudeProcessIdFile = join(dir, "claude.pid");
+      writeFileSync(claudeProcessIdFile, "claude-run 4321\n");
+      runningMap.set("claude-run", makeRunning({
+        id: "claude-run", runId: "claude-run", cli: "claude", claudeProcessIdFile,
+        wrapperExitFile: join(dir, "missing-wrapper.json"),
+        abortController: new AbortController(),
+      }));
+      const result = await testApi.handleSubagentTerminate(
+        { id: "claude-run" }, async () => {}, () => "",
+        (pid: number) => { assert.equal(pid, 4321); throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      );
+      assert.equal(result.details.status, "terminated");
+      assert.equal(runningMap.has("claude-run"), false);
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles a previously requested Claude stop after its PID disappears", async () => {
+    const dir = createTestDir();
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      const claudeProcessIdFile = join(dir, "claude.pid");
+      writeFileSync(claudeProcessIdFile, "claude-run 4321\n");
+      runningMap.set("claude-run", makeRunning({
+        id: "claude-run", runId: "claude-run", cli: "claude", claudeProcessIdFile,
+        terminationRequestState: "accepted",
+      }));
+      const result = await testApi.handleSubagentTerminate(
+        { id: "claude-run" }, async () => { throw new Error("must not close twice"); }, () => "",
+        () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      );
+      assert.equal(result.details.status, "terminated");
+      assert.equal(runningMap.has("claude-run"), false);
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the watcher registered when hard termination cannot close the pane", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2914,6 +3183,14 @@ describe("subagent result renderer", () => {
       assert.equal((output.match(/failed \(provider\/agent error\)/g) ?? []).length, testCase.details.name === "Provider" ? 1 : 0);
       assert.doesNotMatch(output, /auto-retry exhausted/);
     }
+  });
+
+  it("advertises a Claude session ID without a fake Pi resume path", () => {
+    const text = (subagentsModule as any).__test__.resolveResultPresentation({
+      exitCode: 0, elapsed: 2, summary: "reviewed", claudeSessionId: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
+    }, "Claude Reviewer");
+    assert.match(text, /Claude session ID: 2ff3b2c1-d633-4200-b9da-87e1aaefb767/);
+    assert.doesNotMatch(text, /Resume: pi --session|subagent_resume/);
   });
 
   it("projects the same control marker for initial and resumed delivery details", () => {

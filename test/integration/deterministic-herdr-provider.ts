@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 const agentDir = process.env.PI_CODING_AGENT_DIR;
 if (!agentDir) throw new Error("deterministic provider requires PI_CODING_AGENT_DIR");
 const config = JSON.parse(readFileSync(join(agentDir, "extensions", "deterministic-herdr-config.json"), "utf8"));
-const { eventsFile, gateFile, releaseFile, versionsFile, scenario = "completion", childName = "DeterministicChild", siblingReleaseFile, invalidSessionFile, fixtureToolCallId, missingSkillAgent } = config;
+const { eventsFile, gateFile, releaseFile, versionsFile, scenario = "completion", childName = "DeterministicChild", siblingReleaseFile, invalidSessionFile, fixtureToolCallId, missingSkillAgent, resumeSessionId } = config;
 
 function record(event: string, details: Record<string, unknown> = {}) {
   appendFileSync(eventsFile, `${JSON.stringify({ event, at: new Date().toISOString(), pid: process.pid, subagentId: process.env.PI_SUBAGENT_ID ?? null, subagentName: process.env.PI_SUBAGENT_NAME ?? null, ...details })}\n`);
@@ -225,6 +225,14 @@ export default function (pi: any) {
                         : { name: childName, task: "This direct request must fail before provider work.", skills: "missing-live-skill", fork: true } }
                       : plannerFinal
                         ? { type: "toolCall", id: "planner-checkpoint", name: "planner_checkpoint", arguments: {} }
+                        : (scenario === "claude-review" || scenario === "claude-resume") && !child
+                          ? { type: "toolCall", id: "spawn-claude", name: "subagent", arguments: {
+                              name: "Claude Reviewer", agent: "claude-code",
+                              task: scenario === "claude-resume"
+                                ? "Follow up on the previous review: state the correction for src/caller.ts in one sentence without further reads."
+                                : "Diff: src/access.ts changed requiredHeader from X-Access-V1 to X-Access-V2. Acceptance: all callers must send V2. Failing test: caller sends V1, expected V2. Read src/access.ts and src/caller.ts in this fixture, then report the direct consumer mismatch in one sentence. Do not search elsewhere or run commands.",
+                              ...(scenario === "claude-resume" ? { resumeSessionId } : {}),
+                            } }
                         : child
                           ? { type: "toolCall", id: fixtureToolCallId ?? "done-1", name: "subagent_done", arguments: {} }
                         : { type: "toolCall", id: "spawn-1", name: "subagent", arguments: { name: childName, agent: scenario === "planner" ? "deterministic-planner" : "deterministic-child", task: scenario === "planner" ? "Draft a plan, wait for approval, then finalize." : "Call subagent_done exactly once." } };

@@ -4,6 +4,7 @@ import { connect } from "node:net";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { readWrapperExitRecord } from "./completion.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1456,7 +1457,7 @@ export async function closeSurface(surface: string): Promise<void> {
 export interface PollResult {
   /** How the subagent exited */
   reason: "done" | "ping" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  /** Foreground shell exit status, recorded after the child command exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
   ping?: { name: string; message: string };
@@ -1464,13 +1465,22 @@ export interface PollResult {
   errorMessage?: string;
 }
 
-/** Poll the separate Claude transport until its plugin or screen sentinel appears. */
+export class ClaudeExitTimeoutError extends Error {
+  constructor() {
+    super("Claude review deadline exceeded before process exit");
+    this.name = "ClaudeExitTimeoutError";
+  }
+}
+
+/** Wait for a run-correlated wrapper record written after the Claude process exits. */
 export async function pollForExit(
-  surface: string,
+  _surface: string,
   signal: AbortSignal,
   options: {
     interval: number;
-    sentinelFile?: string;
+    wrapperExitFile: string;
+    runId: string;
+    timeoutMs?: number;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -1482,29 +1492,12 @@ export async function pollForExit(
       throw new Error(`Aborted while waiting for subagent to finish: ${reason}`);
     }
 
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
+    const record = readWrapperExitRecord(options.wrapperExitFile, options.runId);
+    if (record.ok) return { reason: "done", exitCode: record.value.exit.shellStatus };
+    if (record.reason === "invalid") throw new Error(`Invalid Claude wrapper record: ${record.error}`);
+    if (Date.now() - start >= (options.timeoutMs ?? 600_000)) throw new ClaudeExitTimeoutError();
 
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Screen loss is not completion evidence; continue until a sentinel or cancellation.
-    }
-
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
+    options.onTick?.(Math.floor((Date.now() - start) / 1000));
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) {
         const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
