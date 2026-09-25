@@ -225,12 +225,16 @@ export default function (pi: any) {
                         : { name: childName, task: "This direct request must fail before provider work.", skills: "missing-live-skill", fork: true } }
                       : plannerFinal
                         ? { type: "toolCall", id: "planner-checkpoint", name: "planner_checkpoint", arguments: {} }
-                        : (scenario === "claude-review" || scenario === "claude-resume") && !child
+                        : ["claude-review", "claude-resume", "claude-managed-review", "claude-managed-validate"].includes(scenario) && !child
                           ? { type: "toolCall", id: "spawn-claude", name: "subagent", arguments: {
-                              name: "Claude Reviewer", agent: "claude-code",
+                              name: scenario === "claude-managed-validate" ? "Claude Validator" : "Claude Reviewer",
+                              agent: scenario === "claude-managed-validate" ? "claude-validator"
+                                : scenario === "claude-managed-review" ? "claude-reviewer" : "claude-code",
                               task: scenario === "claude-resume"
                                 ? "Follow up on the previous review: state the correction for src/caller.ts in one sentence without further reads."
-                                : "Diff: src/access.ts changed requiredHeader from X-Access-V1 to X-Access-V2. Acceptance: all callers must send V2. Failing test: caller sends V1, expected V2. Read src/access.ts and src/caller.ts in this fixture, then report the direct consumer mismatch in one sentence. Do not search elsewhere or run commands.",
+                                : scenario === "claude-managed-validate"
+                                  ? "Contract: src/access.ts requires X-Access-V2. Acceptance: src/caller.ts sends that header. Failing test: caller sent V1, expected V2. Read these two fixture files and report PASS or FAIL against the contract in one sentence. Do not search elsewhere or run commands."
+                                  : "Diff: src/access.ts changed requiredHeader from X-Access-V1 to X-Access-V2. Acceptance: all callers must send V2. Failing test: caller sends V1, expected V2. Read src/access.ts and src/caller.ts in this fixture, then report the direct consumer mismatch in one sentence. Do not search elsewhere or run commands.",
                               ...(scenario === "claude-resume" ? { resumeSessionId } : {}),
                             } }
                         : child

@@ -8,10 +8,11 @@ import { it } from "node:test";
 import { confirmClaudeProcessGone, readClaudeProcessId } from "../../pi-extension/subagents/claude-transport.ts";
 import { readWrapperExitRecord } from "../../pi-extension/subagents/completion.ts";
 
-const enabled = process.env.PI_TEST_CLAUDE_HERDR_SUBSCRIPTION === "approved";
+const managedRoles = process.env.PI_TEST_CLAUDE_MANAGED_ROLES === "approved";
+const enabled = managedRoles || process.env.PI_TEST_CLAUDE_HERDR_SUBSCRIPTION === "approved";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const pi = process.env.PI_TEST_PI_BINARY ?? join(root, "node_modules", ".bin", "pi");
-const extension = join(root, "pi-extension", "subagents", "index.ts");
+const extension = process.env.PI_TEST_EXTENSION_PATH ?? join(root, "pi-extension", "subagents", "index.ts");
 const provider = join(root, "test", "integration", "deterministic-herdr-provider.ts");
 const herdrExtension = join(homedir(), ".pi", "agent", "extensions", "herdr-agent-state.ts");
 
@@ -40,7 +41,7 @@ async function until<T>(label: string, probe: () => T | undefined, timeout = 60_
   throw new Error(`Timed out waiting for ${label}`);
 }
 
-it("delivers and resumes a bounded read-only Claude review in Herdr", { skip: !enabled, timeout: 150_000 }, async (t) => {
+it("delivers two bounded Claude review runs in Herdr", { skip: !enabled, timeout: 150_000 }, async (t) => {
   assert.equal(process.env.HERDR_ENV, "1");
   const temp = mkdtempSync(join(tmpdir(), "pi-claude-herdr-"));
   const work = join(temp, "work");
@@ -49,7 +50,7 @@ it("delivers and resumes a bounded read-only Claude review in Herdr", { skip: !e
   const events = join(temp, "events.jsonl");
   const versions = join(temp, "versions.jsonl");
   const configFile = join(agentDir, "extensions", "deterministic-herdr-config.json");
-  const config = { scenario: "claude-review", eventsFile: events, versionsFile: versions,
+  const config = { scenario: managedRoles ? "claude-managed-review" : "claude-review", eventsFile: events, versionsFile: versions,
     gateFile: join(temp, "gate"), releaseFile: join(temp, "release") };
   let workspaceId: string | undefined;
   let followupPane: string | undefined;
@@ -71,9 +72,16 @@ it("delivers and resumes a bounded read-only Claude review in Herdr", { skip: !e
     writeFileSync(join(work, "src", "caller.ts"), 'export const sentHeader = "X-Access-V1";\n');
     writeFileSync(join(agentDir, "settings.json"), '{"packages":[]}\n');
     writeFileSync(join(agentDir, "models.json"), '{"providers":{}}\n');
-    const role = readFileSync(join(root, "agents", "claude-code.md"), "utf8");
-    assert.match(role, /^model: sonnet$/m);
-    writeFileSync(join(agentDir, "agents", "claude-code.md"), role.replace(/^model: sonnet$/m, "model: haiku"));
+    if (managedRoles) {
+      for (const name of ["claude-reviewer", "claude-validator"]) {
+        writeFileSync(join(agentDir, "agents", `${name}.md`),
+          readFileSync(join(homedir(), ".pi", "agent", "agents", `${name}.md`), "utf8"));
+      }
+    } else {
+      const role = readFileSync(join(root, "agents", "claude-code.md"), "utf8");
+      assert.match(role, /^model: sonnet$/m);
+      writeFileSync(join(agentDir, "agents", "claude-code.md"), role.replace(/^model: sonnet$/m, "model: haiku"));
+    }
     writeFileSync(configFile, JSON.stringify(config));
 
     const created = herdr(["workspace", "create", "--cwd", work, "--label", "TEST Claude review", "--no-focus",
@@ -86,16 +94,21 @@ it("delivers and resumes a bounded read-only Claude review in Herdr", { skip: !e
     assert.match(first.content, /X-Access-V[12]/);
     assert.equal(first.details.exitCode, 0);
 
-    writeFileSync(configFile, JSON.stringify({ ...config, scenario: "claude-resume", resumeSessionId: claudeSessionId }));
+    writeFileSync(configFile, JSON.stringify({ ...config,
+      scenario: managedRoles ? "claude-managed-validate" : "claude-resume",
+      ...(managedRoles ? {} : { resumeSessionId: claudeSessionId }),
+    }));
     const followupTab = herdr(["tab", "create", "--workspace", workspaceId, "--cwd", work, "--no-focus",
       "--env", `PI_CODING_AGENT_DIR=${agentDir}`, "--env", "PI_SUBAGENT_MUX=herdr"]);
     followupPane = followupTab.root_pane.pane_id;
     herdr(["pane", "run", followupPane, command]);
     await until("follow-up Pi provider startup", () => entries(versions).filter(e => e.subagentId === null).length === 2 || undefined, 10_000);
-    const second = await until("resumed Claude review result", () => results().find(entry => entry.id !== first.id));
-    assert.equal(second.details.claudeSessionId, claudeSessionId);
+    const second = await until("second Claude review result", () => results().find(entry => entry.id !== first.id));
+    if (managedRoles) assert.notEqual(second.details.claudeSessionId, claudeSessionId);
+    else assert.equal(second.details.claudeSessionId, claudeSessionId);
     assert.equal(second.details.exitCode, 0);
     assert.match(second.content, /X-Access-V2/);
+    if (managedRoles) assert.match(second.content, /FAIL/i);
     if (process.env.PI_TEST_PI_EXPECTED_VERSION) {
       assert.ok(entries(versions).filter(e => e.subagentId === null).every(e => e.version === process.env.PI_TEST_PI_EXPECTED_VERSION));
     }
@@ -104,6 +117,12 @@ it("delivers and resumes a bounded read-only Claude review in Herdr", { skip: !e
     const pidFiles = findFiles(sessions, ".claude.pid");
     assert.equal(wrapperFiles.length, 2);
     assert.equal(pidFiles.length, 2);
+    if (managedRoles) {
+      const scripts = findFiles(sessions, ".sh").map(file => readFileSync(file, "utf8"));
+      assert.equal(scripts.length, 2);
+      assert.ok(scripts.some(text => /--safe-mode --restricted/.test(text) && /--model 'sonnet'/.test(text)));
+      assert.ok(scripts.some(text => /--safe-mode --restricted/.test(text) && /--model 'opus'/.test(text)));
+    }
     for (const file of pidFiles) {
       const runId = readFileSync(file, "utf8").split(" ")[0];
       assert.ok(readClaudeProcessId(file, runId));
