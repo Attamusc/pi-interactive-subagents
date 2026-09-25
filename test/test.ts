@@ -1858,6 +1858,72 @@ describe("semantic Herdr blocked lifecycle", () => {
     }
   });
 
+  it("delivers a review that finishes as the watcher deadline fires", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    try {
+      const wrapperExitFile = join(dir, "wrapper.json");
+      const claudeResultFile = join(dir, "result.json");
+      const running = makeRunning({ id: "deadline-race", runId: "deadline-race", cli: "claude", wrapperExitFile, claudeResultFile });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { throw new ClaudeExitTimeoutError(); },
+        async closeSurface() {
+          writeFileSync(claudeResultFile, JSON.stringify({
+            type: "result", subtype: "success", is_error: false, result: "Review finished at deadline",
+            session_id: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
+          }));
+          writeFileSync(wrapperExitFile, JSON.stringify({
+            version: 1, runId: "deadline-race", sourceId: "wrapper:deadline-race", sequence: 1,
+            observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 },
+          }));
+          throw new Error("Herdr pane cleanup failed");
+        },
+        readScreen() { return ""; },
+      });
+      assert.equal(result.exitCode, 0);
+      assert.match(result.summary, /Review finished at deadline/);
+      assert.match(result.summary, /Herdr pane cleanup failed/);
+      assert.equal(result.claudeSessionId, "2ff3b2c1-d633-4200-b9da-87e1aaefb767");
+      assert.equal(testApi.runningSubagents.has("deadline-race"), false);
+    } finally {
+      testApi.releaseRunningSubagent("deadline-race");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves bounded partial output and pane-close errors when a wrapper is invalid", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    try {
+      const claudeResultFile = join(dir, "result.json");
+      const claudeProcessIdFile = join(dir, "claude.pid");
+      writeFileSync(claudeResultFile, JSON.stringify({ type: "result", subtype: "error_max_turns", is_error: true, result: "Consumer still sends V1" }));
+      writeFileSync(claudeProcessIdFile, "invalid-wrapper 4321\n");
+      const running = makeRunning({ id: "invalid-wrapper", runId: "invalid-wrapper", cli: "claude", claudeResultFile, claudeProcessIdFile });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, new AbortController().signal, {
+        async pollForExit() { throw new Error("Invalid Claude wrapper record"); },
+        async closeSurface() { throw new Error("Herdr pane close failed"); },
+        readScreen() { return ""; },
+        processProbe(pid: number) { assert.equal(pid, 4321); throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      });
+      assert.equal(result.exitCode, 1);
+      assert.equal(result.claudeSessionId, undefined);
+      assert.match(result.summary, /Consumer still sends V1/);
+      assert.match(result.summary, /Herdr pane close failed/);
+      assert.equal(result.failureContext?.claudeResultFile, claudeResultFile);
+      assert.equal(testApi.runningSubagents.has("invalid-wrapper"), false);
+    } finally {
+      testApi.releaseRunningSubagent("invalid-wrapper");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("requests Claude pane closure on deadline but reports exit as unconfirmed", async () => {
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
@@ -3008,6 +3074,40 @@ describe("subagent interruption", () => {
       assert.equal(runningMap.has("claude-run"), false);
     } finally {
       runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("wakes the Claude watcher after accepted pane closure to confirm exit promptly", { timeout: 2_000 }, async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const controller = new AbortController();
+    try {
+      const claudeProcessIdFile = join(dir, "claude.pid");
+      writeFileSync(claudeProcessIdFile, "wake-run 4321\n");
+      const running = makeRunning({ id: "wake-run", runId: "wake-run", cli: "claude", claudeProcessIdFile, abortController: controller });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const watcher = testApi.watchSubagent(running, controller.signal, {
+        pollForExit(_surface: string, signal: AbortSignal) {
+          return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true }));
+        },
+        async closeSurface() { throw new Error("must not close twice"); },
+        readScreen() { return ""; },
+        processProbe(pid: number) { assert.equal(pid, 4321); throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      });
+      const request = await testApi.handleSubagentTerminate({ id: "wake-run" }, async () => {}, () => "", () => {});
+      assert.equal(request.details.status, "termination_requested_unconfirmed");
+      const watched = await Promise.race([
+        watcher,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("watcher did not wake")), 250)),
+      ]);
+      assert.equal(watched.error, "terminated");
+      assert.equal(testApi.runningSubagents.has("wake-run"), false);
+    } finally {
+      controller.abort("test_cleanup");
+      testApi.releaseRunningSubagent("wake-run");
       rmSync(dir, { recursive: true, force: true });
     }
   });

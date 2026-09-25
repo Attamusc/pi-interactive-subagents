@@ -103,6 +103,7 @@ describe("Claude review launch policy", () => {
     assert.throws(() => validateClaudeReviewLaunch({ thinking: "high" }, { autoExit: true }), /thinking overrides/);
     assert.throws(() => validateClaudeReviewLaunch({ resumeSessionId: "bad-id" }, { autoExit: true }), /invalid Claude session ID/);
     assert.throws(() => validateClaudeReviewLaunch({ task: "x".repeat(60 * 1024 + 1) }, { autoExit: true }), /60 KiB/);
+    assert.throws(() => validateClaudeReviewLaunch({ systemPrompt: "x".repeat(60 * 1024 + 1) }, { autoExit: true }), /60 KiB/);
     assert.doesNotThrow(() => validateClaudeReviewLaunch({
       resumeSessionId: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
     }, { autoExit: true }));

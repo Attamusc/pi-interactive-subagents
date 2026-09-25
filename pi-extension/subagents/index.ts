@@ -1292,9 +1292,8 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestState = "accepted";
-  if (running.cli !== "claude" && running.completionState) {
-    confirmOwnedProcessGone(running.completionState);
-  }
+  if (running.cli === "claude") running.abortController?.abort("terminated_by_parent");
+  else if (running.completionState) confirmOwnedProcessGone(running.completionState);
   updateWidget();
 
   let confirmed: boolean;
@@ -1510,6 +1509,13 @@ async function launchSubagent(
   if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
   else if (params.resumeSessionId) throw new Error("resumeSessionId requires a Claude review agent");
   const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
+  const claudeSystemPrompt = agentDefs?.cli === "claude"
+    ? [launchIntent.effective.systemPrompt?.text, params.systemPrompt]
+      .filter((text, index, all): text is string => !!text && all.indexOf(text) === index)
+      .join("\n\n") : undefined;
+  if (claudeSystemPrompt && Buffer.byteLength(claudeSystemPrompt, "utf8") > 60 * 1024) {
+    throw new Error("Claude review system prompt exceeds 60 KiB");
+  }
   const effectiveModel = launchIntent.effective.model;
   const effectiveTools = launchIntent.effective.tools?.join(",");
   const effectiveThinking = launchIntent.effective.thinking;
@@ -1593,9 +1599,7 @@ async function launchSubagent(
       processIdFile,
       runId: id,
       model: effectiveModel,
-      systemPrompt: [launchIntent.effective.systemPrompt?.text, params.systemPrompt]
-        .filter((text, index, all): text is string => !!text && all.indexOf(text) === index)
-        .join("\n\n"),
+      systemPrompt: claudeSystemPrompt,
       resumeSessionId: params.resumeSessionId,
       task: params.task,
       cwd: targetCwdForSession,
@@ -1884,6 +1888,7 @@ async function watchSubagent(
 
     const watcherAborted = signal.aborted;
     const moduleAborted = moduleSignal.aborted;
+    let paneCloseError: string | undefined;
     // A lost Claude watcher cannot supervise a running CLI; close its pane, then confirm exit separately.
     if ((running.cli === "claude" || watcherAborted || moduleAborted || err instanceof ClaudeExitTimeoutError) && running.terminationRequestState !== "accepted") {
       try {
@@ -1892,12 +1897,15 @@ async function watchSubagent(
           running.terminationRequestState = "accepted";
           running.terminationRequestedAt = Date.now();
         }
-      } catch {}
+      } catch (error) {
+        paneCloseError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+      }
     }
-    if (running.cli === "claude" && (running.claudeExitConfirmed ||
-        (running.wrapperExitFile && readWrapperExitRecord(running.wrapperExitFile, running.runId).ok))) terminalObserved = true;
+    const wrapper = running.cli === "claude" && running.wrapperExitFile
+      ? readWrapperExitRecord(running.wrapperExitFile, running.runId) : undefined;
+    if (running.cli === "claude" && (running.claudeExitConfirmed || wrapper?.ok)) terminalObserved = true;
     if (running.cli === "claude" && !terminalObserved && running.claudeProcessIdFile) {
-      for (let attempt = 0; attempt < 20; attempt++) {
+      for (let attempt = 0; attempt < 100; attempt++) {
         try {
           terminalObserved = confirmClaudeProcessGone(
             running.claudeProcessIdFile, running.runId, dependencies.processProbe,
@@ -1919,6 +1927,18 @@ async function watchSubagent(
     const errorMessage = err?.message ?? String(err);
     const terminatedByParent =
       watcherAborted && String(signal.reason ?? "") === "terminated_by_parent";
+    if (!terminatedByParent && wrapper?.ok && wrapper.value.exit.shellStatus === 0 && running.claudeResultFile) {
+      try {
+        const output = readClaudePrintResult(running.claudeResultFile);
+        const summary = paneCloseError
+          ? `${output.summary}\n\nHerdr pane cleanup failed after verified CLI exit: ${paneCloseError}`
+          : output.summary;
+        return { name, task, summary, exitCode: 0,
+          elapsed: Math.floor((Date.now() - startTime) / 1000), claudeSessionId: output.sessionId };
+      } catch {}
+    }
+    const partial = running.cli === "claude" && running.claudeResultFile
+      ? readClaudeFailureResult(running.claudeResultFile) : undefined;
     const summaryLines = [
       err instanceof ClaudeExitTimeoutError
         ? `Claude review deadline exceeded; process exit ${terminalObserved ? "confirmed" : "unconfirmed"}.`
@@ -1931,6 +1951,8 @@ async function watchSubagent(
       `Abort state: ${abortDetails}`,
       `Surface: ${surface}`,
       running.launchScriptFile ? `Launch script: ${running.launchScriptFile}` : undefined,
+      paneCloseError ? `Herdr pane cleanup failed: ${paneCloseError}` : undefined,
+      partial ? `Partial Claude output:\n${partial}` : undefined,
       terminalOutput ? `Terminal output before cleanup:\n${terminalOutput}` : undefined,
     ].filter((line): line is string => line != null);
 
@@ -1947,6 +1969,7 @@ async function watchSubagent(
         surface,
         launchScriptFile: running.launchScriptFile,
         activityFile: running.activityFile,
+        ...(running.cli === "claude" ? { claudeResultFile: running.claudeResultFile } : {}),
         terminalOutput,
         watcherAborted,
         watcherAbortReason: signal.reason == null ? undefined : String(signal.reason),

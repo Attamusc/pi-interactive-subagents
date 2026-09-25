@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function validateClaudeReviewLaunch(
-  params: { tools?: string; skills?: string; thinking?: string; fork?: boolean; interactive?: boolean; resumeSessionId?: string; task?: string },
+  params: { tools?: string; skills?: string; thinking?: string; fork?: boolean; interactive?: boolean; resumeSessionId?: string; task?: string; systemPrompt?: string },
   agent: { tools?: string; skills?: string; thinking?: string; autoExit?: boolean; sessionMode?: string },
 ): void {
   if (params.tools?.trim() || agent.tools?.trim()) throw new Error("Claude review does not accept tools overrides");
@@ -14,6 +14,9 @@ export function validateClaudeReviewLaunch(
   if (params.resumeSessionId && !SESSION_ID.test(params.resumeSessionId)) throw new Error("invalid Claude session ID");
   if (params.task && Buffer.byteLength(params.task, "utf8") > 60 * 1024) {
     throw new Error("Claude review task exceeds 60 KiB; provide a bounded evidence file path inside cwd");
+  }
+  if (params.systemPrompt && Buffer.byteLength(params.systemPrompt, "utf8") > 60 * 1024) {
+    throw new Error("Claude review system prompt exceeds 60 KiB");
   }
 }
 
