@@ -110,6 +110,24 @@ describe("Claude CLI launch", () => {
     assert.match(command, /wait "\$_claude_pid"\nelse\n[\s\S]*false\nfi$/);
   });
 
+  it("rejects oversized combined role and caller prompts before accessing a session or pane", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "big-review", "name: big-review\ncli: claude\nmodel: haiku\nauto-exit: true\nspawning: false\nsystem-prompt: append", "A".repeat(35_000));
+      const ctx = {
+        cwd: projectDir,
+        sessionManager: {
+          getSessionFile() { throw new Error("session access means validation was late"); },
+          getSessionId() { throw new Error("session access means validation was late"); },
+          getSessionDir() { throw new Error("session access means validation was late"); },
+        },
+      };
+      await assert.rejects(
+        () => subagentsModule.__test__.launchSubagent({ name: "Big review", agent: "big-review", task: "inspect", systemPrompt: "B".repeat(30_000) }, ctx),
+        /Claude review system prompt exceeds 60 KiB/,
+      );
+    });
+  });
+
   it("passes the bundled review instructions to Claude", () => {
     const agentFile = join(dirname(fileURLToPath(import.meta.url)), "..", "agents", "claude-code.md");
     const agent = subagentsModule.__test__.parseVisibleAgentDefinition(agentFile, readFileSync(agentFile, "utf8"));
@@ -1890,6 +1908,42 @@ describe("semantic Herdr blocked lifecycle", () => {
       assert.equal(testApi.runningSubagents.has("deadline-race"), false);
     } finally {
       testApi.releaseRunningSubagent("deadline-race");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not recover success after an explicit Claude termination even with a zero-exit wrapper", async () => {
+    const dir = createTestDir();
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    try {
+      const wrapperExitFile = join(dir, "wrapper.json");
+      const claudeResultFile = join(dir, "result.json");
+      writeFileSync(claudeResultFile, JSON.stringify({
+        type: "result", subtype: "success", is_error: false, result: "Finished just as parent terminated",
+        session_id: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
+      }));
+      writeFileSync(wrapperExitFile, JSON.stringify({
+        version: 1, runId: "terminated-race", sourceId: "wrapper:terminated-race", sequence: 1,
+        observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 },
+      }));
+      const controller = new AbortController();
+      controller.abort("terminated_by_parent");
+      const running = makeRunning({ id: "terminated-race", runId: "terminated-race", cli: "claude",
+        wrapperExitFile, claudeResultFile, abortController: controller, terminationRequestState: "accepted" });
+      testApi.registerRunningSubagent(runtime.api, running);
+      const result = await testApi.watchSubagent(running, controller.signal, {
+        async pollForExit() { throw new Error("parent terminated"); },
+        async closeSurface() { throw new Error("must not close twice"); },
+        readScreen() { return ""; },
+      });
+      assert.equal(result.error, "terminated");
+      assert.equal(result.exitCode, 1);
+      assert.equal(result.claudeSessionId, undefined);
+      assert.equal(testApi.runningSubagents.has("terminated-race"), false);
+    } finally {
+      testApi.releaseRunningSubagent("terminated-race");
       rmSync(dir, { recursive: true, force: true });
     }
   });

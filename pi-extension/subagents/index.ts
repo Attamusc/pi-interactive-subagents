@@ -1456,6 +1456,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   buildPiModelArgs,
   buildClaudeCommand,
+  launchSubagent,
   formatWidgetRightLabel,
   observeRunningSubagent,
   resolveDenyTools,
