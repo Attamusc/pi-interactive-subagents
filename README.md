@@ -185,6 +185,16 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 Optional string overrides are trimmed. Blank or whitespace-only `model`, `skills`, `tools`, and `cwd` values are treated as omitted, so a named agent's configured default still applies.
 
+### Herdr task labels
+
+Herdr peers publish guarded presentation metadata such as `Pi | Scout: Auth` or `Claude | Review`. Titles and labels are control-stripped and capped at 80 Unicode codepoints; narrow sidebar rows can still clip them. This does not change canonical harness identity, status, session identity, focus, or attention handling. A metadata failure stops launch; a newly created pane is closed, and a failed close names the retained pane.
+
+### Native Claude review progress
+
+Agents configured with `cli: claude` remain noninteractive, read-only review seats. The native CLI streams visible assistant text and requested `Read`, `Glob`, and `Grep` names into the pane, capped at 20,000 characters. Thinking, tool arguments/results, raw stream records, and init/config metadata are not mirrored. Terminal escape sequences, C1 controls, and bidi controls are stripped, including sequences split across deltas. Tool-name output is not proof of execution, permission enforcement, or turn completion; the parent widget still uses its existing `running` fallback.
+
+A private FIFO carries the stream without a transcript file. The formatter saves one selected terminal-result JSON (at most 1 MiB); the parent retains its 20,000-character summary limit and validates the native UUID for resume. The existing shell wrapper records the actual CLI PID, waits for CLI and formatter exit, and preserves nonzero native exit codes. Output failure notifies that wrapper to cancel its owned CLI process group; the formatter does not own the CLI lifecycle. Herdr remains the pane/PTY/session owner. This path requires the existing Unix Bash/Node host profile; no dependencies are provisioned automatically.
+
 ### Skill bootstrap
 
 Selected skills are resolved inside the child session, using that child's resource discovery, trust, precedence, and collision winner. The child prepends the canonical skill blocks to its first task input before the first provider request; it does not queue separate `/skill:` prompts or spend extra model turns loading them. Missing or unreadable required skills fail before provider work with a specific completion error.

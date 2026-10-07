@@ -94,6 +94,34 @@ describe("Claude foreground wrapper", () => {
   });
 });
 
+describe("Claude stream transport", () => {
+  it("renders bounded safe text and tool names before exit without exposing private stream fields", { timeout: 4_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-stream-progress-"));
+    const cli = join(dir, "claude");
+    const resultFile = join(dir, "result.json");
+    const wrapperExitFile = join(dir, "wrapper.json");
+    try {
+      writeFileSync(cli, `#!/bin/sh\nprintf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Visible\\u001b[31m SAFE"}}}' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"SECRET_ARGUMENT"}},{"type":"thinking","thinking":"SECRET_THOUGHT"}]}}'\nsleep 0.15\nprintf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"result":"final","session_id":"2ff3b2c1-d633-4200-b9da-87e1aaefb767"}'\n`);
+      chmodSync(cli, 0o755);
+      const command = (subagents as any).__test__.buildClaudeCommand({ resultFile, processIdFile: join(dir, "pid"), runId: "progress", task: "--tools Bash", cwd: dir });
+      const child = spawn("bash", ["-c", buildVisibleWrapperCommand({ piCommand: command, runId: "progress", wrapperExitFile })], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+      let visible = "";
+      child.stdout!.on("data", (data) => { visible += data.toString(); });
+      await new Promise<void>((resolve, reject) => {
+        const deadline = setTimeout(() => { child.kill(); reject(new Error("progress not visible before exit")); }, 2000);
+        const poll = setInterval(() => {
+          if (visible.includes("[Read]") && visible.includes("Visible")) { clearTimeout(deadline); clearInterval(poll); resolve(); }
+        }, 5);
+        child.once("exit", () => { clearTimeout(deadline); clearInterval(poll); if (!visible.includes("[Read]")) reject(new Error("no live progress")); });
+      });
+      assert.equal(child.exitCode, null);
+      await once(child, "exit");
+      assert.doesNotMatch(visible, /SECRET|\\x1b|31m/);
+      assert.equal(readClaudePrintResult(resultFile).sessionId, "2ff3b2c1-d633-4200-b9da-87e1aaefb767");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe("Claude review launch policy", () => {
   it("rejects wider authority and interactive/fork semantics before a pane is created", () => {
     assert.throws(() => validateClaudeReviewLaunch({ tools: "Bash" }, {}), /does not accept tools/);
@@ -111,7 +139,7 @@ describe("Claude review launch policy", () => {
       resultFile: "/tmp/claude-result.json", processIdFile: "/tmp/claude.pid",
       runId: "option-prompt", task: "--tools Bash", cwd: "/tmp",
     });
-    assert.match(command, /-- '--tools Bash' > '\/tmp\/claude-result\.json'/);
+    assert.match(command, /-- '--tools Bash' 1>&4/);
   });
 });
 

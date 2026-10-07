@@ -94,20 +94,21 @@ describe("Claude CLI launch", () => {
       runId: "review-1",
       model: "sonnet",
       systemPrompt: "Review only",
-      resumeSessionId: "session-123",
+      resumeSessionId: "2ff3b2c1-d633-4200-b9da-87e1aaefb767",
       task: "Check this file",
       cwd: "/tmp/project",
     });
 
-    assert.match(command, /claude --safe-mode --restricted --strict-mcp-config --permission-mode dontAsk --tools 'Read,Glob,Grep' --allowedTools 'Read' 'Glob' 'Grep' --disallowedTools 'mcp__\*' -p --output-format json --max-turns 16/);
+    assert.match(command, /claude --safe-mode --restricted --strict-mcp-config --permission-mode dontAsk --tools 'Read,Glob,Grep' --allowedTools 'Read' 'Glob' 'Grep' --disallowedTools 'mcp__\*' -p --output-format stream-json --verbose --include-partial-messages --max-turns 16/);
     assert.doesNotMatch(command, /dangerously-skip-permissions|bypassPermissions|--tools '.*Bash|PI_CLAUDE_SENTINEL|--plugin-dir/);
     assert.match(command, /--model 'sonnet'/);
     assert.match(command, /--append-system-prompt 'Review only'/);
-    assert.match(command, /--resume 'session-123' -- 'Check this file'/);
-    assert.match(command, /\(cd '\/tmp\/project' && exec claude /);
-    assert.match(command, /'Check this file' > '\/tmp\/claude-result.json'\) &/);
+    assert.match(command, /--resume '2ff3b2c1-d633-4200-b9da-87e1aaefb767' -- 'Check this file'/);
+    assert.match(command, /\(cd '\/tmp\/project' \|\| exit 1; exec 4>&3/);
+    assert.match(command, /'Check this file' 1>&4\) 2>&5 5>&- &/);
     assert.match(command, /review-1.*'\/tmp\/claude.pid'/s);
-    assert.match(command, /wait "\$_claude_pid"\nelse\n[\s\S]*false\nfi$/);
+    assert.match(command, /wait "\$_claude_pid"; _cli_status=\$\?/);
+    assert.match(command, /wait "\$_formatter_pid"; _formatter_status=\$\?/);
   });
 
   it("rejects oversized combined role and caller prompts before accessing a session or pane", async () => {

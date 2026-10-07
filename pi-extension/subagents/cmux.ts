@@ -1,5 +1,5 @@
 import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
+import { promisify, stripVTControlCharacters } from "node:util";
 import { connect } from "node:net";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -918,6 +918,31 @@ export function extractHerdrReadText(result: unknown): string {
     );
   }
   return text;
+}
+
+export async function setTaskLabel(surface: string, harness: "Pi" | "Claude", task: string): Promise<void> {
+  if (getMuxBackend() !== "herdr") return;
+  const title = Array.from(stripVTControlCharacters(task)
+    .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\s+/g, " ").trim()).slice(0, 80).join("");
+  if (!title) throw new Error("Subagent task label is empty after sanitization");
+  await herdrSocketCall("pane.report_metadata", {
+    pane_id: surface, source: "pi:subagent-task",
+    // Metadata's agent field is a presentation guard, not an authority claim.
+    agent: harness === "Claude" ? "claude" : "pi",
+    title, display_agent: Array.from(`${harness} | ${title}`).slice(0, 80).join(""),
+  });
+}
+
+export async function createTaskSurface(name: string, harness: "Pi" | "Claude"): Promise<string> {
+  const surface = await createSurface(name);
+  try { await setTaskLabel(surface, harness, name); }
+  catch (error) {
+    try { await closeSurface(surface); }
+    catch { throw new Error(`Task metadata failed; newly created pane ${surface} could not be closed`, { cause: error }); }
+    throw error;
+  }
+  return surface;
 }
 
 export async function createSurface(name: string): Promise<string> {
