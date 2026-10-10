@@ -185,6 +185,18 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 Optional string overrides are trimmed. Blank or whitespace-only `model`, `skills`, `tools`, and `cwd` values are treated as omitted, so a named agent's configured default still applies.
 
+### Herdr task labels
+
+Herdr peers publish guarded presentation metadata such as `Pi | Scout: Auth` or `Claude | Review`. Titles and labels are control-stripped and capped at 80 Unicode codepoints; narrow sidebar rows can still clip them. This does not change canonical harness identity, status, session identity, focus, or attention handling. A metadata failure stops launch; a newly created pane is closed, and a failed close names the retained pane.
+
+### Native Claude review progress
+
+Agents configured with `cli: claude` remain noninteractive, read-only review seats. The native CLI streams visible assistant text and requested `Read`, `Glob`, and `Grep` names into the pane, capped at 20,000 characters. Thinking, tool arguments/results, raw stream records, and init/config metadata are not mirrored. Terminal escape sequences, C1 controls, and bidi controls are stripped, including sequences split across deltas. Tool-name output is not proof of execution, permission enforcement, or turn completion; the parent widget still uses its existing `running` fallback.
+
+A one-shot foreground transport command pipes native output to an output-only formatter without a transcript file. It records the actual CLI PID (not the transport/formatter PID), awaits native and formatter exits, and preserves nonzero native exit codes. Both children inherit Herdr's foreground process group and session; no job-control mode or separate session is created. The formatter saves one selected terminal-result JSON (at most 1 MiB); the parent retains its 20,000-character summary limit and validates the native UUID for resume. Output/startup failure cancels the native invocation; Herdr remains the pane/PTY/session owner and performs whole-session cleanup. This path requires the existing Unix Bash/Node host profile; no dependencies are provisioned automatically.
+
+If output remains open one second after native exit, the transport cuts off its drain and fails closed—even if a valid success result was received. Available findings are returned as partial output without a resume UUID, not promoted back to success. The existing Pi deadline and Herdr pane close still bound blocked terminal writes and clean up session descendants; the transport does not claim to kill them itself. PID-only signalling and escaped-session cleanup are not certified.
+
 ### Skill bootstrap
 
 Selected skills are resolved inside the child session, using that child's resource discovery, trust, precedence, and collision winner. The child prepends the canonical skill blocks to its first task input before the first provider request; it does not queue separate `/skill:` prompts or spend extra model turns loading them. Missing or unreadable required skills fail before provider work with a specific completion error.
