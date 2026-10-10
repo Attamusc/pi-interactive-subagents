@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildVisibleWrapperCommand, readWrapperExitRecord } from "../pi-extension/subagents/completion.ts";
@@ -12,8 +13,25 @@ const uuid = "2ff3b2c1-d633-4200-b9da-87e1aaefb767";
 const result = (text = "review", id = uuid) => JSON.stringify({ type: "result", subtype: "success", is_error: false, result: text, session_id: id });
 const scriptLine = (value: unknown) => `printf '%s\\n' '${JSON.stringify(value).replaceAll("'", "'\\''")}'\n`;
 
+for (const exists of [false, true]) {
+  it(`fails startup without a PID sidecar (file exists=${exists})`, { timeout: 4000 }, () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-spawn-"));
+    try {
+      const cli = join(dir, "bad-cli");
+      if (exists) writeFileSync(cli, "#!/bin/sh\nexit 0\n", { mode: 0o600 });
+      const pidFile = join(dir, "pid");
+      let status = 0;
+      try {
+        execFileSync(process.execPath, [fileURLToPath(new URL("../pi-extension/subagents/claude-run.ts", import.meta.url)), join(dir, "result"), pidFile, "spawn", dir, cli], { timeout: 2000, stdio: "pipe" });
+      } catch (error: any) { status = error.status; }
+      assert.equal(status, 1);
+      assert.equal(existsSync(pidFile), false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 type Run = { output: string; error: string; status: number | null; elapsed: number; dir: string; resultFile: string; pid: number | null; wrapperOk: boolean };
-async function fakeRun(body: string, options: { task?: string; model?: string; systemPrompt?: string; resumeSessionId?: string; timeout?: number; closeOutput?: boolean } = {}): Promise<Run> {
+async function fakeRun(body: string, options: { task?: string; model?: string; systemPrompt?: string; resumeSessionId?: string; timeout?: number; closeOutput?: boolean; readError?: boolean } = {}): Promise<Run> {
   const dir = mkdtempSync(join(tmpdir(), "claude-stream-contract-"));
   const cli = join(dir, "claude");
   const resultFile = join(dir, "result.json");
@@ -25,8 +43,23 @@ async function fakeRun(body: string, options: { task?: string; model?: string; s
     resultFile, processIdFile: pidFile, runId: "contract", task: options.task ?? "inspect", cwd: dir,
     model: options.model, systemPrompt: options.systemPrompt, resumeSessionId: options.resumeSessionId,
   });
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}` };
+  if (options.readError) {
+    const preload = join(dir, "read-error.mjs");
+    writeFileSync(preload, `import { createRequire, syncBuiltinESMExports } from 'node:module';
+const cp = createRequire(import.meta.url)('node:child_process');
+const original = cp.spawn;
+cp.spawn = (command, ...args) => {
+  const child = original(command, ...args);
+  if (command === 'claude') setTimeout(() => child.stdout.emit('error', new Error('FIXTURE_READ_ERROR')), 100);
+  return child;
+};
+syncBuiltinESMExports();
+`);
+    env.NODE_OPTIONS = `--import ${preload}`;
+  }
   const child = spawn("bash", ["-c", buildVisibleWrapperCommand({ piCommand: command, runId: "contract", wrapperExitFile })], {
-    detached: true, env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    detached: true, env,
   });
   if (options.closeOutput) child.stdout!.destroy();
   let output = "", error = "", status: number | null = null;
@@ -123,6 +156,17 @@ describe("native Claude stream result integrity", () => {
       assert.throws(() => process.kill(run.pid!, 0), { code: "ESRCH" });
     } finally { cleanup(run); }
   });
+  it("cancels on an internal read-side pipe error without an uncaught exception", { timeout: 4000 }, async () => {
+    const run = await fakeRun("exec sleep 10\n", { readError: true, timeout: 2200 });
+    try {
+      assert.ok(run.elapsed < 2000);
+      assert.notEqual(run.status, 0);
+      assert.ok(run.wrapperOk);
+      assert.ok(run.pid);
+      assert.throws(() => process.kill(run.pid!, 0), { code: "ESRCH" });
+      assert.doesNotMatch(run.error, /Unhandled 'error'|FIXTURE_READ_ERROR/);
+    } finally { cleanup(run); }
+  });
   it("reaps the native CLI when pane output closes (EPIPE)", { timeout: 4000 }, async () => {
     const body = scriptLine({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "live output" } } }) + "exec sleep 10\n";
     const run = await fakeRun(body, { closeOutput: true, timeout: 2200 });
@@ -139,6 +183,16 @@ describe("native Claude stream result integrity", () => {
     const run = await fakeRun(scriptLine(JSON.parse(result("x".repeat(1_100_000)))));
     try { assert.notEqual(run.status, 0); assert.equal(existsSync(run.resultFile), false); } finally { cleanup(run); }
   });
+  for (const exit of [0, 7]) {
+    it(`bounds post-exit drain when a native descendant holds stdout open (native=${exit})`, { timeout: 4000 }, async () => {
+      const run = await fakeRun(scriptLine(JSON.parse(result())) + `sleep 10 &\nexit ${exit}\n`, { timeout: 2200 });
+      try {
+        assert.ok(run.elapsed < 2000, `unbounded drain: ${run.elapsed}ms`);
+        assert.ok(run.wrapperOk, "transport must settle before outer deadline");
+        assert.equal(run.status, exit === 0 ? 1 : exit);
+      } finally { cleanup(run); }
+    });
+  }
   it("preserves native2 when formatter detects a malformed tail after native exit", { timeout: 4000 }, async () => {
     const run = await fakeRun(scriptLine(JSON.parse(result())) + "printf '%s' '{bad tail'\nexit 2\n");
     try {

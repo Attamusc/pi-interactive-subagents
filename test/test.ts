@@ -104,11 +104,9 @@ describe("Claude CLI launch", () => {
     assert.match(command, /--model 'sonnet'/);
     assert.match(command, /--append-system-prompt 'Review only'/);
     assert.match(command, /--resume '2ff3b2c1-d633-4200-b9da-87e1aaefb767' -- 'Check this file'/);
-    assert.match(command, /\(cd '\/tmp\/project' \|\| exit 1; exec 4>&3/);
-    assert.match(command, /'Check this file' 1>&4\) 2>&5 5>&- &/);
-    assert.match(command, /review-1.*'\/tmp\/claude.pid'/s);
-    assert.match(command, /wait "\$_claude_pid"; _cli_status=\$\?/);
-    assert.match(command, /wait "\$_formatter_pid"; _formatter_status=\$\?/);
+    assert.match(command, /^node .*claude-run\.ts' '\/tmp\/claude-result\.json' '\/tmp\/claude\.pid' 'review-1' '\/tmp\/project' claude /);
+    assert.match(command, /'Check this file'$/);
+    assert.doesNotMatch(command, /set -m|mkfifo|USR1/);
   });
 
   it("rejects oversized combined role and caller prompts before accessing a session or pane", async () => {
@@ -1693,6 +1691,42 @@ describe("semantic Herdr blocked lifecycle", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("waits for owner close before returning successful and drain-failure CLI results", async () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    const testApi = (subagentsModule as any).__test__;
+    const dir = createTestDir();
+    const claudeResultFile = join(dir, "result.json");
+    writeFileSync(claudeResultFile, JSON.stringify({ type: "result", subtype: "success", is_error: false,
+      result: "Verified finding", session_id: "2ff3b2c1-d633-4200-b9da-87e1aaefb767" }));
+    try {
+      for (const exitCode of [0, 1, 7]) {
+        const running = makeRunning({ id: `owner-close-${exitCode}`, cli: "claude", claudeResultFile });
+        testApi.registerRunningSubagent(runtime.api, running);
+        let releaseClose!: () => void;
+        const closePending = new Promise<void>((resolve) => { releaseClose = resolve; });
+        let settled = false;
+        const watcher = testApi.watchSubagent(running, new AbortController().signal, {
+          async pollForExit() { return { exitCode }; },
+          async closeSurface() { await closePending; },
+          readScreen() { return ""; },
+        }).then((result: { exitCode: number; claudeSessionId?: string; summary: string }) => { settled = true; return result; });
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.equal(settled, false, `CLI exit ${exitCode} must wait for owner cleanup`);
+        } finally {
+          releaseClose();
+        }
+        const result = await watcher;
+        assert.equal(result.exitCode, exitCode);
+        assert.equal(result.claudeSessionId, exitCode === 0 ? "2ff3b2c1-d633-4200-b9da-87e1aaefb767" : undefined,
+          "a failed/cut-off transport must not recover success or resume from its result file");
+        if (exitCode !== 0) assert.match(result.summary, /Partial Claude output:[\s\S]*Verified finding/);
+        assert.equal(settled, true);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it("preserves a verified Claude review if Herdr pane cleanup fails", async () => {

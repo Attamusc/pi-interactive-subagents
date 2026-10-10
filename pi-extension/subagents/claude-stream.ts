@@ -1,7 +1,7 @@
-import { createReadStream, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { TextDecoder } from "node:util";
 
-const [input, output, ready, notifyParent] = process.argv.slice(2);
+const [output] = process.argv.slice(2);
 const MAX_BYTES = 1024 * 1024;
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -47,11 +47,6 @@ let failed = false;
 function fail(reason: string): never {
   failed = true;
   console.error(`Claude stream formatter: ${reason}`);
-  // Output failure notification only. The existing shell wrapper owns cancellation
-  // and waits for its native child; this formatter never signals the CLI itself.
-  if (notifyParent === "--notify-parent") {
-    try { process.kill(process.ppid, "SIGUSR1"); } catch {}
-  }
   process.exit(1);
 }
 process.stdout.on("error", () => fail("pane output failed"));
@@ -92,12 +87,7 @@ function line(raw: string) {
   }
 }
 try {
-  const stream = createReadStream(input);
-  await new Promise<void>((resolve, reject) => {
-    stream.once("open", () => resolve());
-    stream.once("error", reject);
-  });
-  writeFileSync(ready, "ready", { mode: 0o600 });
+  const stream = process.stdin;
   for await (const chunk of stream) {
     pending += decoder.decode(chunk, { stream: true });
     let end: number;

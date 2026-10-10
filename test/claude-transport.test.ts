@@ -139,7 +139,7 @@ describe("Claude review launch policy", () => {
       resultFile: "/tmp/claude-result.json", processIdFile: "/tmp/claude.pid",
       runId: "option-prompt", task: "--tools Bash", cwd: "/tmp",
     });
-    assert.match(command, /-- '--tools Bash' 1>&4/);
+    assert.match(command, /-- '--tools Bash'$/);
   });
 });
 

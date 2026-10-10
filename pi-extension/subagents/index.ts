@@ -1015,29 +1015,9 @@ function buildClaudeCommand(options: {
   if (options.resumeSessionId) parts.push("--resume", shellEscape(options.resumeSessionId));
   parts.push("--", shellEscape(options.task));
 
-  const cdPrefix = options.cwd ? `cd ${shellEscape(options.cwd)} || exit 1; ` : "";
-  const fifo = shellEscape(`${options.resultFile}.stream`);
-  const child = `${cdPrefix}exec 4>&3; exec 3>&-; exec ${parts.join(" ")} 1>&4`;
-  const formatter = shellEscape(fileURLToPath(new URL("./claude-stream.ts", import.meta.url)));
-  const ready = shellEscape(`${options.resultFile}.ready`);
-  const pidFile = shellEscape(options.processIdFile);
-  const pidTemp = shellEscape(`${options.processIdFile}.tmp`);
-  return `(umask 077\nset -m\n_formatter_failed=0\n_interrupted_status=$((128 + $(kill -l USR1)))\n_claude_pid=\n` +
-    `trap '_formatter_failed=1; if [ -n "$_claude_pid" ]; then kill -KILL -- "-$_claude_pid" 2>/dev/null || :; fi' USR1\n` +
-    `rm -f ${shellEscape(options.resultFile)}\nmkfifo ${fifo} || exit 1\nexec 3<> ${fifo}\n` +
-    `rm -f ${ready}\nnode ${formatter} ${fifo} ${shellEscape(options.resultFile)} ${ready} --notify-parent 2>&5 5>&- 3>&- &\n_formatter_pid=$!\n` +
-    `while [ ! -f ${ready} ]; do\n  if ! kill -0 "$_formatter_pid" 2>/dev/null; then exec 3>&-; wait "$_formatter_pid"; rm -f ${fifo}; exit 1; fi\n  sleep 0.01\ndone\nrm -f ${ready}\n` +
-    `(${child}) 2>&5 5>&- &\n_claude_pid=$!\nexec 3>&-\n` +
-    `if ! { printf '%s %s\\n' ${shellEscape(options.runId)} "$_claude_pid" > ${pidTemp} && mv ${pidTemp} ${pidFile}; }; then\n` +
-    `  kill -KILL -- "-$_claude_pid" "-$_formatter_pid" 2>/dev/null || :\n  wait "$_claude_pid" || :\n  wait "$_formatter_pid" || :\n  rm -f ${fifo}\n  exit 1\nfi\n` +
-    `wait "$_claude_pid"; _cli_status=$?\n` +
-    `if [ "$_formatter_failed" -ne 0 ] && [ "$_cli_status" -eq "$_interrupted_status" ]; then wait "$_claude_pid"; _cli_status=$?; fi\n` +
-    `kill -KILL -- "-$_claude_pid" 2>/dev/null || :\n` +
-    `wait "$_formatter_pid"; _formatter_status=$?\n` +
-    `if [ "$_formatter_failed" -ne 0 ] && [ "$_formatter_status" -eq "$_interrupted_status" ]; then wait "$_formatter_pid"; _formatter_status=$?; fi\n` +
-    `rm -f ${fifo}\n` +
-    `if [ "$_cli_status" -ne 0 ]; then exit "$_cli_status"; fi\n` +
-    `exit "$_formatter_status") 5>&2 2>/dev/null`;
+  const runner = shellEscape(fileURLToPath(new URL("./claude-run.ts", import.meta.url)));
+  return ["node", runner, shellEscape(options.resultFile), shellEscape(options.processIdFile),
+    shellEscape(options.runId), shellEscape(options.cwd ?? ""), ...parts].join(" ");
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
