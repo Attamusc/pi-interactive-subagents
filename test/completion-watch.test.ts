@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { projectAgentRunStatus } from "pi-agent-execution";
+import { projectAgentRunStatus, reduceAgentRunEvidence } from "pi-agent-execution";
 import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import { confirmOwnedProcessGone, createVisibleCompletionState, observeVisibleCompletion, recordVisibleControl, waitForVisibleCompletion } from "../pi-extension/subagents/completion-watch.ts";
 
@@ -47,6 +47,7 @@ describe("visible parent completion observer", () => {
     writeWrapper(f.paths, "run");
     const result = await waitForVisibleCompletion({ state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit, sessionFile: f.sessionFile, transcriptStartLine: offset, sessionRef: f.sessionFile, signal: new AbortController().signal, interval: 1 });
     assert.equal(result.completion.output, "fresh");
+    assert.equal(result.completion.errorMessage, undefined);
     assert.equal(result.completion.execution, "normal-exit");
     assert.equal(result.completion.sessionRef, f.sessionFile);
     assert.equal(observeVisibleCompletion({ state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit }).terminal, true);
@@ -73,6 +74,7 @@ describe("visible parent completion observer", () => {
       interval: 1,
     });
     assert.equal(result.completion.output, "FINAL REVIEW");
+    assert.equal(result.completion.errorMessage, undefined);
   });
 
   it("does not recover stale text for non-explicit completion", async () => {
@@ -96,7 +98,111 @@ describe("visible parent completion observer", () => {
       interval: 1,
     });
     assert.equal(result.completion.output, "");
+    assert.equal(result.completion.errorMessage, undefined);
   });
+
+  it("reports an unparseable fresh transcript instead of silently returning no findings", async () => {
+    const f = fixture();
+    writeFileSync(f.sessionFile, [
+      JSON.stringify({ type: "session", id: "session-1" }),
+      JSON.stringify({ type: "message", id: "fresh", message: { role: "assistant", content: [{ type: "text", text: "SYNTHETIC FINDINGS" }] } }),
+      '{"synthetic_secret":"DO_NOT_ECHO_THIS',
+    ].join("\n") + "\n");
+    f.recorder.record({ kind: "completion-requested", reason: "auto-exit" }, { kind: "done" });
+    f.recorder.record({ kind: "agent-settled" });
+    writeWrapper(f.paths, "run");
+
+    const result = await waitForVisibleCompletion({
+      state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile, transcriptStartLine: 1,
+      signal: new AbortController().signal, interval: 1,
+    });
+    assert.equal(result.completion.execution, "normal-exit");
+    assert.equal(result.completion.output, "");
+    assert.equal(result.completion.errorMessage, "Subagent transcript could not be read or parsed; findings are unavailable.");
+    assert.equal(result.completion.taskOutcome, "unknown");
+    assert.deepEqual(result.completion.processExit, { kind: "shell", shellStatus: 0 });
+    assert.doesNotMatch(result.completion.errorMessage, /DO_NOT_ECHO_THIS|synthetic_secret|SYNTHETIC FINDINGS/);
+  });
+
+  it("reports a missing fresh transcript instead of a successful empty observation", async () => {
+    const f = fixture();
+    f.recorder.record({ kind: "completion-requested", reason: "auto-exit" }, { kind: "done" });
+    f.recorder.record({ kind: "agent-settled" });
+    writeWrapper(f.paths, "run");
+    rmSync(f.sessionFile);
+
+    const result = await waitForVisibleCompletion({
+      state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile, transcriptStartLine: 1,
+      signal: new AbortController().signal, interval: 1,
+    });
+    assert.equal(result.completion.execution, "normal-exit");
+    assert.equal(result.completion.output, "");
+    assert.equal(result.completion.errorMessage, "Subagent transcript could not be read or parsed; findings are unavailable.");
+    assert.equal(result.completion.taskOutcome, "unknown");
+    assert.deepEqual(result.completion.processExit, { kind: "shell", shellStatus: 0 });
+    assert.doesNotMatch(result.completion.errorMessage, new RegExp(f.dir));
+    assert.equal(Object.isFrozen(result.completion), true);
+    assert.equal(Object.isFrozen(result.completion.processExit), true);
+  });
+
+  it("preserves a child error when fresh transcript retrieval also fails", async () => {
+    const f = fixture();
+    f.recorder.record({ kind: "completion-requested", reason: "agent-error" }, {
+      kind: "error", errorMessage: "SYNTHETIC PROVIDER FAILURE", stopReason: "error",
+    });
+    f.recorder.record({ kind: "agent-settled" });
+    writeWrapper(f.paths, "run");
+    rmSync(f.sessionFile);
+
+    const result = await waitForVisibleCompletion({
+      state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile, transcriptStartLine: 1,
+      signal: new AbortController().signal, interval: 1,
+    });
+    assert.equal(result.completion.errorMessage, "SYNTHETIC PROVIDER FAILURE");
+    assert.equal(result.completion.output, "");
+    assert.equal(result.completion.execution, "agent-error");
+    assert.equal(result.completion.taskOutcome, "unknown");
+    assert.deepEqual(result.completion.processExit, { kind: "shell", shellStatus: 0 });
+  });
+
+  it("preserves abnormal-exit evidence when the fresh transcript is missing", async () => {
+    const f = fixture();
+    assert.throws(() => writeWrapper(f.paths, "run", 1), { status: 1 });
+    rmSync(f.sessionFile);
+    const result = await waitForVisibleCompletion({
+      state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+      sessionFile: f.sessionFile, transcriptStartLine: 1,
+      signal: new AbortController().signal, interval: 1,
+    });
+    assert.equal(result.completion.errorMessage, "Shell command exited with status 1 without a graceful completion handshake");
+    assert.equal(result.completion.execution, "transport-failure");
+    assert.equal(result.completion.taskOutcome, "unknown");
+    assert.deepEqual(result.completion.processExit, { kind: "shell", shellStatus: 1 });
+  });
+
+  for (const kind of ["host-start-failed", "transport-failed"] as const) {
+    it(`preserves ${kind} evidence when the fresh transcript is missing`, async () => {
+      const f = fixture();
+      rmSync(f.sessionFile);
+      const message = `SYNTHETIC ${kind} FAILURE`;
+      f.state.core = reduceAgentRunEvidence(f.state.core, {
+        kind, message, runId: "run", sourceId: "parent:run", sequence: 1,
+        observedAt: new Date().toISOString(),
+      });
+      const result = await waitForVisibleCompletion({
+        state: f.state, childSnapshotFile: f.paths.childSnapshot, wrapperExitFile: f.paths.wrapperExit,
+        sessionFile: f.sessionFile, transcriptStartLine: 1,
+        signal: new AbortController().signal, interval: 1,
+      });
+      assert.equal(result.completion.errorMessage, message);
+      assert.equal(result.completion.execution, "transport-failure");
+      assert.equal(result.completion.taskOutcome, "unknown");
+      assert.equal(result.completion.processExit, undefined);
+    });
+  }
 
   it("ignores malformed, wrong-run, legacy exit, and screen-like files", () => {
     const f = fixture();

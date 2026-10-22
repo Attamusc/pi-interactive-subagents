@@ -2,7 +2,7 @@
 
 Date: 2026-10-22
 Scope: TODO-2c6e541f; synthetic completion-observer fixtures only
-Status: one diagnostic fault reproduced; earlier live incidents remain unattributed
+Status: diagnostic fix independently verified in synthetic tests; earlier live incidents remain unattributed
 
 ## Observations and limits
 
@@ -91,3 +91,34 @@ content privacy and unchanged lifecycle/control behavior. Full production
 parent/child runtime proof remains unverified until its separate live-test gate is
 approved. If the earlier scout incidents persist, obtain user-authorized bounded
 runtime evidence rather than silently expanding into transcript archaeology.
+
+## Verified diagnostic fix
+
+The observer now adds the fixed content-free read/parse diagnostic only AFTER
+normal lifecycle projection and only if that projection has no error message.
+Existing child/provider, startup, transport and abnormal-exit errors keep their
+original precedence. The fallback result remains frozen; actual execution,
+process-exit, session and unknown task-outcome facts are unchanged.
+
+Independent Claude CLI validation caught an earlier candidate that supplied the
+transcript diagnostic before projection, masking structured lifecycle errors.
+Three synthetic precedence cases failed with that candidate and passed after
+moving the diagnostic to the final fallback. The abnormal-exit fixture executes
+a real shell wrapper, expects its status 1 and checks the recorded exit evidence.
+No live agent or provider is involved.
+
+Measured final checks:
+
+- Missing/malformed normal-exit data and abnormal/start/transport precedence:
+  5 focused tests passed, none skipped; negative-control precedence run failed
+  all 3 expected assertions before restoring the corrected code.
+- A production-parent watcher/summary test covers both missing and malformed
+  synthetic files with a mock runtime. It verifies the surfaced diagnostic,
+  truthful shell-zero exit, one pane-close request and released registration.
+- `npm test`: exit 0; 255 passed, 0 failed, 0 skipped.
+- `git diff --check`: exit 0.
+- Independent Claude CLI validator: PASS for this narrow diagnostic contract.
+
+The full real-Herdr/integration/provider paths were not run. This does not prove
+that the earlier scouts hit this failure or that their live failure is resolved.
+No installed package, host configuration or managed pin was changed.

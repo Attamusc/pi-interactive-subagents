@@ -2197,6 +2197,44 @@ describe("semantic Herdr blocked lifecycle", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("surfaces fresh output-read failures through the production parent summary", async () => {
+    const runtime = createMockExtensionApi();
+    (subagentsModule as any).default(runtime.api);
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    const testApi = (subagentsModule as any).__test__;
+    for (const variant of ["missing", "malformed"]) {
+      const dir = createTestDir();
+      const id = `output-read-${variant}`;
+      const paths = buildVisibleCompletionPaths(dir, id);
+      const sessionFile = join(dir, "synthetic.jsonl");
+      if (variant === "malformed") writeFileSync(sessionFile, "SYNTHETIC_PRIVATE_MARKER");
+      const recorder = createChildCompletionRecorder({ runId: id, childPid: process.pid, sessionFile, snapshotFile: paths.childSnapshot });
+      recorder.record({ kind: "completion-requested", reason: "auto-exit" }, { kind: "done" });
+      recorder.record({ kind: "agent-settled" });
+      writeFileSync(paths.wrapperExit, JSON.stringify({ version: 1, runId: id, sourceId: `wrapper:${id}`, sequence: 1,
+        observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 0 } }));
+      const running = makeRunning({ id, runId: id, sessionFile, piSessionRef: sessionFile, transcriptStartLine: 0,
+        childSnapshotFile: paths.childSnapshot, wrapperExitFile: paths.wrapperExit, completionState: createVisibleCompletionState(id) });
+      testApi.registerRunningSubagent(runtime.api, running);
+      let closes = 0;
+      try {
+        const result = await testApi.watchSubagent(running, new AbortController().signal, {
+          async closeSurface() { closes++; }, readScreen() { throw new Error("screen recovery must not run"); }, visibleInterval: 1,
+        });
+        assert.equal(result.summary, "Subagent error: Subagent transcript could not be read or parsed; findings are unavailable.");
+        assert.equal(result.errorMessage, "Subagent transcript could not be read or parsed; findings are unavailable.");
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.sessionFile, sessionFile);
+        assert.doesNotMatch(result.summary, /SYNTHETIC_PRIVATE_MARKER|exited without new output/);
+        assert.equal(closes, 1);
+        assert.equal(testApi.runningSubagents.has(id), false);
+      } finally {
+        testApi.releaseRunningSubagent(id);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("maps agent errors and termination to failure even with shell status zero", () => {
     const testApi = (subagentsModule as any).__test__;
     const base = { runId: "r", output: "", taskOutcome: "unknown", settled: true, processExit: { kind: "shell", shellStatus: 0 } };

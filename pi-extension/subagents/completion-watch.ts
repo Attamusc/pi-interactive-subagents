@@ -117,7 +117,9 @@ export async function waitForVisibleCompletion(params: {
     }
     if (status.terminal) {
       let entries: ReturnType<typeof getNewEntries> = [];
-      try { entries = getNewEntries(params.sessionFile, params.transcriptStartLine); } catch {}
+      let transcriptError: string | undefined;
+      try { entries = getNewEntries(params.sessionFile, params.transcriptStartLine); }
+      catch { transcriptError = "Subagent transcript could not be read or parsed; findings are unavailable."; }
       const assistant = extractLatestAssistantOutput(entries);
       const explicitDoneSummary =
         assistant.output === "" && params.state.core.completionIntent?.reason === "done"
@@ -130,7 +132,12 @@ export async function waitForVisibleCompletion(params: {
         sessionRef: params.sessionRef,
       });
       if (!completion) throw new Error("terminal lifecycle projection produced no completion");
-      return { completion, payload: params.state.payload };
+      return {
+        completion: completion.errorMessage === undefined && transcriptError !== undefined
+          ? Object.freeze({ ...completion, errorMessage: transcriptError })
+          : completion,
+        payload: params.state.payload,
+      };
     }
     try { params.onTick?.(); }
     catch (error) { diagnostic(params.state, "observer callback", { reason: "invalid", error: error instanceof Error ? error.message : String(error) }); }
