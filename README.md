@@ -74,7 +74,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
-| `/plan`                    | Start a full planning workflow       |
+| `/plan`                    | Plan a rough idea or concrete request in the current conversation |
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
 
@@ -267,26 +267,17 @@ await caller_ping({
 
 ## The `/plan` Workflow
 
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
+The `/plan` command injects planning guidance into the current conversation. No scout or separate planner pane is required. Investigate source facts first; ask focused questions with recommendations only for consequential unknown goals or trade-offs.
 
 ```
 /plan Add a dark mode toggle to the settings page
 ```
 
-```
-Phase 1: Investigation    → Quick codebase scan
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm todos, adjust if needed
-Phase 4: Execute          → Scout + sequential workers implement todos
-Phase 5: Review           → Reviewer subagent checks all changes
-```
+Draft one plain-English proposal (ordinarily 250–400 words): changed behavior/examples, unchanged scope, observable success checks, and consequential decisions. Routine reversible internal choices stay agent-owned; hard-to-undo commitments need evidence, alternatives, recovery limits, and explicit consent. Potential harm determines tests even if code rollback is cheap.
 
-Tab/window titles update to show current phase:
+Tasks remain draft, with code examples or source references and inline acceptance checks. A fresh read-only reviewer checks the proposal and resolved tasks without inheriting the author's conversation; add a second technical check for hard-to-undo or high-harm work. Resolve findings with at most one fresh re-review, then pause on material blockers or incomplete review. Only the main author/orchestrator activates tasks after one explicit execution approval of the reviewed version. Planning-only stops with drafts; material changes need renewed consent, routine implementation choices do not.
 
-```
-🔍 Investigating: dark mode → 💬 Planning: dark mode
-→ 🔨 Executing: 1/3 → 🔎 Reviewing → ✅ Done
-```
+Scouts remain optional. Deliberately delegated planners stay interactive and return through `subagent_done`; they do not authorize execution. Explicit grilling is opt-in. `/iterate` stays lightweight. Existing dependency checks, claims, real tests, post-code review, and contract validation still apply; see `agents/planner.md` and `pi-extension/subagents/plan-skill.md` for the handoff contract.
 
 ---
 

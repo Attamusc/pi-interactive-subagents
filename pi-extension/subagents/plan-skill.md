@@ -1,203 +1,33 @@
 ---
 name: plan
 description: >
-  Planning workflow. Runs a pre-flight scout, then spawns the planner agent
-  which clarifies WHAT to build and figures out HOW, with the ability to
-  spawn its own scouts/researchers mid-session. Use when asked to "plan",
-  "brainstorm", "I want to build X", or "let's design". Requires the
-  subagents extension and a supported multiplexer (cmux/tmux/zellij).
+  Plan rough ideas or concrete requests in the current conversation. Investigate
+  source facts, clarify consequential choices, and draft one compact proposal
+  with grounded tasks. No compulsory scout or planner pane.
 ---
 
 # Plan
 
-A planning workflow. A scout maps the relevant codebase, then an interactive planner clarifies intent + requirements and designs the technical approach, producing a `plan.md` and todos.
+Stay in the current conversation for both rough ideas and concrete requests. Read the bundled `../../agents/planner.md` guidance, resolving that path relative to this skill's injected file location (`pi-extension/subagents/plan-skill.md`), never relative to the user project's current working directory, and follow its discovery, proposal, draft-task, fresh-review, and execution-consent contract as the main author. Do not spawn a planner just because `/plan` was invoked. A scout or researcher is optional when bounded investigation helps; investigate source-discoverable facts rather than asking the user.
 
-**Announce at start:** "Let me take a quick look, then I'll send a scout to map the codebase before we start the planning session."
+Ask focused plain-English questions with recommendations only when unresolved goals or trade-offs could materially change the result. Otherwise investigate and draft directly. No mandatory phases, repeated continue gates, glossary ceremony, numerical risk forms, forced routine alternatives, or automatic grill skill loading. Explicit grilling remains opt-in.
 
----
+Write `.pi/plans/YYYY-MM-DD-<name>/plan.md`. An ordinary proposal aims for 250–400 words explaining changed behavior/examples, unchanged scope, observable success checks, and consequential decisions. Never hide risks or commitments in optional worker detail to meet that aim. Cheap reversible internal choices stay agent-owned. Judge deliberation by undoing choices after shipping; hard-to-undo work needs evidence, recovery options or limits, meaningful alternatives, and explicit owner consent. Potential harm controls verification even when code rollback is cheap.
 
-## The Flow
+Draft independently implementable tasks with owned paths, constraints, code examples or exact source references, inline acceptance criteria, real tests, and integration sources of truth. Follow host/repository-declared task capability and tracker conventions before ticket operations; read `~/.pi/agent/skills/todo-tracker.md` when that managed path is configured. Do not assume every host has that file. If required task capability or conventions are unavailable, report the gap before ticket operations; do not invent a backend or silently proceed. Create tasks as `draft`, record IDs, then wire actual `Blocked by:` dependencies. Do not activate them while planning or reviewing.
 
-```
-Phase 1: Quick Assessment (main session — 30s orientation)
-    ↓
-Phase 2: Scout (autonomous — codebase context)
-    ↓
-Phase 3: Spawn Planner Agent (interactive — clarifies WHAT, plans HOW, creates todos)
-    ↓
-    (Planner may spawn its own scouts/researchers mid-session as needed)
-    ↓
-Phase 4: Review Plan & Todos (main session)
-    ↓
-Phase 5: Execute Todos (workers — receive plan + scout context)
-    ↓
-Phase 6: Review
-```
+Have a fresh read-only reviewer check the proposal and resolved task bodies for consistency and feasibility, using allowed source evidence without the author's conversation. Use standalone/lineage-only context, never `/iterate` or a full-context fork; do not claim filesystem isolation. Follow repository review-seat defaults. For authorized Pi-backed review, explicitly use `tools: "read"` and prohibit spawning; Claude Code read-only seats take no tool/fork overrides. Add a second independent technical check for hard-to-undo or high-harm work, at most two concurrent reviewers. Declare bounded time/run limits using existing host controls, not a new lifecycle manager.
 
----
+In default main-conversation planning, the main author is the sole proposal/task writer and resolves findings. When deliberately delegated, the planner is the sole writer of its assigned proposal/draft tasks and resolves discovery and review findings; the orchestrator does not write them concurrently. Allow at most one fresh re-review of affected checks. Missing, empty, failed, or incomplete review preserves evidence and pauses promotion. Unresolved material blockers pause rather than becoming accepted at the retry limit. The main author/orchestrator presents the reviewed proposal and collects one explicit execution approval of that version. A deliberately delegated planner does not ask for permission to build or activate tasks; it returns reviewed artifacts, IDs, status, and evidence to the orchestrator for that single approval. Already verifiable execution approval for the identical reviewed version need not be re-asked; a summary, completion handshake, or approval of a direction alone is not proof. Only the main author/orchestrator activates fully wired tasks after successful review and that approval. Planning-only requests stop with drafts. Material proposal/task changes require renewed review and consent; routine internal choices do not. Reconcile artifacts, tickets, and VCS after restart; stale summaries are not permission.
 
-## Phase 1: Quick Assessment
-
-Quick orientation — just enough to give the scout a focused mission:
-
-```bash
-ls -la
-find . -type f -name "*.ts" | head -20  # or relevant extension
-cat package.json 2>/dev/null | head -30
-```
-
-Spend ~30 seconds. Tech stack, project shape, and the area relevant to the user's request. This tells you what to ask the scout to focus on.
-
----
-
-## Artifact Paths
-
-For a planning run, pick a short `<name>` (e.g. `auth-redesign`) and use a shared directory under `.pi/plans/YYYY-MM-DD-<name>/` for every deliverable. Pass explicit paths in each subagent's task and read them back with the plain `read` tool when a subagent finishes.
-
-Standard filenames:
-
-- `.pi/plans/YYYY-MM-DD-<name>/scout-context.md`
-- `.pi/plans/YYYY-MM-DD-<name>/plan.md`
-- `.pi/plans/YYYY-MM-DD-<name>/review.md` (optional, for reviewer output)
-
----
-
-## Phase 2: Scout
-
-**Always spawn a scout before the planner.** The scout's context feeds into the planning session — it lets the planner skip re-asking questions whose answers live in the code, and gives it a solid base to design from.
+When deliberately delegating planning, keep the planner interactive and provide explicit artifact paths, scope, constraints, evidence, and stop condition:
 
 ```typescript
-subagent({
-  name: "🔍 Scout",
-  agent: "scout",
-  task: `Analyze the codebase for [user's request area]. Map file structure, key modules, patterns, conventions, and existing code related to [feature area]. Focus on what a planner would need to understand before designing this feature.
-
-Save your findings to: .pi/plans/YYYY-MM-DD-<name>/scout-context.md`,
-});
+subagent({ name: "Planner", agent: "planner", interactive: true, task: "Plan [goal]. Write .pi/plans/YYYY-MM-DD-<name>/plan.md and grounded draft tasks. [Resolved context, boundaries, references, checks]. Return reviewed artifacts, IDs, status, and evidence; do not ask for permission to build or activate tasks." })
 ```
 
-**Wait for the scout to finish.** Read the scout's context file with the `read` tool — you'll pass it to the planner.
+The planner completes through `subagent_done`, not a manual close. Read its artifacts and reconcile draft tasks; its return is not execution approval.
 
-The planner can spawn **additional** scouts or researchers mid-session if it hits a factual gap. That's expected — don't try to pre-scout every possible area.
+After approval, the orchestrator verifies each task is unclaimed and eligible, including dependencies, then delegates without claiming on the worker's behalf. The implementation worker fetches and claims the task in the authoritative task scope before writes, following host/repository tracker conventions. A cross-workspace or scoped-store mismatch must pause before writes and be reported to the coordinator; do not steal a claim, force a transfer, or silently copy tickets. Supply resolved scope, constraints, examples, and acceptance checks, never only an opaque ID. Serialize writers in a shared checkout; concurrent work requires disjoint ownership. Retain real tests, polished commits, independent post-code review, and risk-appropriate contract validation, including non-mocked integration checks. Preserve failures and actual command output. Plan review cannot replace implementation verification.
 
----
-
-## Phase 3: Spawn Planner Agent
-
-Spawn the interactive planner with the scout's context and the user's request. The planner handles everything from here: clarifying intent, compact requirements engineering, ISC, approach exploration, design validation, premortem, plan artifact, and todos.
-
-```typescript
-subagent({
-  name: "💬 Planner",
-  agent: "planner",
-  interactive: true,
-  task: `Plan: [what the user wants to build]
-
-Scout context:
-[paste scout findings here — file structure, conventions, patterns, relevant code]
-
-Save the final plan to: .pi/plans/YYYY-MM-DD-<name>/plan.md
-Create todos tagged with: <name>`,
-});
-```
-
-**The user works with the planner.** It will clarify requirements lightly (1-2 rounds of questions, not a deep spec session), propose approaches, validate the design, run a premortem, write the plan, and create todos with mandatory code examples.
-
-When done, the user presses Ctrl+D and the plan + todos are returned to the main session.
-
-### The planner may spawn its own specialists
-
-During the session, the planner can spawn:
-- **`scout`** — when a design decision depends on existing code it hasn't read
-- **`researcher`** — when a decision depends on external facts (library tradeoffs, best practices, API behaviors)
-
-These are internal to the planning session. You'll see them in the multiplexer but don't need to intervene.
-
-### Optional: extra scout after planning
-
-If the planner significantly changed scope (new subsystems, areas the original scout didn't cover), spawn another scout targeting the new areas before workers start:
-
-```typescript
-subagent({
-  name: "🔍 Scout (updated scope)",
-  agent: "scout",
-  task: "The plan changed scope. Gather context for [new areas]. Read the plan at [plan path]. Focus on [specific files/modules the planner identified that weren't in the original scout].",
-});
-```
-
-Fold the new context into the worker tasks.
-
----
-
-## Phase 4: Review Plan & Todos
-
-Once the planner closes, read the plan and list todos:
-
-```typescript
-todo({ action: "list" });
-```
-
-Review with the user:
-
-> "Here's what the planner produced: [brief summary]. Ready to execute, or anything to adjust?"
-
----
-
-## Phase 5: Execute Todos
-
-Before each spawn, fetch that todo with `todo({ action: "get", id: "TODO-xxxx" })`. Spawn workers sequentially with the resolved scope, constraints, references, and acceptance criteria — never hand a worker only an opaque ID.
-
-```typescript
-// Workers execute todos sequentially — one at a time
-subagent({
-  name: "🔨 Worker 1/N",
-  agent: "worker",
-  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nResolved todo: [paste scope, constraints, references, and acceptance criteria]\n\nScout context: [paste scout summary from Phase 2, plus any re-scout from Phase 3]",
-});
-
-// Check result, fetch the next todo, then spawn the next worker
-subagent({
-  name: "🔨 Worker 2/N",
-  agent: "worker",
-  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nResolved todo: [paste scope, constraints, references, and acceptance criteria]\n\nScout context: [paste scout summary]",
-});
-```
-
-**Always run workers sequentially in the same git repo** — parallel workers will conflict on commits.
-
----
-
-## Phase 6: Review
-
-After all todos are complete:
-
-```typescript
-subagent({
-  name: "Reviewer",
-  agent: "reviewer",
-  interactive: false,
-  task: "Review the recent changes. Plan: [plan path]\n\nResolved intent and acceptance criteria: [paste from the completed todos]",
-});
-```
-
-Triage findings:
-
-- **P0** — Real bugs, security issues → fix now
-- **P1** — Genuine traps, maintenance dangers → fix before merging
-- **P2** — Minor issues → fix if quick, note otherwise
-- **P3** — Nits → skip
-
-Create todos for P0/P1, run workers to fix, re-review only if fixes were substantial.
-
----
-
-## ⚠️ Completion Checklist
-
-Before reporting done:
-
-1. ✅ Scout ran before the planner?
-2. ✅ Scout context was passed to the planner?
-3. ✅ All worker todos closed?
-4. ✅ Every todo has a polished commit (using the `commit` skill)?
-5. ✅ Reviewer has run?
-6. ✅ Reviewer findings triaged and addressed?
+Plans are ephemeral: durable constraints belong in self-contained ADRs, agent instructions, or code, not permanent references back to plans. Planning does not authorize host changes, repinning, live task migration, or altering active runs. `/iterate` remains a lightweight full-context fork. Use existing host lifecycle ownership; do not add pane/process/status machinery.
