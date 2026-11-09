@@ -214,6 +214,22 @@ export async function startCoreRun(context: CoreContext, spec: CoreRunSpec): Pro
   }
 }
 
+export async function reconcileCoreRun(launch: Pick<CoreLaunchUnconfirmed, "context" | "runId" | "scriptPath" | "wrapperStartFile">): Promise<CoreHostRef | undefined> {
+  await verifyCore(launch.context);
+  const listed = object(await coreRpcCall(launch.context.endpoint, "terminal.list", { all: true, labels: { "pi.subagent.run": launch.runId } }));
+  if (!Array.isArray(listed?.terminals)) throw new CoreRpcError("terminal.list", "invalid_reply", "invalid reconciliation listing");
+  const candidates = listed.terminals.map((value: unknown) => terminal(value, "terminal.list"))
+    .filter((record: CoreTerminal) => record.labels["pi.subagent.run"] === launch.runId);
+  if (candidates.some((record: CoreTerminal) => record.parent !== launch.context.parent || record.argv.length !== 2
+    || record.argv[0] !== "/bin/bash" || record.argv[1] !== launch.scriptPath)) {
+    throw new CoreRpcError("terminal.list", "owner_mismatch", "run label no longer matches the original parent/wrapper");
+  }
+  if (candidates.length > 1) throw new CoreRpcError("terminal.list", "ambiguous", "multiple terminals match the owned run; cleanup remains unconfirmed");
+  if (candidates.length === 0) return undefined;
+  return { kind: "herdr-core", ...launch.context, address: candidates[0].address, runId: launch.runId,
+    scriptPath: launch.scriptPath, wrapperStartFile: launch.wrapperStartFile };
+}
+
 export async function getCoreTerminal(host: CoreHostRef): Promise<CoreTerminal> {
   await verifyCore(host);
   const record = terminal(await coreRpcCall(host.endpoint, "terminal.get", { terminal: host.address }), "terminal.get");

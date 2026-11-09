@@ -163,8 +163,8 @@ export function readWrapperStartRecord(file: string, expectedRunId: string, expe
 }
 
 export function writeCoreRecoveryDescriptor(file: string, record: {
-  runId: string; endpoint: string; address: string; wrapperPid?: number; childPid?: number;
-  script: string; session: string; stage: string; error: string;
+  runId: string; endpoint: string; coreId: string; parent: string; address?: string; wrapperPid?: number; childPid?: number;
+  script: string; wrapperStartFile: string; session: string; stage: string; error: string;
 }): void {
   requireRunId(record.runId);
   atomicWrite(file, { ...record, error: record.error.slice(0, MAX_STRING) }, 1);

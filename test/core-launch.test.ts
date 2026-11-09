@@ -7,6 +7,7 @@ import { createServer } from "node:net";
 import { once } from "node:events";
 import { createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
+import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
 import { getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
 
 it("selects explicit Core without classic fallback and requires inherited identity", () => {
@@ -48,8 +49,23 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
         case "terminal.run":
           child = { address: "t2", state: "live", pid: 456, argv: request.params.argv, parent: "t1", labels: request.params.labels };
           writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), child: true, name: "" }));
+          if (JSON.parse(readFileSync(stateFile, "utf8")).unconfirmed) {
+            const reply = () => socket.end(JSON.stringify({ jsonrpc: "2.0", id: "uncorrelated", result: child }) + "\n");
+            if (JSON.parse(readFileSync(stateFile, "utf8")).delayRunReply) setTimeout(reply, 50); else reply();
+            return;
+          }
           result = child; break;
-        case "terminal.kill": child = { ...child, state: "finished", pid: null, exit_code: 143 }; result = child; break;
+        case "terminal.list": {
+          const state = JSON.parse(readFileSync(stateFile, "utf8"));
+          result = { terminals: state.hideChild || state.hideChildOnce ? [] : state.ambiguous ? [child, { ...child, address: "t3" }] : [child], hidden_finished: 0 };
+          if (state.hideChildOnce) writeFileSync(stateFile, JSON.stringify({ ...state, hideChildOnce: false }));
+          break;
+        }
+        case "terminal.kill":
+          if (JSON.parse(readFileSync(stateFile, "utf8")).killFails) {
+            socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture kill failure", data: { kind: "busy" } } }) + "\n"); return;
+          }
+          child = { ...child, state: "finished", pid: null, exit_code: 143 }; result = child; break;
         case "terminal.rm":
           if (JSON.parse(readFileSync(stateFile, "utf8")).rmFails) {
             socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture remove failure", data: { kind: "busy" } } }) + "\n"); return;
@@ -310,6 +326,275 @@ for (const confirmed of [true, false]) {
     });
   });
 }
+
+function registeredRuntime(ctx: any) {
+  const tools: any[] = [];
+  const handlers = new Map<string, any>();
+  const messages: any[] = [];
+  subagentsExtension({
+    events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
+    registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+    sendMessage(message: any) { messages.push(message); }, getAllTools() { return []; },
+  } as any);
+  handlers.get("session_start")({}, ctx);
+  return { tools, handlers, messages, launch: (params: any) => tools.find(tool => tool.name === "subagent").execute("launch", params, undefined, undefined, ctx) };
+}
+
+it("retains failed visibility cleanup from the registered tool and retries only removal", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ renameFails: true, rmFails: true }));
+    const runtime = registeredRuntime(ctx);
+    try {
+      await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /visibility setup failed/);
+      assert.equal(__test__.runningSubagents.size, 1, "failed setup must remain directly owned");
+      assert.equal(getDirectChildCount(), 1);
+      const running = [...__test__.runningSubagents.values()][0];
+      assert.equal(running.coreHost?.address, "t2");
+      assert.equal(running.coreCleanupStage, "remove");
+      const termination = await runtime.tools.find(tool => tool.name === "subagent_terminate").execute("terminate", { id: running.id }, undefined, undefined, ctx);
+      assert.equal(termination.details.status, "termination_requested_unconfirmed");
+      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1, "an already accepted setup kill must not be repeated by controls");
+      writeFileSync(stateFile, JSON.stringify({ child: true, renameFails: true, rmFails: false }));
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      assert.equal(__test__.runningSubagents.size, 0);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 2);
+      assert.equal(runtime.messages.length, 0, "a failed launch must not deliver a second completion result");
+    } finally {
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
+
+it("retains an unconfirmed registered launch and reconciles its exact run without relaunching", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ unconfirmed: true, hideChild: true }));
+    const runtime = registeredRuntime(ctx);
+    try {
+      await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /launch .* is unconfirmed/);
+      assert.equal(__test__.runningSubagents.size, 1, "unconfirmed launches remain directly owned");
+      assert.equal(getDirectChildCount(), 1);
+      const running = [...__test__.runningSubagents.values()][0];
+      assert.equal(running.coreHost, undefined);
+      assert.equal(running.coreLaunchPending?.context.endpoint, process.env.HC_TERMINAL_SOCKET);
+      assert.equal(running.coreLaunchPending?.context.coreId, "test-core");
+      assert.equal(running.coreLaunchPending?.context.parent, "t1");
+      const launch = requests.find((request: any) => request.method === "terminal.run");
+      assert.equal(running.coreLaunchPending?.runId, launch.params.labels["pi.subagent.run"]);
+      assert.equal(running.coreLaunchPending?.scriptPath, launch.params.argv[1]);
+      assert.ok(running.coreLaunchPending?.wrapperStartFile.endsWith(".wrapper-start.json"));
+      writeFileSync(stateFile, JSON.stringify({ child: true, unconfirmed: true, hideChild: false }));
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      assert.equal(__test__.runningSubagents.size, 0);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+      assert.deepEqual(requests.filter((request: any) => ["terminal.kill", "terminal.rm"].includes(request.method)).map((request: any) => request.params.terminal), ["t2", "t2"]);
+      assert.equal(runtime.messages.length, 0);
+    } finally {
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
+
+it("preserves ambiguous launch ownership and full correlation in a private shutdown descriptor", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ unconfirmed: true, hideChild: true }));
+    const runtime = registeredRuntime(ctx);
+    const stderr: string[] = [];
+    const originalError = console.error;
+    console.error = message => { stderr.push(String(message)); };
+    try {
+      await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /is unconfirmed/);
+      assert.equal(__test__.runningSubagents.size, 1);
+      const running = [...__test__.runningSubagents.values()][0];
+      const interrupt = await runtime.tools.find(tool => tool.name === "subagent_interrupt").execute("escape", { id: running.id }, undefined, undefined, ctx);
+      assert.equal(interrupt.details.error, "launch-unconfirmed");
+      const terminate = await runtime.tools.find(tool => tool.name === "subagent_terminate").execute("terminate", { id: running.id }, undefined, undefined, ctx);
+      assert.equal(terminate.details.error, "launch-unconfirmed");
+      writeFileSync(stateFile, JSON.stringify({ child: true, ambiguous: true }));
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      assert.equal(__test__.runningSubagents.size, 1);
+      const file = join(running.artifactDir!, "subagent-completion", `${running.runId}.recovery.json`);
+      const record = JSON.parse(readFileSync(file, "utf8"));
+      assert.equal(record.runId, running.runId);
+      assert.equal(record.endpoint, running.coreLaunchPending!.context.endpoint);
+      assert.equal(record.coreId, "test-core");
+      assert.equal(record.parent, "t1");
+      assert.equal(record.script, running.coreLaunchPending!.scriptPath);
+      assert.equal(record.wrapperStartFile, running.coreLaunchPending!.wrapperStartFile);
+      assert.equal(record.session, running.sessionFile);
+      assert.equal(record.address, undefined, "ambiguous addresses must not become owned addresses");
+      assert.equal(record.wrapperPid, undefined, "current/recovery PID must not become original identity");
+      assert.equal(record.stage, "reconcile");
+      assert.ok(statSync(file).size <= 64 * 1024);
+      assert.equal(statSync(file).mode & 0o777, 0o600);
+      assert.equal(stderr.filter(message => message.includes(file)).length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+      assert.equal(requests.some((request: any) => ["terminal.kill", "terminal.rm", "terminal.keys"].includes(request.method)), false);
+      assert.equal(runtime.messages.length, 0);
+    } finally {
+      console.error = originalError;
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
+
+async function waitUntil(check: () => boolean) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (check()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.ok(check(), "bounded fake cleanup observation timed out");
+}
+
+it("cleans a retained setup once when an actual module reload aborts the old runtime", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ renameFails: true, rmFails: true }));
+    const runtime = registeredRuntime(ctx);
+    try {
+      await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /visibility setup failed/);
+      assert.equal(__test__.runningSubagents.size, 1);
+      writeFileSync(stateFile, JSON.stringify({ child: true, rmFails: false }));
+      const replacement = await import("../pi-extension/subagents/index.ts?retained-core-reload");
+      await waitUntil(() => __test__.runningSubagents.size === 0);
+      assert.equal(replacement.__test__.runningSubagents.size, 0);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 2);
+      assert.equal(runtime.messages.length, 0);
+    } finally {
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
+
+it("cleans an unconfirmed in-flight setup that settles after the shutdown snapshot", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ unconfirmed: true, hideChildOnce: true, delayRunReply: true }));
+    const runtime = registeredRuntime(ctx);
+    try {
+      const rejected = assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /is unconfirmed/);
+      await waitUntil(() => requests.some((request: any) => request.method === "terminal.run"));
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      runtime.handlers.get("session_start")({}, ctx);
+      await rejected;
+      await waitUntil(() => requests.some((request: any) => request.method === "terminal.rm") && __test__.runningSubagents.size === 0);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 1);
+      assert.equal(runtime.messages.length, 0);
+    } finally {
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
+
+for (const stage of ["kill", "remove"] as const) {
+  it(`describes pre-registration visibility ${stage} failure with its known original identity`, async () => {
+    await coreFixture(async ({ ctx, stateFile }: any) => {
+      writeFileSync(stateFile, JSON.stringify({ renameFails: true, killFails: stage === "kill", rmFails: stage === "remove" }));
+      const runtime = registeredRuntime(ctx);
+      const stderr: string[] = [];
+      const originalError = console.error;
+      console.error = message => { stderr.push(String(message)); };
+      try {
+        await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /visibility setup failed/);
+        assert.equal(getDirectChildCount(), 1);
+        const running = [...__test__.runningSubagents.values()][0];
+        const recorder = createChildCompletionRecorder({ runId: running.runId, childPid: 789, sessionFile: running.sessionFile, snapshotFile: running.childSnapshotFile! });
+        recorder.record({ kind: "agent-ended" });
+        await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+        const file = join(running.artifactDir!, "subagent-completion", `${running.runId}.recovery.json`);
+        const record = JSON.parse(readFileSync(file, "utf8"));
+        assert.equal(record.address, "t2");
+        assert.equal(record.coreId, "test-core");
+        assert.equal(record.parent, "t1");
+        assert.equal(record.endpoint, running.coreHost!.endpoint);
+        assert.equal(record.wrapperPid, 456);
+        assert.equal(record.childPid, 789);
+        assert.equal(record.script, running.launchScriptFile);
+        assert.equal(record.wrapperStartFile, running.coreHost!.wrapperStartFile);
+        assert.equal(record.stage, stage);
+        assert.equal(__test__.runningSubagents.size, 1);
+        assert.equal(stderr.filter(message => message.includes(file)).length, 1);
+        assert.equal(runtime.messages.length, 0);
+      } finally {
+        console.error = originalError;
+        for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+        await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      }
+    });
+  });
+}
+
+it("retains failed registered resume setup under the resumed session identity", async () => {
+  await coreFixture(async ({ dir, ctx, stateFile, requests }: any) => {
+    const sessionPath = join(dir, "resume-failed.jsonl");
+    writeFileSync(sessionPath, [
+      { type: "session", id: "old-session", cwd: dir },
+      { type: "custom", customType: "pi-interactive-subagents.resume-policy", data: {
+        version: 2, sessionId: "old-session", agent: null, deniedTools: ["bash"], cwd: dir,
+        agentDir: process.env.PI_CODING_AGENT_DIR, systemPrompt: null, requestedSkills: [], activeTools: ["read"], skills: [],
+      } },
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    writeFileSync(stateFile, JSON.stringify({ unconfirmed: true, hideChild: true }));
+    const runtime = registeredRuntime(ctx);
+    try {
+      await assert.rejects(runtime.tools.find(tool => tool.name === "subagent_resume").execute("resume", { sessionPath, name: "Resume failed", message: "Continue once" }, undefined, undefined, ctx), /is unconfirmed/);
+      assert.equal(getDirectChildCount(), 1);
+      const running = [...__test__.runningSubagents.values()][0];
+      assert.equal(running.sessionFile, sessionPath);
+      assert.equal(running.task, "Continue once");
+      writeFileSync(stateFile, JSON.stringify({ child: true, hideChild: false }));
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      assert.equal(__test__.runningSubagents.size, 0);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 1);
+      assert.equal(runtime.messages.length, 0);
+    } finally {
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
+
+it("preserves failed reload cleanup in a recovery descriptor without a completion delivery", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ renameFails: true, rmFails: true }));
+    const runtime = registeredRuntime(ctx);
+    const stderr: string[] = [];
+    const originalError = console.error;
+    console.error = message => { stderr.push(String(message)); };
+    try {
+      await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /visibility setup failed/);
+      const running = [...__test__.runningSubagents.values()][0];
+      const file = join(running.artifactDir!, "subagent-completion", `${running.runId}.recovery.json`);
+      await import("../pi-extension/subagents/index.ts?retained-core-reload-failure");
+      await waitUntil(() => stderr.some(message => message.includes(file)));
+      const record = JSON.parse(readFileSync(file, "utf8"));
+      assert.equal(record.address, "t2");
+      assert.equal(record.coreId, "test-core");
+      assert.equal(record.parent, "t1");
+      assert.equal(record.runId, running.runId);
+      assert.equal(record.stage, "remove");
+      assert.equal(__test__.runningSubagents.size, 1);
+      assert.equal(stderr.filter(message => message.includes(file)).length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 2);
+      assert.equal(runtime.messages.length, 0);
+    } finally {
+      console.error = originalError;
+      for (const id of __test__.runningSubagents.keys()) __test__.releaseRunningSubagent(id);
+      await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+    }
+  });
+});
 
 it("rejects Claude-on-Core before accessing native context", async () => {
   await coreFixture(async ({ dir, ctx, requests }: any) => {

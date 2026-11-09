@@ -99,6 +99,18 @@ async function adoptCoreRun(prepared: PreparedCoreLaunch, host: CoreHostRef): Pr
   }
 }
 
+export class CoreSetupCleanupFailure extends Error {
+  readonly coreHost: CoreHostRef;
+  readonly stage: "kill" | "remove";
+  readonly killAccepted: boolean;
+  constructor(coreHost: CoreHostRef, stage: "kill" | "remove", killAccepted: boolean, cause: unknown) {
+    super(`Core visibility setup failed for ${coreHost.address}; owned ${stage} cleanup unconfirmed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.coreHost = coreHost;
+    this.stage = stage;
+    this.killAccepted = killAccepted;
+  }
+}
+
 export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: {
   runId: string; scriptPath: string; wrapperStartFile: string; command: string; cwd: string; agentDir: string;
 }): Promise<CoreHostRef> {
@@ -115,13 +127,16 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   host.runtime = { ...prepared.runtime };
   try { await adoptCoreRun(prepared, host); }
   catch (error) {
-    let cleanup = "";
-    try { await killCoreTerminal(host); await removeCoreTerminal(host); }
-    catch (failure) { cleanup = `; owned cleanup unconfirmed: ${failure instanceof Error ? failure.message : String(failure)}`; }
+    let killAccepted = false;
+    try {
+      await killCoreTerminal(host);
+      killAccepted = true;
+      await removeCoreTerminal(host);
+    } catch (failure) {
+      throw new CoreSetupCleanupFailure(host, killAccepted ? "remove" : "kill", killAccepted, failure);
+    }
     const reason = error instanceof Error ? error.message : String(error);
-    const failed = new Error(`Core visibility setup failed for ${host.address}: ${reason}${cleanup}`, { cause: error });
-    Object.assign(failed, { coreHost: host, stage: "visibility" });
-    throw failed;
+    throw new Error(`Core visibility setup failed for ${host.address}: ${reason}`, { cause: error });
   }
   return host;
 }

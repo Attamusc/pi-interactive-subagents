@@ -41,8 +41,8 @@ import {
   readScreen,
 } from "./cmux.ts";
 
-import { prepareCoreLaunch, launchPreparedCoreRun } from "./core-launch.ts";
-import { killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, type CoreHostRef } from "./herdr-core.ts";
+import { prepareCoreLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
+import { killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
 
 import {
   getNewEntries,
@@ -668,10 +668,11 @@ interface RunningSubagent {
   agent?: string;
   surface: string;
   coreHost?: CoreHostRef;
+  coreLaunchPending?: CoreLaunchUnconfirmed;
   coreCleanupPromise?: Promise<void>;
   coreCleanupError?: string;
   coreKillAccepted?: boolean;
-  coreCleanupStage?: "kill" | "remove";
+  coreCleanupStage?: "reconcile" | "kill" | "remove";
   artifactDir?: string;
   startTime: number;
   sessionFile: string;
@@ -765,11 +766,89 @@ function releaseRunningSubagent(id: string): boolean {
   return true;
 }
 
-async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: string) => Promise<void> = closeSurface): Promise<void> {
-  if (!running.coreHost) return classic(running.surface);
-  if (!running.coreCleanupPromise) {
+async function launchOwnedCoreRun(
+  prepared: Parameters<typeof launchPreparedCoreRun>[0],
+  spec: Parameters<typeof launchPreparedCoreRun>[1],
+  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren"> & { artifactDir: string },
+): Promise<CoreHostRef> {
+  const ownerSignal = getModuleAbortSignal();
+  try { return await launchPreparedCoreRun(prepared, spec); }
+  catch (error) {
+    if (error instanceof CoreSetupCleanupFailure || error instanceof CoreLaunchUnconfirmed) {
+      const host = error instanceof CoreSetupCleanupFailure ? error.coreHost : undefined;
+      const paths = buildVisibleCompletionPaths(metadata.artifactDir, spec.runId);
+      const running: RunningSubagent = {
+        ...metadata, id: spec.runId, runId: spec.runId, surface: host?.address ?? "",
+        coreHost: host, coreLaunchPending: error instanceof CoreLaunchUnconfirmed ? error : undefined,
+        coreCleanupStage: error instanceof CoreSetupCleanupFailure ? error.stage : "reconcile",
+        coreKillAccepted: error instanceof CoreSetupCleanupFailure && error.killAccepted,
+        terminationRequestState: error instanceof CoreSetupCleanupFailure && error.killAccepted ? "accepted" : undefined,
+        coreCleanupError: error.message, launchScriptFile: spec.scriptPath,
+        childSnapshotFile: paths.childSnapshot, wrapperExitFile: paths.wrapperExit,
+        completionState: createVisibleCompletionState(spec.runId), transcriptStartLine: 0,
+        interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: metadata.startTime }),
+      };
+      runningSubagents.set(running.id, running);
+      notifyOwnershipChanged();
+      const moduleSignal = ownerSignal;
+      const cleanupAfterAbort = () => {
+        void closeOwnedSubagent(running).then(
+          () => { releaseRunningSubagent(running.id); },
+          failure => { console.error(recordCoreCleanupFailure(running, failure)); },
+        );
+      };
+      if (moduleSignal.aborted) {
+        // An in-flight launch can settle after shutdown already took its ownership snapshot.
+        cleanupAfterAbort();
+      } else {
+        moduleSignal.addEventListener("abort", () => {
+          // Ordinary shutdown owns its snapshot; reload has no active watcher for a failed setup.
+          if (!String(moduleSignal.reason).startsWith("session_shutdown:")) cleanupAfterAbort();
+        }, { once: true });
+      }
+    }
+    throw error;
+  }
+}
+
+function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  let recovery = "";
+  if ((running.coreHost || running.coreLaunchPending) && running.artifactDir) {
     const host = running.coreHost;
+    const pending = running.coreLaunchPending;
+    const owner = host ?? pending!.context;
+    const script = host?.scriptPath ?? pending!.scriptPath;
+    const wrapperStartFile = host?.wrapperStartFile ?? pending!.wrapperStartFile;
+    const file = join(running.artifactDir, "subagent-completion", `${running.runId}.recovery.json`);
+    try {
+      if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
+        observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
+      }
+      const startup = host ? readWrapperStartRecord(wrapperStartFile, running.runId, host.address) : undefined;
+      writeCoreRecoveryDescriptor(file, {
+        runId: running.runId, endpoint: owner.endpoint, coreId: owner.coreId, parent: owner.parent, address: host?.address,
+        wrapperPid: host?.wrapperPid ?? (startup?.ok ? startup.value.wrapperPid : undefined),
+        childPid: running.completionState?.childPid, script, wrapperStartFile, session: running.sessionFile,
+        stage: running.coreCleanupStage ?? (host ? "kill" : "reconcile"), error: message,
+      });
+      recovery = `; recovery descriptor: ${file}`;
+    } catch (failure) { recovery = `; recovery descriptor failed: ${failure instanceof Error ? failure.message : String(failure)}`; }
+  }
+  return `${running.name} [${running.id}]: ${message}${recovery}`;
+}
+
+async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: string) => Promise<void> = closeSurface): Promise<void> {
+  if (!running.coreHost && !running.coreLaunchPending) return classic(running.surface);
+  if (!running.coreCleanupPromise) {
     running.coreCleanupPromise = (async () => {
+      if (!running.coreHost && running.coreLaunchPending) {
+        running.coreCleanupStage = "reconcile";
+        running.coreHost = await reconcileCoreRun(running.coreLaunchPending);
+        if (!running.coreHost) { running.coreCleanupError = undefined; return; }
+        running.surface = running.coreHost.address;
+      }
+      const host = running.coreHost!;
       if (running.terminationRequestState !== "accepted" && !running.coreKillAccepted) {
         running.coreCleanupStage = "kill";
         await killCoreTerminal(host);
@@ -794,31 +873,15 @@ async function shutdownOwnedSubagents(
   const owned = [...runningSubagents.values()];
   for (const running of owned) {
     running.abortController?.abort(`session_shutdown:${reason}`);
-    if (!running.coreHost) releaseRunningSubagent(running.id);
+    if (!running.coreHost && !running.coreLaunchPending) releaseRunningSubagent(running.id);
   }
   const failures: string[] = [];
   await Promise.all(owned.map(async (running) => {
     try {
       await closeOwnedSubagent(running, close);
-      if (running.coreHost) releaseRunningSubagent(running.id);
+      if (running.coreHost || running.coreLaunchPending) releaseRunningSubagent(running.id);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      let recovery = "";
-      if (running.coreHost && running.artifactDir) {
-        const host = running.coreHost;
-        const file = join(running.artifactDir, "subagent-completion", `${running.runId}.recovery.json`);
-        try {
-          const startup = readWrapperStartRecord(host.wrapperStartFile, host.runId, host.address);
-          writeCoreRecoveryDescriptor(file, {
-            runId: host.runId, endpoint: host.endpoint, address: host.address,
-            wrapperPid: host.wrapperPid ?? (startup.ok ? startup.value.wrapperPid : undefined),
-            childPid: running.completionState?.childPid, script: host.scriptPath, session: running.sessionFile,
-            stage: running.coreCleanupStage ?? "kill", error: message,
-          });
-          recovery = `; recovery descriptor: ${file}`;
-        } catch (failure) { recovery = `; recovery descriptor failed: ${failure instanceof Error ? failure.message : String(failure)}`; }
-      }
-      failures.push(`${running.name} [${running.id}]: ${message}${recovery}`);
+      failures.push(recordCoreCleanupFailure(running, error));
     }
   }));
   return failures;
@@ -1202,6 +1265,9 @@ function handleSubagentInterrupt(
   }
 
   const running = resolved.running;
+  if (running.coreLaunchPending && !running.coreHost) {
+    return { content: [{ type: "text" as const, text: "Core launch is unconfirmed; its captured run must be reconciled during owned cleanup before controls can target a terminal." }], details: { error: "launch-unconfirmed", id: running.id } };
+  }
   if (running.cli === "claude") {
     return {
       content: [{
@@ -1270,6 +1336,9 @@ async function handleSubagentTerminate(
   }
 
   const running = resolved.running;
+  if (running.coreLaunchPending && !running.coreHost) {
+    return { content: [{ type: "text" as const, text: "Core launch is unconfirmed; its captured run must be reconciled during owned cleanup before controls can target a terminal." }], details: { error: "launch-unconfirmed", id: running.id } };
+  }
   const claudeGone = () => {
     if (running.cli !== "claude") return false;
     if (running.wrapperExitFile && readWrapperExitRecord(running.wrapperExitFile, running.runId).ok) return true;
@@ -1811,9 +1880,12 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   if (coreLaunch) {
-    coreHost = await launchPreparedCoreRun(coreLaunch, {
+    coreHost = await launchOwnedCoreRun(coreLaunch, {
       runId: id, scriptPath: launchScriptFile, wrapperStartFile, command,
       cwd: targetCwdForSession, agentDir: effectiveAgentDir,
+    }, {
+      name: params.name, task: params.task, agent: params.agent, sessionFile: subagentSessionFile, artifactDir, startTime,
+      canSpawnDirectChildren: canSpawnDirectChildren(toolAllowlist ? toolAllowlist.split(",") : null, denySet),
     });
     surface = coreHost.address;
   } else await sendLongCommand(surface, command, {
@@ -2681,9 +2753,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
           );
           if (coreLaunch) {
-            coreHost = await launchPreparedCoreRun(coreLaunch, {
+            coreHost = await launchOwnedCoreRun(coreLaunch, {
               runId: id, scriptPath: launchScriptFile, wrapperStartFile, command,
               cwd: resumePolicy.cwd, agentDir: resumePolicy.agentDir,
+            }, {
+              name, task: params.message ?? "resumed session", agent: resumePolicy.agent ?? undefined,
+              sessionFile: params.sessionPath, artifactDir, startTime, canSpawnDirectChildren: resumePolicyCanSpawn(resumePolicy),
             });
             surface = coreHost.address;
           } else await sendLongCommand(surface, command, {
