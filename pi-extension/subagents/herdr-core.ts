@@ -127,6 +127,7 @@ export interface CoreHostRef {
   scriptPath: string;
   wrapperStartFile: string;
   wrapperPid?: number;
+  runtime?: { node: string; script: string; version: string };
 }
 
 export interface CoreRunSpec {

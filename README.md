@@ -48,7 +48,7 @@ zellij --session pi   # then run: pi
 # just run pi inside WezTerm — no wrapper needed
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a classic backend. The experimental Core source candidate also accepts `herdr-core` (see below).
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -188,6 +188,16 @@ Optional string overrides are trimmed. Blank or whitespace-only `model`, `skills
 ### Herdr task labels
 
 Herdr peers publish guarded presentation metadata such as `Pi | Scout: Auth` or `Claude | Review`. Titles and labels are control-stripped and capped at 80 Unicode codepoints; narrow sidebar rows can still clip them. This does not change canonical harness identity, status, session identity, focus, or attention handling. A metadata failure stops launch; a newly created pane is closed, and a failed close names the retained pane.
+
+### Experimental Herdr Core source candidate
+
+`PI_SUBAGENT_MUX=herdr-core` selects Core explicitly and never falls back to another backend. Without an override, classic detection keeps its existing order (Herdr, cmux, tmux, zellij, WezTerm); Core is considered only when none is selected. This candidate requires the reviewed local `pi-agent-execution` Core profile, a Node-hosted Pi CLI, a live inherited Core terminal, and a local parent space/tab mapping in `herdr-app`. It does not install or start Core or the app. Claude-on-Core is unsupported.
+
+Launch and resume prepare one artifact-backed Bash wrapper before `terminal.run`. The wrapper invokes the canonical parent Pi package entrypoint with the parent's absolute Node executable, preserves PATH and the selected profile, and derives its surface from its own Core identity. Pi-only identity and immutable launch/resume policy are assigned inline rather than inherited by Core recovery shells. Private startup and exit records distinguish the original wrapper from a later recovery shell; a recovery shell never means the original Pi continued or succeeded.
+
+The app adopts the labeled child into a new tab; the extension observes the exact child address, renames only that returned tab, and confirms its title. It does not create app tabs/splits or select/focus them. Fake-socket/stub-app tests cover this protocol; actual adoption and focus preservation still require an independently approved native fixture.
+
+Escape uses the captured Core owner. Hard termination requests Core terminal kill; removal is a separate cleanup step after completion evidence. Unknown exit is not success, and a still-running original wrapper prevents Pi-disappearance fallback. Ordinary shutdown attempts owned cleanup; failed registered-run cleanup retains ownership and writes a private, bounded recovery descriptor under the run's artifact directory, with its path in the shutdown error. Fatal parent/owner loss is best-effort native policy, not a cleanup guarantee. This source candidate is not a product pin or promotion.
 
 ### Native Claude review progress
 

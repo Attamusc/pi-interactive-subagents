@@ -11,8 +11,11 @@ import { findLastAssistantMessage, getNewEntries } from "./session.ts";
 import {
   readChildCompletionSnapshot,
   readWrapperExitRecord,
+  readWrapperStartRecord,
   type CompletionPayload,
 } from "./completion.ts";
+
+import { getCoreTerminal, CoreRpcError, type CoreHostRef } from "./herdr-core.ts";
 
 export interface VisibleCompletionState {
   core: AgentRunState;
@@ -78,7 +81,7 @@ export function observeVisibleCompletion(params: {
 
 export type VisibleControlEvidence =
   | { kind: "interrupt-requested"; mode: "process-abort" | "turn-escape" }
-  | { kind: "terminate-requested"; mode: "process-signal" | "herdr-pane-close" }
+  | { kind: "terminate-requested"; mode: "process-signal" | "herdr-pane-close" | "core-terminal-kill" }
   | { kind: "process-exited"; exit: { kind: "native"; code: number | null; signal: string | null } | { kind: "shell"; shellStatus: number } | { kind: "process-not-found" } };
 
 export function recordVisibleControl(state: VisibleCompletionState, evidence: VisibleControlEvidence): void {
@@ -102,6 +105,7 @@ export async function waitForVisibleCompletion(params: {
   state: VisibleCompletionState; childSnapshotFile: string; wrapperExitFile: string; sessionFile: string;
   transcriptStartLine: number; sessionRef?: string; signal: AbortSignal; interval?: number; onTick?: () => void;
   processProbe?: (pid: number, signal: 0) => void;
+  coreHost?: CoreHostRef;
 }) {
   for (;;) {
     if (params.signal.aborted) throw new Error(`Aborted while waiting for subagent to finish: ${String(params.signal.reason ?? "no abort reason provided")}`);
@@ -111,7 +115,33 @@ export async function waitForVisibleCompletion(params: {
       diagnostic(params.state, "completion observer", { reason: "invalid", error: error instanceof Error ? error.message : String(error) });
       status = projectAgentRunStatus(params.state.core);
     }
-    if (params.state.core.control.status === "terminate-requested") {
+    if (params.coreHost && !status.terminal) {
+      const host = params.coreHost;
+      let gone = false;
+      let wrapperAlive = false;
+      const startup = readWrapperStartRecord(host.wrapperStartFile, host.runId, host.address);
+      if (startup.ok && (host.wrapperPid === undefined || host.wrapperPid === startup.value.wrapperPid)) {
+        try { (params.processProbe ?? process.kill)(startup.value.wrapperPid, 0); wrapperAlive = true; }
+        catch (error) { gone = (error as NodeJS.ErrnoException).code === "ESRCH"; }
+      } else if (startup.ok) {
+        diagnostic(params.state, "wrapper start", { reason: "wrong-id", error: "native initial PID does not match wrapper" });
+      } else diagnostic(params.state, "wrapper start", startup);
+      if (!gone && !wrapperAlive) {
+        try { gone = (await getCoreTerminal(host)).state === "finished"; }
+        catch (error) {
+          if (error instanceof CoreRpcError && error.method === "terminal.get" && error.kind === "not_found") gone = true;
+          else diagnostic(params.state, "Core observer", { reason: "invalid", error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (gone) {
+        // A final sidecar may have appeared while the exit probe was in flight.
+        status = observeVisibleCompletion(params);
+        if (!status.terminal && params.state.core.process.status !== "exited") {
+          recordVisibleControl(params.state, { kind: "process-exited", exit: { kind: "process-not-found" } });
+          status = projectAgentRunStatus(params.state.core);
+        }
+      }
+    } else if (!params.coreHost && params.state.core.control.status === "terminate-requested") {
       confirmOwnedProcessGone(params.state, params.processProbe);
       status = projectAgentRunStatus(params.state.core);
     }

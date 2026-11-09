@@ -5,6 +5,7 @@ import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
   visibleHerdrCapabilities,
+  visibleHerdrCoreCapabilities,
   type AgentRunCompletion,
   type AgentLaunchIntent,
   type NormalizedAgentDefinition,
@@ -40,6 +41,9 @@ import {
   readScreen,
 } from "./cmux.ts";
 
+import { prepareCoreLaunch, launchPreparedCoreRun } from "./core-launch.ts";
+import { killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, type CoreHostRef } from "./herdr-core.ts";
+
 import {
   getNewEntries,
   seedSubagentSessionFile,
@@ -64,7 +68,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, readWrapperExitRecord } from "./completion.ts";
+import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, readWrapperExitRecord, readWrapperStartRecord, writeCoreRecoveryDescriptor } from "./completion.ts";
 import { confirmClaudeProcessGone, readClaudeFailureResult, readClaudePrintResult, validateClaudeReviewLaunch } from "./claude-transport.ts";
 import {
   confirmOwnedProcessGone,
@@ -663,6 +667,12 @@ interface RunningSubagent {
   task: string;
   agent?: string;
   surface: string;
+  coreHost?: CoreHostRef;
+  coreCleanupPromise?: Promise<void>;
+  coreCleanupError?: string;
+  coreKillAccepted?: boolean;
+  coreCleanupStage?: "kill" | "remove";
+  artifactDir?: string;
   startTime: number;
   sessionFile: string;
   /** Exact Pi transcript identity; unlike a host pane reference, this is resumable. */
@@ -755,6 +765,28 @@ function releaseRunningSubagent(id: string): boolean {
   return true;
 }
 
+async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: string) => Promise<void> = closeSurface): Promise<void> {
+  if (!running.coreHost) return classic(running.surface);
+  if (!running.coreCleanupPromise) {
+    const host = running.coreHost;
+    running.coreCleanupPromise = (async () => {
+      if (running.terminationRequestState !== "accepted" && !running.coreKillAccepted) {
+        running.coreCleanupStage = "kill";
+        await killCoreTerminal(host);
+        running.coreKillAccepted = true;
+      }
+      running.coreCleanupStage = "remove";
+      await removeCoreTerminal(host);
+      running.coreCleanupError = undefined;
+    })().catch(error => {
+      running.coreCleanupPromise = undefined;
+      running.coreCleanupError = error instanceof Error ? error.message : String(error);
+      throw error;
+    });
+  }
+  return running.coreCleanupPromise;
+}
+
 async function shutdownOwnedSubagents(
   reason: string,
   close: (surface: string) => Promise<void> = closeSurface,
@@ -762,14 +794,31 @@ async function shutdownOwnedSubagents(
   const owned = [...runningSubagents.values()];
   for (const running of owned) {
     running.abortController?.abort(`session_shutdown:${reason}`);
-    releaseRunningSubagent(running.id);
+    if (!running.coreHost) releaseRunningSubagent(running.id);
   }
   const failures: string[] = [];
   await Promise.all(owned.map(async (running) => {
     try {
-      await close(running.surface);
+      await closeOwnedSubagent(running, close);
+      if (running.coreHost) releaseRunningSubagent(running.id);
     } catch (error) {
-      failures.push(`${running.name} [${running.id}]: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      let recovery = "";
+      if (running.coreHost && running.artifactDir) {
+        const host = running.coreHost;
+        const file = join(running.artifactDir, "subagent-completion", `${running.runId}.recovery.json`);
+        try {
+          const startup = readWrapperStartRecord(host.wrapperStartFile, host.runId, host.address);
+          writeCoreRecoveryDescriptor(file, {
+            runId: host.runId, endpoint: host.endpoint, address: host.address,
+            wrapperPid: host.wrapperPid ?? (startup.ok ? startup.value.wrapperPid : undefined),
+            childPid: running.completionState?.childPid, script: host.scriptPath, session: running.sessionFile,
+            stage: running.coreCleanupStage ?? "kill", error: message,
+          });
+          recovery = `; recovery descriptor: ${file}`;
+        } catch (failure) { recovery = `; recovery descriptor failed: ${failure instanceof Error ? failure.message : String(failure)}`; }
+      }
+      failures.push(`${running.name} [${running.id}]: ${message}${recovery}`);
     }
   }));
   return failures;
@@ -1138,10 +1187,12 @@ function requestSubagentInterrupt(
   }
 }
 
+type InterruptResult = { content: { type: "text"; text: string }[]; details: Record<string, unknown> };
+
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   sendEscapeKey: (surface: string) => void = sendEscape,
-) {
+): InterruptResult | Promise<InterruptResult> {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
     return {
@@ -1162,6 +1213,12 @@ function handleSubagentInterrupt(
     };
   }
 
+  if (running.coreHost && sendEscapeKey === sendEscape) {
+    return sendCoreEscape(running.coreHost).then(
+      () => handleSubagentInterrupt(params, () => {}),
+      error => ({ content: [{ type: "text" as const, text: `Core Escape failed: ${error.message}` }], details: { error: error.message } }),
+    );
+  }
   const now = Date.now();
   observeRunningSubagent(running, now);
 
@@ -1244,7 +1301,7 @@ async function handleSubagentTerminate(
     observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
   }
   try {
-    running.terminationOutput = read(running.surface, 200)
+    running.terminationOutput = (running.coreHost ? (await readCoreScreen(running.coreHost, 200)).text : read(running.surface, 200))
       .replace(/__SUBAGENT_DONE_\d+__/, "")
       .trim();
   } catch {}
@@ -1268,10 +1325,11 @@ async function handleSubagentTerminate(
   running.terminationRequestState = "pending";
   running.terminationRequestedAt = Date.now();
   if (running.cli !== "claude" && running.completionState) {
-    recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: "herdr-pane-close" });
+    recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: running.coreHost ? "core-terminal-kill" : "herdr-pane-close" });
   }
   try {
-    await close(running.surface);
+    if (running.coreHost) await killCoreTerminal(running.coreHost);
+    else await close(running.surface);
   } catch (error: any) {
     running.terminationRequestState = undefined;
     const message =
@@ -1290,7 +1348,7 @@ async function handleSubagentTerminate(
 
   running.terminationRequestState = "accepted";
   if (running.cli === "claude") running.abortController?.abort("terminated_by_parent");
-  else if (running.completionState) confirmOwnedProcessGone(running.completionState);
+  else if (running.completionState && !running.coreHost) confirmOwnedProcessGone(running.completionState);
   updateWidget();
 
   let confirmed: boolean;
@@ -1450,6 +1508,7 @@ export const __test__ = {
   resolveVisibleIdentityRouting,
   parseVisibleAgentDefinition,
   visibleHerdrCapabilities,
+  visibleHerdrCoreCapabilities,
   buildSubagentToolAllowlist,
   buildPiModelArgs,
   buildClaudeCommand,
@@ -1504,6 +1563,7 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const coreSelected = getMuxBackend() === "herdr-core";
   if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
   else if (params.resumeSessionId) throw new Error("resumeSessionId requires a Claude review agent");
   const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
@@ -1514,6 +1574,9 @@ async function launchSubagent(
   if (claudeSystemPrompt && Buffer.byteLength(claudeSystemPrompt, "utf8") > 60 * 1024) {
     throw new Error("Claude review system prompt exceeds 60 KiB");
   }
+  if (coreSelected && agentDefs?.cli === "claude") throw new Error("Claude-on-Core is unsupported; select a classic backend");
+  if (coreSelected && options?.surface) throw new Error("Core launches cannot reuse a classic surface");
+  const coreLaunch = coreSelected ? await prepareCoreLaunch(params.name) : undefined;
   const effectiveModel = launchIntent.effective.model;
   const effectiveTools = launchIntent.effective.tools?.join(",");
   const effectiveThinking = launchIntent.effective.thinking;
@@ -1544,9 +1607,10 @@ async function launchSubagent(
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
   const harness = agentDefs?.cli === "claude" ? "Claude" : "Pi";
-  const surface = options?.surface ?? (await createTaskSurface(params.name, harness));
+  let surface = coreLaunch ? "" : options?.surface ?? (await createTaskSurface(params.name, harness));
+  let coreHost: CoreHostRef | undefined;
   if (surfacePreCreated) await setTaskLabel(surface, harness, params.name);
-  if (!surfacePreCreated) {
+  if (!surfacePreCreated && !coreLaunch) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
@@ -1652,7 +1716,8 @@ async function launchSubagent(
   // ── Pi CLI path ──
 
   // Build pi command
-  const parts: string[] = ["pi"];
+  const parts: string[] = coreLaunch
+    ? [shellEscape(coreLaunch.runtime.node), shellEscape(coreLaunch.runtime.script)] : ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1699,7 +1764,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  envParts.push(coreLaunch ? 'PI_SUBAGENT_SURFACE="$HC_TERMINAL_ID"' : `PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass exactly one task prompt; the child bootstraps skills from launch policy.
@@ -1731,10 +1796,12 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.wrapper-start.json`);
   const command = buildVisibleWrapperCommand({
     piCommand,
     runId: id,
     wrapperExitFile: completionPaths.wrapperExit,
+    ...(coreLaunch ? { wrapperStartFile, nodeExecutable: coreLaunch.runtime.node } : {}),
   });
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1743,7 +1810,13 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  await sendLongCommand(surface, command, {
+  if (coreLaunch) {
+    coreHost = await launchPreparedCoreRun(coreLaunch, {
+      runId: id, scriptPath: launchScriptFile, wrapperStartFile, command,
+      cwd: targetCwdForSession, agentDir: effectiveAgentDir,
+    });
+    surface = coreHost.address;
+  } else await sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -1763,6 +1836,8 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     piSessionRef: subagentSessionFile,
+    coreHost,
+    artifactDir,
     transcriptStartLine,
     completionState: createVisibleCompletionState(id),
     childSnapshotFile: completionPaths.childSnapshot,
@@ -1823,6 +1898,7 @@ async function watchSubagent(
           interval: dependencies.visibleInterval ?? 1000,
           onTick() { observeRunningSubagent(running); },
           processProbe: dependencies.processProbe,
+          coreHost: running.coreHost,
         });
 
     terminalObserved = true;
@@ -1870,7 +1946,7 @@ async function watchSubagent(
       : completion.output || (completion.errorMessage
         ? `Subagent error: ${completion.errorMessage}`
         : exitCode !== 0 ? "Sub-agent exited abnormally" : "Sub-agent exited without new output");
-    if (!running.terminationRequestState) await close(surface);
+    if (running.coreHost || !running.terminationRequestState) await closeOwnedSubagent(running, close);
 
     return {
       name, task, summary, sessionFile, exitCode, elapsed,
@@ -1881,7 +1957,7 @@ async function watchSubagent(
   } catch (err: any) {
     let terminalOutput: string | undefined;
     try {
-      terminalOutput = running.terminationOutput ?? read(surface, 200)
+      terminalOutput = running.terminationOutput ?? (running.coreHost ? (await readCoreScreen(running.coreHost, 200)).text : read(surface, 200))
         .replace(/__SUBAGENT_DONE_\d+__/, "")
         .trim();
     } catch {}
@@ -1890,9 +1966,9 @@ async function watchSubagent(
     const moduleAborted = moduleSignal.aborted;
     let paneCloseError: string | undefined;
     // A lost Claude watcher cannot supervise a running CLI; close its pane, then confirm exit separately.
-    if ((running.cli === "claude" || watcherAborted || moduleAborted || err instanceof ClaudeExitTimeoutError) && running.terminationRequestState !== "accepted") {
+    if ((running.cli === "claude" || watcherAborted || moduleAborted || err instanceof ClaudeExitTimeoutError) && (running.coreHost || running.terminationRequestState !== "accepted")) {
       try {
-        await close(surface);
+        await closeOwnedSubagent(running, close);
         if (running.cli === "claude") {
           running.terminationRequestState = "accepted";
           running.terminationRequestedAt = Date.now();
@@ -1978,7 +2054,7 @@ async function watchSubagent(
       },
     };
   } finally {
-    if (terminalObserved || (running.cli !== "claude" && (signal.aborted || moduleSignal.aborted))) {
+    if (!running.coreCleanupError && (terminalObserved || (running.cli !== "claude" && (signal.aborted || moduleSignal.aborted)))) {
       releaseRunningSubagent(running.id);
     }
   }
@@ -2108,10 +2184,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startWidgetRefresh();
           startStatusRefresh(pi);
         } catch (error) {
-          releaseRunningSubagent(running.id);
+          if (!running.coreHost) releaseRunningSubagent(running.id);
           watcherAbort.abort("launch_setup_failed");
           try {
-            await closeSurface(running.surface);
+            await closeOwnedSubagent(running);
+            if (running.coreHost) releaseRunningSubagent(running.id);
           } catch {}
           throw error;
         }
@@ -2515,6 +2592,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const coreLaunch = getMuxBackend() === "herdr-core" ? await prepareCoreLaunch(name) : undefined;
+
         // Record the raw nonempty-line offset before resuming so extraction only
         // sees transcript entries appended by this run.
         const transcriptStartLine = countNonemptyLines(params.sessionPath);
@@ -2526,7 +2605,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build pi resume command from the immutable authority captured by the
         // original child process. Display name and auto-exit are run-local only.
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const parts = [...(coreLaunch ? [shellEscape(coreLaunch.runtime.node), shellEscape(coreLaunch.runtime.script)] : ["pi"]), "--session", shellEscape(params.sessionPath)];
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
         parts.push("--tools", shellEscape(resumePolicy.activeTools.join(",")));
@@ -2573,19 +2652,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`${RESUME_POLICY_ENV}=''`);
         resumeEnvParts.push(`${RESUME_POLICY_RESTORE_ENV}=1`);
         resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`);
+        if (coreLaunch) resumeEnvParts.push('PI_SUBAGENT_SURFACE="$HC_TERMINAL_ID"');
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const finishOwnedLaunch = beginOwnedLaunch();
         let surface: string;
         let launchScriptFile: string;
+        let coreHost: CoreHostRef | undefined;
+        const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.wrapper-start.json`);
         try {
-          surface = await createTaskSurface(name, "Pi");
-          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+          surface = coreLaunch ? "" : await createTaskSurface(name, "Pi");
+          if (!coreLaunch) await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
           const command = buildVisibleWrapperCommand({
             piCommand: `cd ${shellEscape(resumePolicy.cwd)} && ${resumeEnvPrefix}${parts.join(" ")}`,
             runId: id,
             wrapperExitFile: completionPaths.wrapperExit,
+            ...(coreLaunch ? { wrapperStartFile, nodeExecutable: coreLaunch.runtime.node } : {}),
           });
           launchScriptFile = join(
             artifactDir,
@@ -2597,7 +2680,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/-+/g, "-")
               .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
           );
-          await sendLongCommand(surface, command, {
+          if (coreLaunch) {
+            coreHost = await launchPreparedCoreRun(coreLaunch, {
+              runId: id, scriptPath: launchScriptFile, wrapperStartFile, command,
+              cwd: resumePolicy.cwd, agentDir: resumePolicy.agentDir,
+            });
+            surface = coreHost.address;
+          } else await sendLongCommand(surface, command, {
             scriptPath: launchScriptFile,
             scriptPreamble: [
               `# Subagent resume script for ${name}`,
@@ -2626,6 +2715,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startTime,
           sessionFile: params.sessionPath,
           piSessionRef: params.sessionPath,
+          coreHost,
+          artifactDir,
           transcriptStartLine,
           completionState: createVisibleCompletionState(id),
           childSnapshotFile: completionPaths.childSnapshot,
@@ -2650,10 +2741,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startWidgetRefresh();
           startStatusRefresh(pi);
         } catch (error) {
-          releaseRunningSubagent(running.id);
+          if (!running.coreHost) releaseRunningSubagent(running.id);
           watcherAbort.abort("launch_setup_failed");
           try {
-            await closeSurface(running.surface);
+            await closeOwnedSubagent(running);
+            if (running.coreHost) releaseRunningSubagent(running.id);
           } catch {}
           throw error;
         }

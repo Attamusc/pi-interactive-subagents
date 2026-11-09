@@ -8,7 +8,7 @@ import { readWrapperExitRecord } from "./completion.ts";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "herdr" | "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "herdr-core" | "herdr" | "cmux" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -45,7 +45,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "herdr" || pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "herdr-core" || pref === "herdr" || pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
   return null;
 }
 
@@ -89,8 +89,13 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+function isCoreRuntimeAvailable(): boolean {
+  return !!process.env.HC_TERMINAL_SOCKET && /^t[0-9a-z]+$/.test(process.env.HC_TERMINAL_ID ?? "");
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
+  if (pref === "herdr-core") return isCoreRuntimeAvailable() ? "herdr-core" : null;
   if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
@@ -102,6 +107,7 @@ export function getMuxBackend(): MuxBackend | null {
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isCoreRuntimeAvailable()) return "herdr-core";
   return null;
 }
 
@@ -111,6 +117,7 @@ export function isMuxAvailable(): boolean {
 
 export function muxSetupHint(): string {
   const pref = muxPreference();
+  if (pref === "herdr-core") return "Start Node-hosted Pi inside a local Herdr Core terminal adopted by herdr-app.";
   if (pref === "herdr") {
     return "Start pi inside herdr (launch herdr, then run `pi`).";
   }
@@ -131,6 +138,7 @@ export function muxSetupHint(): string {
 
 function requireMuxBackend(): MuxBackend {
   const backend = getMuxBackend();
+  if (backend === "herdr-core") throw new Error("Herdr Core operations require a captured CoreHostRef; classic mux dispatch is unsupported");
   if (!backend) {
     throw new Error(`No supported terminal multiplexer found. ${muxSetupHint()}`);
   }
@@ -921,7 +929,9 @@ export function extractHerdrReadText(result: unknown): string {
 }
 
 export async function setTaskLabel(surface: string, harness: "Pi" | "Claude", task: string): Promise<void> {
-  if (getMuxBackend() !== "herdr") return;
+  const backend = getMuxBackend();
+  if (backend === "herdr-core") throw new Error("Core task labels require the captured app adoption context");
+  if (backend !== "herdr") return;
   const title = Array.from(stripVTControlCharacters(task)
     .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
     .replace(/\s+/g, " ").trim()).slice(0, 80).join("");
@@ -947,6 +957,7 @@ export async function createTaskSurface(name: string, harness: "Pi" | "Claude"):
 
 export async function createSurface(name: string): Promise<string> {
   const backend = getMuxBackend();
+  if (backend === "herdr-core") throw new Error("Core launch requires a prepared wrapper and captured Core context");
 
   if (backend === "herdr") {
     const parentPaneId = process.env.HERDR_PANE_ID;

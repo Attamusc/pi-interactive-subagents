@@ -162,6 +162,14 @@ export function readWrapperStartRecord(file: string, expectedRunId: string, expe
   return { ok: true, value: value as unknown as WrapperStartRecord };
 }
 
+export function writeCoreRecoveryDescriptor(file: string, record: {
+  runId: string; endpoint: string; address: string; wrapperPid?: number; childPid?: number;
+  script: string; session: string; stage: string; error: string;
+}): void {
+  requireRunId(record.runId);
+  atomicWrite(file, { ...record, error: record.error.slice(0, MAX_STRING) }, 1);
+}
+
 function shellEscape(value: string): string { return "'" + value.replace(/'/g, "'\\''") + "'"; }
 /** Runs the supplied Pi shell command in the foreground and records only after it returns. */
 export function buildVisibleWrapperCommand(params: { piCommand: string; runId: string; wrapperExitFile: string; terminalSentinel?: string; wrapperStartFile?: string; nodeExecutable?: string }): string {
