@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify, stripVTControlCharacters } from "node:util";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join, resolve, extname } from "node:path";
+import { homedir } from "node:os";
 import { resolveCoreContext, startCoreRun, killCoreTerminal, removeCoreTerminal, type CoreContext, type CoreHostRef } from "./herdr-core.ts";
 
 const exec = promisify(execFile);
@@ -29,7 +30,7 @@ export function resolveParentPiRuntime() {
   throw unsupported();
 }
 
-interface AppContext { env: NodeJS.ProcessEnv; space: string; parentTab: string; existingTabs: Set<string> }
+interface AppContext { home: string; env: NodeJS.ProcessEnv; space: string; parentTab: string; existingTabs: Set<string> }
 export interface PreparedCoreLaunch { context: CoreContext; runtime: ReturnType<typeof resolveParentPiRuntime>; app: AppContext; title: string }
 
 async function appCall(env: NodeJS.ProcessEnv, args: string[], timeout = 5000): Promise<any> {
@@ -65,6 +66,10 @@ export async function prepareCoreLaunch(name: string): Promise<PreparedCoreLaunc
   const parentTab = context.parentTerminal.labels["herdr.tab"];
   if (!spaceId || !parentTab) throw new Error("Core parent must be adopted by herdr-app with space/tab labels");
   const env = { ...process.env };
+  // Match herdr-app app_dir(): nonempty override, XDG config root, then ~/.config.
+  const configHome = env.XDG_CONFIG_HOME || join(env.HOME ?? homedir(), ".config");
+  const home = resolve(env.HERDR_APP_HOME || join(configHome, "herdr-app"));
+  env.HERDR_APP_HOME = home;
   const listing = await appCall(env, ["ls"]);
   const status = await appCall(env, ["status"]);
   if (typeof status.space !== "string" || typeof status.tab !== "string") throw new Error("Invalid herdr-app status");
@@ -73,7 +78,7 @@ export async function prepareCoreLaunch(name: string): Promise<PreparedCoreLaunc
   if (matches.length !== 1 || matches[0].tab.id !== parentTab || typeof matches[0].terminal.pane !== "string") {
     throw new Error("Herdr app parent address does not match its labeled tab");
   }
-  return { context, runtime, title, app: { env, space: spaceId, parentTab, existingTabs: new Set(space.tabs.map((tab: any) => tab.id)) } };
+  return { context, runtime, title, app: { home, env, space: spaceId, parentTab, existingTabs: new Set(space.tabs.map((tab: any) => tab.id)) } };
 }
 
 async function adoptCoreRun(prepared: PreparedCoreLaunch, host: CoreHostRef): Promise<void> {
@@ -120,8 +125,7 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   const host = await startCoreRun(prepared.context, {
     name: `pi-${spec.runId}`.slice(0, 32), runId: spec.runId, scriptPath: spec.scriptPath,
     wrapperStartFile: spec.wrapperStartFile, cwd: spec.cwd,
-    env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir,
-      ...(prepared.app.env.HERDR_APP_HOME === undefined ? {} : { HERDR_APP_HOME: prepared.app.env.HERDR_APP_HOME }) },
+    env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, HERDR_APP_HOME: prepared.app.home },
     labels: { "herdr.space": prepared.app.space },
   });
   host.runtime = { ...prepared.runtime };

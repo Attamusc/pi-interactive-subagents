@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServer } from "node:net";
 import { once } from "node:events";
+import { waitForVisibleCompletion } from "../pi-extension/subagents/completion-watch.ts";
 import { createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
@@ -45,10 +46,16 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
       let result: any;
       switch (request.method) {
         case "hello": result = { generation: 1, core: { id: "test-core" }, methods: ["terminal.run", "terminal.get", "terminal.list", "terminal.read", "terminal.keys", "terminal.kill", "terminal.rm"] }; break;
-        case "terminal.get": result = request.params.terminal === "t1" ? parent : child; break;
+        case "terminal.get":
+          if (request.params.terminal !== "t1" && JSON.parse(readFileSync(stateFile, "utf8")).missingChild) {
+            socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture missing registry record", data: { kind: "not_found" } } }) + "\n"); return;
+          }
+          result = request.params.terminal === "t1" ? parent : child; break;
         case "terminal.run":
           child = { address: "t2", state: "live", pid: 456, argv: request.params.argv, parent: "t1", labels: request.params.labels };
-          writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), child: true, name: "" }));
+          const serviceState = JSON.parse(readFileSync(stateFile, "utf8"));
+          const childEnv = { HERDR_APP_HOME: serviceState.coreServerHome, ...request.params.env };
+          writeFileSync(stateFile, JSON.stringify({ ...serviceState, child: true, name: "", childHome: childEnv.HERDR_APP_HOME }));
           if (JSON.parse(readFileSync(stateFile, "utf8")).unconfirmed) {
             const reply = () => socket.end(JSON.stringify({ jsonrpc: "2.0", id: "uncorrelated", result: child }) + "\n");
             if (JSON.parse(readFileSync(stateFile, "utf8")).delayRunReply) setTimeout(reply, 50); else reply();
@@ -595,6 +602,84 @@ it("preserves failed reload cleanup in a recovery descriptor without a completio
     }
   });
 });
+
+it("does not infer original process exit from a missing Core registry record with unknown startup identity", async () => {
+  await coreFixture(async ({ ctx, stateFile }: any) => {
+    const running = await __test__.launchSubagent({ name: "Task", task: "inspect", tools: "read" }, ctx);
+    writeFileSync(stateFile, JSON.stringify({ child: true, missingChild: true }));
+    const abort = new AbortController();
+    let completed = false;
+    let ticks = 0;
+    const waiting = waitForVisibleCompletion({
+      state: running.completionState!, childSnapshotFile: running.childSnapshotFile!, wrapperExitFile: running.wrapperExitFile!,
+      sessionFile: running.sessionFile, transcriptStartLine: 0, signal: abort.signal, coreHost: running.coreHost,
+      interval: 5, processProbe() { throw Object.assign(new Error("unknown PID"), { code: "ESRCH" }); }, onTick() { ticks++; },
+    }).then(result => { completed = true; return result; });
+    try {
+      await waitUntil(() => completed || ticks > 0);
+      assert.equal(completed, false, "registry absence alone is not original process-exit evidence");
+      assert.notEqual(running.completionState!.core.process.status, "exited");
+    } finally { abort.abort("test cleanup"); await waiting.catch(() => {}); }
+  });
+});
+
+it("keeps wrapper loss unconfirmed while known Pi lives and rereads final sidecars after proof", async () => {
+  await coreFixture(async ({ ctx }: any) => {
+    const running = await __test__.launchSubagent({ name: "Task", task: "inspect", tools: "read" }, ctx);
+    const recorder = createChildCompletionRecorder({ runId: running.runId, childPid: 789, sessionFile: running.sessionFile, snapshotFile: running.childSnapshotFile! });
+    recorder.record({ kind: "agent-ended" });
+    writeFileSync(running.coreHost!.wrapperStartFile, JSON.stringify({ version: 1, runId: running.runId, wrapperPid: 456, address: "t2", observedAt: new Date().toISOString() }));
+    mkdirSync(dirname(running.sessionFile), { recursive: true });
+    writeFileSync(running.sessionFile, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Original output" }] } }) + "\n");
+    const abort = new AbortController();
+    let completed = false;
+    let piAlive = true;
+    let ticks = 0;
+    const probed: number[] = [];
+    const waiting = waitForVisibleCompletion({
+      state: running.completionState!, childSnapshotFile: running.childSnapshotFile!, wrapperExitFile: running.wrapperExitFile!,
+      sessionFile: running.sessionFile, transcriptStartLine: 0, signal: abort.signal, coreHost: running.coreHost,
+      interval: 5, onTick() { ticks++; }, processProbe(pid: number) {
+        probed.push(pid);
+        if (pid === 789 && piAlive) return;
+        if (pid === 789) writeFileSync(running.wrapperExitFile!, JSON.stringify({ version: 1, runId: running.runId, sourceId: `wrapper:${running.runId}`, sequence: 1, observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: 7 } }));
+        throw Object.assign(new Error("original process gone"), { code: "ESRCH" });
+      },
+    }).then(result => { completed = true; return result; });
+    try {
+      await waitUntil(() => completed || ticks > 0);
+      assert.equal(completed, false, "wrapper absence must not imply exit of a known live original Pi");
+      assert.ok(probed.includes(789));
+      assert.notEqual(running.completionState!.core.process.status, "exited");
+      piAlive = false;
+      await waitUntil(() => completed);
+      const result = await waiting;
+      assert.deepEqual(result.completion.processExit, { kind: "shell", shellStatus: 7 }, "final sidecar must beat the first-exit-wins absence fallback");
+      assert.equal(result.completion.output, "Original output");
+    } finally { abort.abort("test cleanup"); await waiting.catch(() => {}); }
+  });
+});
+
+for (const defaultHome of ["xdg", "home"] as const) {
+  it(`pins the parent's ${defaultHome} default app home over a conflicting Core service environment`, async () => {
+    await coreFixture(async ({ dir, ctx, stateFile, requests, appLog }: any) => {
+      process.env.HOME = join(dir, "parent-home");
+      process.env.XDG_CONFIG_HOME = defaultHome === "xdg" ? join(dir, "parent-config") : "";
+      if (defaultHome === "xdg") delete process.env.HERDR_APP_HOME;
+      else process.env.HERDR_APP_HOME = "";
+      const expected = defaultHome === "xdg" ? join(dir, "parent-config", "herdr-app") : join(dir, "parent-home", ".config", "herdr-app");
+      const staleServerHome = join(dir, "stale-server-app");
+      writeFileSync(stateFile, JSON.stringify({ coreServerHome: staleServerHome }));
+      await __test__.launchSubagent({ name: "Task", task: "inspect", tools: "read" }, ctx);
+      const state = JSON.parse(readFileSync(stateFile, "utf8"));
+      assert.equal(state.childHome, expected, "overlay must not reintroduce the server's different app selection into nested Pi");
+      const launch = requests.find((request: any) => request.method === "terminal.run");
+      assert.equal(launch.params.env.HERDR_APP_HOME, expected);
+      const appCalls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      assert.ok(appCalls.every(call => call.home === expected), "preflight/adoption and nested child must use the same recorded home");
+    });
+  });
+}
 
 it("rejects Claude-on-Core before accessing native context", async () => {
   await coreFixture(async ({ dir, ctx, requests }: any) => {

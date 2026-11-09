@@ -129,14 +129,20 @@ export async function waitForVisibleCompletion(params: {
       if (!gone && !wrapperAlive) {
         try { gone = (await getCoreTerminal(host)).state === "finished"; }
         catch (error) {
-          if (error instanceof CoreRpcError && error.method === "terminal.get" && error.kind === "not_found") gone = true;
-          else diagnostic(params.state, "Core observer", { reason: "invalid", error: error instanceof Error ? error.message : String(error) });
+          if (error instanceof CoreRpcError && error.method === "terminal.get" && error.kind === "not_found") {
+            diagnostic(params.state, "Core observer", { reason: "unconfirmed", error: "registry absence is not original process-exit evidence" });
+          } else diagnostic(params.state, "Core observer", { reason: "invalid", error: error instanceof Error ? error.message : String(error) });
         }
       }
       if (gone) {
-        // A final sidecar may have appeared while the exit probe was in flight.
+        const childPid = params.state.childPid;
+        if (childPid !== undefined) {
+          try { (params.processProbe ?? process.kill)(childPid, 0); gone = false; }
+          catch (error) { gone = (error as NodeJS.ErrnoException).code === "ESRCH"; }
+        }
+        // The last process probe can race a final writer or a newly observed Pi identity.
         status = observeVisibleCompletion(params);
-        if (!status.terminal && params.state.core.process.status !== "exited") {
+        if (gone && params.state.childPid === childPid && !status.terminal && params.state.core.process.status !== "exited") {
           recordVisibleControl(params.state, { kind: "process-exited", exit: { kind: "process-not-found" } });
           status = projectAgentRunStatus(params.state.core);
         }
