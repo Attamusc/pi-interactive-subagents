@@ -33,6 +33,9 @@ export interface ChildCompletionSnapshot {
   childPid: number; sessionFile: string; completionPayload?: CompletionPayload;
   latestFacts: ChildCompletionFact[];
 }
+export interface WrapperStartRecord {
+  version: 1; runId: string; wrapperPid: number; address: string; observedAt: string;
+}
 export interface WrapperExitRecord {
   version: 1; runId: string; sourceId: string; sequence: 1; observedAt: string;
   exit: { kind: "shell"; shellStatus: number };
@@ -148,11 +151,30 @@ export function readWrapperExitRecord(file: string, expectedRunId: string, after
   return { ok: true, value: value as unknown as WrapperExitRecord };
 }
 
+export function readWrapperStartRecord(file: string, expectedRunId: string, expectedAddress: string): SidecarReadResult<WrapperStartRecord> {
+  const read = readJson(file); if (!read.ok) return read;
+  const value = object(read.value);
+  if (!value || value.version !== 1) return { ok: false, reason: "invalid", error: "unsupported wrapper-start shape or version" };
+  if (value.runId !== expectedRunId || value.address !== expectedAddress) return { ok: false, reason: "wrong-id" };
+  if (!validInteger(value.wrapperPid, 1) || !validDate(value.observedAt) || !validString(value.address) || !/^t[0-9a-z]+$/.test(value.address)) {
+    return { ok: false, reason: "invalid", error: "invalid wrapper-start fields" };
+  }
+  return { ok: true, value: value as unknown as WrapperStartRecord };
+}
+
 function shellEscape(value: string): string { return "'" + value.replace(/'/g, "'\\''") + "'"; }
 /** Runs the supplied Pi shell command in the foreground and records only after it returns. */
-export function buildVisibleWrapperCommand(params: { piCommand: string; runId: string; wrapperExitFile: string; terminalSentinel?: string }): string {
+export function buildVisibleWrapperCommand(params: { piCommand: string; runId: string; wrapperExitFile: string; terminalSentinel?: string; wrapperStartFile?: string; nodeExecutable?: string }): string {
   requireRunId(params.runId); if (!params.piCommand.trim()) throw new Error("piCommand is required");
   const writer = `const fs=require('node:fs'),path=require('node:path');const file=process.argv[1],runId=process.argv[2],status=Number(process.argv[3]);const record={version:1,runId,sourceId:'wrapper:'+runId,sequence:1,observedAt:new Date().toISOString(),exit:{kind:'shell',shellStatus:status}};fs.mkdirSync(path.dirname(file),{recursive:true});const temp=file+'.'+process.pid+'.tmp';fs.writeFileSync(temp,JSON.stringify(record)+'\\n',{mode:384,flag:'wx'});fs.chmodSync(temp,384);fs.renameSync(temp,file);`;
   const sentinel = params.terminalSentinel === undefined ? "" : `\nprintf '%s\\n' ${shellEscape(params.terminalSentinel)}`;
-  return `if\n${params.piCommand}\nthen\n  _pi_status=0\nelse\n  _pi_status=$?\nfi\nif node -e ${shellEscape(writer)} ${shellEscape(params.wrapperExitFile)} ${shellEscape(params.runId)} "$_pi_status"; then :; else :; fi${sentinel}\nexit "$_pi_status"`;
+  const node = params.nodeExecutable ? shellEscape(params.nodeExecutable) : "node";
+  let startup = "";
+  if (params.wrapperStartFile) {
+    if (!params.nodeExecutable?.startsWith("/")) throw new Error("Core wrapper requires an absolute Node executable");
+    const startWriter = `const fs=require('node:fs'),path=require('node:path');const [file,runId,pid,address]=process.argv.slice(1);const wrapperPid=Number(pid);if(!Number.isSafeInteger(wrapperPid)||wrapperPid<=0||address.length>4096||!/^t[0-9a-z]+$/.test(address))throw Error('invalid Core wrapper identity');const record={version:1,runId,wrapperPid,address,observedAt:new Date().toISOString()};fs.mkdirSync(path.dirname(file),{recursive:true});const temp=file+'.'+process.pid+'.tmp';fs.writeFileSync(temp,JSON.stringify(record)+'\\n',{mode:384,flag:'wx'});fs.chmodSync(temp,384);fs.renameSync(temp,file);`;
+    // Explicit failure handling is required even when Bash was not invoked with -e.
+    startup = `if ${node} -e ${shellEscape(startWriter)} ${shellEscape(params.wrapperStartFile)} ${shellEscape(params.runId)} "$$" "$HC_TERMINAL_ID"; then :; else exit 125; fi\n`;
+  }
+  return `${startup}if\n${params.piCommand}\nthen\n  _pi_status=0\nelse\n  _pi_status=$?\nfi\nif ${node} -e ${shellEscape(writer)} ${shellEscape(params.wrapperExitFile)} ${shellEscape(params.runId)} "$_pi_status"; then :; else :; fi${sentinel}\nexit "$_pi_status"`;
 }

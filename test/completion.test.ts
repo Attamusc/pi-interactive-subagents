@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writ
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentRunState, projectAgentRunStatus, reduceAgentRunEvidence } from "pi-agent-execution";
-import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, createChildCompletionRecorder, readChildCompletionSnapshot, readWrapperExitRecord } from "../pi-extension/subagents/completion.ts";
+import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, createChildCompletionRecorder, readChildCompletionSnapshot, readWrapperExitRecord, readWrapperStartRecord } from "../pi-extension/subagents/completion.ts";
 
 const tempDirs = new Set<string>();
 function tempDir() {
@@ -77,6 +77,75 @@ describe("visible completion sidecars", () => {
     const recorder = createChildCompletionRecorder({ runId: "collision", childPid: 9, sessionFile: "/s", snapshotFile: paths.childSnapshot });
     assert.throws(() => recorder.record({ kind: "progress", estimated: false }));
     assert.equal(readFileSync(collision, "utf8"), "pre-existing");
+  });
+
+  it("records the original Bash wrapper before Pi with absolute writers and no PATH lookup", () => {
+    const dir = tempDir();
+    const paths = buildVisibleCompletionPaths(dir, "core-start");
+    const startFile = join(dir, "core-start.wrapper-start.json");
+    const marker = join(dir, "pi-started");
+    const script = buildVisibleWrapperCommand({
+      piCommand: `printf '%s|%s' "$$" "$HC_TERMINAL_ID" > ${JSON.stringify(marker)}`,
+      runId: "core-start", wrapperExitFile: paths.wrapperExit,
+      wrapperStartFile: startFile, nodeExecutable: process.execPath,
+    });
+    execFileSync("/bin/bash", ["-e", "-c", script], { env: { PATH: "/no-command-path", HC_TERMINAL_ID: "tchild" } });
+    const observed = readWrapperStartRecord(startFile, "core-start", "tchild");
+    assert.equal(observed.ok, true);
+    if (!observed.ok) return;
+    const start = observed.value;
+    assert.equal(start.version, 1);
+    assert.equal(start.runId, "core-start");
+    assert.ok(Number.isSafeInteger(start.wrapperPid) && start.wrapperPid > 0);
+    assert.equal(start.address, "tchild");
+    assert.ok(Number.isFinite(Date.parse(start.observedAt)));
+    assert.equal(statSync(startFile).mode & 0o777, 0o600);
+    assert.equal(readFileSync(marker, "utf8"), `${start.wrapperPid}|tchild`);
+    assert.equal(readWrapperExitRecord(paths.wrapperExit, "core-start").ok, true);
+  });
+
+  it("validates wrapper-start run/address/PID identity and bounds", () => {
+    const file = join(tempDir(), "start.json");
+    assert.equal(readWrapperStartRecord(file, "r", "t2").reason, "missing");
+    const base = { version: 1, runId: "r", wrapperPid: 12, address: "t2", observedAt: new Date().toISOString() };
+    for (const [change, reason] of [
+      [{ version: 2 }, "invalid"], [{ runId: "other" }, "wrong-id"],
+      [{ address: "t3" }, "wrong-id"], [{ wrapperPid: 0 }, "invalid"],
+      [{ observedAt: "yesterday" }, "invalid"],
+    ] as const) {
+      writeFileSync(file, JSON.stringify({ ...base, ...change }));
+      assert.equal(readWrapperStartRecord(file, "r", "t2").reason, reason);
+    }
+    writeFileSync(file, " ".repeat(64 * 1024 + 1));
+    assert.equal(readWrapperStartRecord(file, "r", "t2").reason, "invalid");
+  });
+
+  it("does not start Pi without a valid child Core identity", () => {
+    const dir = tempDir();
+    const marker = join(dir, "pi-must-not-start");
+    for (const identity of ["", "parent-invented-id"]) {
+      const script = buildVisibleWrapperCommand({
+        piCommand: `printf started > ${JSON.stringify(marker)}`,
+        runId: "invalid-core", wrapperExitFile: join(dir, "exit.json"),
+        wrapperStartFile: join(dir, "start.json"), nodeExecutable: process.execPath,
+      });
+      assert.throws(() => execFileSync("/bin/bash", ["-c", script], { stdio: "pipe", env: { HC_TERMINAL_ID: identity } }));
+      assert.throws(() => readFileSync(marker));
+    }
+  });
+
+  it("does not start Pi if its wrapper-start record cannot be written", () => {
+    const dir = tempDir();
+    const marker = join(dir, "pi-must-not-start");
+    const blocked = join(dir, "not-a-directory");
+    writeFileSync(blocked, "blocked");
+    const script = buildVisibleWrapperCommand({
+      piCommand: `printf started > ${JSON.stringify(marker)}`,
+      runId: "blocked", wrapperExitFile: join(dir, "exit.json"),
+      wrapperStartFile: join(blocked, "start.json"), nodeExecutable: process.execPath,
+    });
+    assert.throws(() => execFileSync("/bin/bash", ["-c", script], { stdio: "pipe", env: { HC_TERMINAL_ID: "tchild" } }));
+    assert.throws(() => readFileSync(marker));
   });
 
   it("records after foreground return and preserves status 143 under bash -e", () => {
