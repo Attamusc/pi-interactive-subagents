@@ -10,6 +10,7 @@ import { createChildCompletionRecorder } from "../pi-extension/subagents/complet
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
 import { getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
+import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
 
 it("selects explicit Core without classic fallback and requires inherited identity", () => {
   const saved = { ...process.env };
@@ -179,7 +180,7 @@ for (const scenario of [
         assert.equal(launch.parent, "t1");
         assert.equal(launch.caller, "t1");
         assert.match(launch.name, /^[a-z0-9_-]{1,32}$/);
-        assert.equal(launch.name, scenario.name.replaceAll(" ", "-").slice(0, 32));
+        assert.equal(launch.name, `${scenario.name.replaceAll(" ", "-").slice(0, 23)}-${launch.labels["pi.subagent.run"]}`);
         assert.equal(launch.labels["herdr.space"], scenario.expected ? "space-test" : undefined);
         assert.equal(launch.labels["herdr.tab"], scenario.expected ? "parent-tab" : undefined);
         assert.ok(launch.labels["pi.subagent.run"]);
@@ -195,6 +196,29 @@ for (const scenario of [
     });
   });
 }
+
+it("keeps Core names unique by run for repeated, long and non-ASCII titles", async () => {
+  await coreFixture(async ({ dir, requests }: any) => {
+    for (const [index, title] of ["Review task", "Review task ".repeat(12), "調査🧪".repeat(30)].entries()) {
+      const prepared = await prepareCoreLaunch(title, false);
+      const runIds = [`a000000${index}`, `b000000${index}`];
+      for (const runId of runIds) {
+        await launchPreparedCoreRun(prepared, {
+          runId, scriptPath: join(dir, `${runId}.sh`), wrapperStartFile: join(dir, `${runId}.json`),
+          command: "true", cwd: dir, agentDir: process.env.PI_CODING_AGENT_DIR!,
+        });
+      }
+      const launches = requests.filter((request: any) => request.method === "terminal.run").slice(-2);
+      const names = launches.map((request: any) => request.params.name);
+      assert.notEqual(names[0], names[1], "same task title must not collide across runs");
+      for (const [runIndex, name] of names.entries()) {
+        assert.match(name, /^[a-z0-9_-]{1,32}$/);
+        assert.ok(name.endsWith(`-${runIds[runIndex]}`), "preserve the complete run suffix");
+        assert.ok(name.startsWith(index === 2 ? "pi-subagent-" : "review-task-"));
+      }
+    }
+  });
+});
 
 it("launches Pi through Core once with a prepared wrapper and same-tab right pane", async () => {
   await coreFixture(async ({ ctx, requests, entry, appLog }: any) => {
@@ -221,7 +245,7 @@ it("launches Pi through Core once with a prepared wrapper and same-tab right pan
     const appCalls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(appCalls.every(call => call.home === process.env.HERDR_APP_HOME));
     assert.ok(appCalls.every(call => ["ls", "status"].includes(call.args[0])), "no rename, split or focus commands");
-    assert.equal(launch.name, "review-task");
+    assert.equal(launch.name, `review-task-${running.runId}`);
     const taskPath = script.match(/'@([^']+)'/)?.[1];
     assert.ok(taskPath);
     assert.equal((readFileSync(taskPath, "utf8").match(/Inspect exactly once/g) ?? []).length, 1);

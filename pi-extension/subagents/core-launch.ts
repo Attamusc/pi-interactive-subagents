@@ -123,8 +123,10 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   mkdirSync(dirname(spec.scriptPath), { recursive: true });
   writeFileSync(spec.scriptPath, `#!/bin/bash\n${spec.command}\n`, { mode: 0o600, flag: "wx" });
   chmodSync(spec.scriptPath, 0o600);
+  const titlePrefix = prepared.title.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "pi-subagent";
+  const name = `${titlePrefix.slice(0, 32 - spec.runId.length - 1)}-${spec.runId}`;
   const host = await startCoreRun(prepared.context, {
-    name: prepared.title.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "pi-subagent", runId: spec.runId, scriptPath: spec.scriptPath,
+    name, runId: spec.runId, scriptPath: spec.scriptPath,
     wrapperStartFile: spec.wrapperStartFile, cwd: spec.cwd,
     env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, HERDR_APP_HOME: prepared.app.home },
     labels: prepared.app.placement ? { "herdr.space": prepared.app.placement.space, "herdr.tab": prepared.app.placement.parentTab } : {},
