@@ -1,6 +1,6 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServer } from "node:net";
@@ -55,7 +55,7 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           child = { address: "t2", state: "live", pid: 456, argv: request.params.argv, parent: "t1", labels: request.params.labels };
           const serviceState = JSON.parse(readFileSync(stateFile, "utf8"));
           const childEnv = { HERDR_APP_HOME: serviceState.coreServerHome, ...request.params.env };
-          writeFileSync(stateFile, JSON.stringify({ ...serviceState, child: true, name: "", childHome: childEnv.HERDR_APP_HOME }));
+          writeFileSync(stateFile, JSON.stringify({ ...serviceState, child: true, childTab: request.params.labels["herdr.tab"], childSpace: request.params.labels["herdr.space"], childHome: childEnv.HERDR_APP_HOME }));
           if (JSON.parse(readFileSync(stateFile, "utf8")).unconfirmed) {
             const reply = () => socket.end(JSON.stringify({ jsonrpc: "2.0", id: "uncorrelated", result: child }) + "\n");
             if (JSON.parse(readFileSync(stateFile, "utf8")).delayRunReply) setTimeout(reply, 50); else reply();
@@ -93,7 +93,7 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
     writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "fixture", bin: { pi: "cli.js" } }));
     process.argv[1] = entry;
     writeFileSync(stateFile, JSON.stringify({ child: false }));
-    writeFileSync(join(bin, "herdr-app"), `#!${process.execPath}\nconst fs=require('node:fs');const file=${JSON.stringify(stateFile)};const log=${JSON.stringify(appLog)};const args=process.argv.slice(2);fs.appendFileSync(log,JSON.stringify({args,home:process.env.HERDR_APP_HOME})+'\\n');const state=JSON.parse(fs.readFileSync(file));const visibleChild=state.child&&!(state.adoptPending>0);if(state.child&&state.adoptPending>0&&args[0]==='ls'){state.adoptPending--;fs.writeFileSync(file,JSON.stringify(state));}let result;if(args[0]==='ls')result={spaces:[{id:'space-test',machine:null,tabs:[{id:'parent-tab',name:'parent',terminals:[{terminal:state.badParent?'t9':'t1',pane:'parent-pane'}]},...(visibleChild?[{id:'child-tab',name:state.name,terminals:[{terminal:'t2',pane:'child-pane'}]}]:[])]}]};else if(args[0]==='status')result={space:'space-test',tab:'parent-tab'};else if(args[0]==='do'&&args[1]==='tab.rename'){const rename=JSON.parse(args[2]);if(rename.id!=='child-tab')throw Error('wrong tab');state.name=rename.name;fs.writeFileSync(file,JSON.stringify(state));result=state.renameFails?{error:'fixture rename failure'}:{ok:true};}else throw Error('forbidden app command');console.log(JSON.stringify(result));\n`, { mode: 0o700 });
+    writeFileSync(join(bin, "herdr-app"), `#!${process.execPath}\nconst fs=require('node:fs');const file=${JSON.stringify(stateFile)};const log=${JSON.stringify(appLog)};const args=process.argv.slice(2);fs.appendFileSync(log,JSON.stringify({args,home:process.env.HERDR_APP_HOME})+'\\n');const state=JSON.parse(fs.readFileSync(file));const visibleChild=state.child&&state.childSpace&&!(state.adoptPending>0);if(state.child&&state.adoptPending>0&&args[0]==='ls'){state.adoptPending--;fs.writeFileSync(file,JSON.stringify(state));}let result;if(args[0]==='ls')result={spaces:[{id:'space-test',machine:null,tabs:[{id:'parent-tab',name:'parent',terminals:[{terminal:state.badParent?'t9':'t1',pane:'parent-pane'},...(visibleChild&&state.childTab==='parent-tab'?[{terminal:'t2',pane:state.adoptionFails?null:'child-pane'}]:[])]},...(visibleChild&&state.childTab!=='parent-tab'?[{id:'child-tab',name:'child',terminals:[{terminal:'t2',pane:'child-pane'}]}]:[])]}]};else if(args[0]==='status')result={space:'space-test',tab:'parent-tab'};else throw Error('forbidden app command');console.log(JSON.stringify(result));\n`, { mode: 0o700 });
     process.env.PATH = `${bin}:${saved.PATH}`;
     process.env.HERDR_APP_HOME = join(dir, "selected-app");
     process.env.PI_CODING_AGENT_DIR = join(dir, "profile"); mkdirSync(process.env.PI_CODING_AGENT_DIR);
@@ -110,48 +110,93 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
   }
 }
 
-it("resumes through the registered tool using immutable policy and captured Core ownership", async () => {
-  await coreFixture(async ({ dir, ctx, requests, entry }: any) => {
-    const sessionPath = join(dir, "resume.jsonl");
-    writeFileSync(sessionPath, [
-      { type: "session", id: "old-session", cwd: dir },
-      { type: "custom", customType: "pi-interactive-subagents.resume-policy", data: {
-        version: 2, sessionId: "old-session", agent: null, deniedTools: ["bash"], cwd: dir,
-        agentDir: process.env.PI_CODING_AGENT_DIR, systemPrompt: null, requestedSkills: [], activeTools: ["read"], skills: [],
-      } },
-    ].map(value => JSON.stringify(value)).join("\n") + "\n");
-    const tools: any[] = [];
-    const handlers = new Map<string, any>();
-    subagentsExtension({
-      events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
-      registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
-      sendMessage() {}, getAllTools() { return []; },
-    } as any);
-    try {
-      const result = await tools.find(tool => tool.name === "subagent_resume").execute("test", { sessionPath, name: "Resume task", message: "Continue once", autoExit: true }, undefined, undefined, ctx);
-      assert.equal(result.details.status, "started");
-      const launch = requests.find((request: any) => request.method === "terminal.run").params;
-      const script = readFileSync(launch.argv[1], "utf8");
-      assert.ok(script.includes(entry));
-      assert.match(script, /PI_SUBAGENT_RESTORE_POLICY=1/);
-      assert.match(script, /PI_DENY_TOOLS='bash'/);
-      assert.match(script, /--tools 'read'/);
-      assert.match(script, /PI_SUBAGENT_SURFACE="\$HC_TERMINAL_ID"/);
-      const running = [...__test__.runningSubagents.values()][0];
-      assert.equal(running.coreHost.address, "t2");
-      // A stale/new global selector must not reroute controls away from the captured Core.
-      process.env.PI_SUBAGENT_MUX = "zellij";
-      const interrupted = await tools.find(tool => tool.name === "subagent_interrupt").execute("escape", { id: running.id }, undefined, undefined, ctx);
-      assert.equal(interrupted.details.status, "interrupt_requested");
-      assert.equal(requests.filter((request: any) => request.method === "terminal.keys").length, 1);
-    } finally {
-      await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
+for (const autoExit of [true, false]) {
+  it(`resumes through the registered tool with autoExit=${autoExit} and captured Core ownership`, async () => {
+    await coreFixture(async ({ dir, ctx, requests, entry, appLog }: any) => {
+      const sessionPath = join(dir, "resume.jsonl");
+      writeFileSync(sessionPath, [
+        { type: "session", id: "old-session", cwd: dir },
+        { type: "custom", customType: "pi-interactive-subagents.resume-policy", data: {
+          version: 2, sessionId: "old-session", agent: null, deniedTools: ["bash"], cwd: dir,
+          agentDir: process.env.PI_CODING_AGENT_DIR, systemPrompt: null, requestedSkills: [], activeTools: ["read"], skills: [],
+        } },
+      ].map(value => JSON.stringify(value)).join("\n") + "\n");
+      const tools: any[] = [];
+      const handlers = new Map<string, any>();
+      subagentsExtension({
+        events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
+        registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+        sendMessage() {}, getAllTools() { return []; },
+      } as any);
+      try {
+        const result = await tools.find(tool => tool.name === "subagent_resume").execute("test", { sessionPath, name: "Resume task", message: "Continue once", autoExit }, undefined, undefined, ctx);
+        assert.equal(result.details.status, "started");
+        const launch = requests.find((request: any) => request.method === "terminal.run").params;
+        assert.equal(launch.labels["herdr.space"], autoExit ? undefined : "space-test");
+        assert.equal(launch.labels["herdr.tab"], autoExit ? undefined : "parent-tab");
+        assert.equal(existsSync(appLog), !autoExit);
+        const script = readFileSync(launch.argv[1], "utf8");
+        assert.ok(script.includes(entry));
+        assert.match(script, /PI_SUBAGENT_RESTORE_POLICY=1/);
+        assert.match(script, /PI_DENY_TOOLS='bash'/);
+        assert.match(script, /--tools 'read'/);
+        assert.match(script, /PI_SUBAGENT_SURFACE="\$HC_TERMINAL_ID"/);
+        const running = [...__test__.runningSubagents.values()][0];
+        assert.equal(running.coreHost.address, "t2");
+        // A stale/new global selector must not reroute controls away from the captured Core.
+        process.env.PI_SUBAGENT_MUX = "zellij";
+        const interrupted = await tools.find(tool => tool.name === "subagent_interrupt").execute("escape", { id: running.id }, undefined, undefined, ctx);
+        assert.equal(interrupted.details.status, "interrupt_requested");
+        assert.equal(requests.filter((request: any) => request.method === "terminal.keys").length, 1);
+      } finally {
+        await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    });
   });
-});
+}
 
-it("launches Pi through Core once with a prepared wrapper and app-adopted named tab", async () => {
+for (const scenario of [
+  { name: "default autonomous", agent: "autonomous", expected: false },
+  { name: "explicit true overrides auto-exit", agent: "autonomous", interactive: true, expected: true },
+  { name: "explicit false with auto-exit", agent: "autonomous", interactive: false, expected: false },
+  { name: "explicit false overrides interactive definition", agent: "interactive", interactive: false, expected: false },
+  { name: "explicit false on bare launch", interactive: false, expected: false },
+  { name: "nested row without app labels", agent: "autonomous", nested: true, expected: false },
+]) {
+  it(`presents ${scenario.name} using resolved interactivity`, async () => {
+    await coreFixture(async ({ ctx, requests, parent, appLog }: any) => {
+      const agents = join(process.env.PI_CODING_AGENT_DIR!, "agents");
+      mkdirSync(agents);
+      writeFileSync(join(agents, "autonomous.md"), "---\nname: autonomous\nauto-exit: true\n---\nInspect once.\n");
+      writeFileSync(join(agents, "interactive.md"), "---\nname: interactive\ninteractive: true\nauto-exit: false\n---\nInspect interactively.\n");
+      if (scenario.nested) parent.labels = {};
+      const runtime = registeredRuntime(ctx);
+      try {
+        const result = await runtime.launch({ name: scenario.name, task: "inspect", agent: scenario.agent, interactive: scenario.interactive });
+        assert.equal(result.details.status, "started");
+        const launch = requests.find((request: any) => request.method === "terminal.run").params;
+        assert.equal(launch.parent, "t1");
+        assert.equal(launch.caller, "t1");
+        assert.match(launch.name, /^[a-z0-9_-]{1,32}$/);
+        assert.equal(launch.name, scenario.name.replaceAll(" ", "-").slice(0, 32));
+        assert.equal(launch.labels["herdr.space"], scenario.expected ? "space-test" : undefined);
+        assert.equal(launch.labels["herdr.tab"], scenario.expected ? "parent-tab" : undefined);
+        assert.ok(launch.labels["pi.subagent.run"]);
+        assert.equal(launch.env.HERDR_APP_HOME, process.env.HERDR_APP_HOME);
+        assert.equal(existsSync(appLog), scenario.expected, "rows never call the app");
+        if (scenario.expected) {
+          const calls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line).args);
+          assert.ok(calls.every(args => ["ls", "status"].includes(args[0])));
+        }
+      } finally {
+        await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      }
+    });
+  });
+}
+
+it("launches Pi through Core once with a prepared wrapper and same-tab right pane", async () => {
   await coreFixture(async ({ ctx, requests, entry, appLog }: any) => {
     const running = await __test__.launchSubagent({ name: "Review\u001b[31m task", task: "Inspect exactly once", tools: "read", interactive: true }, ctx);
     const launches = requests.filter((request: any) => request.method === "terminal.run");
@@ -160,7 +205,7 @@ it("launches Pi through Core once with a prepared wrapper and app-adopted named 
     assert.equal(running.coreHost.address, "t2");
     assert.deepEqual(running.coreHost.runtime, { node: process.execPath, script: entry, version: "fixture" });
     assert.equal(running.surface, "t2");
-    assert.deepEqual(launch.labels, { "herdr.space": "space-test", "pi.subagent.run": running.runId });
+    assert.deepEqual(launch.labels, { "herdr.space": "space-test", "herdr.tab": "parent-tab", "pi.subagent.run": running.runId });
     assert.equal(launch.env.PI_SUBAGENT_MUX, "herdr-core");
     assert.equal(launch.env.HERDR_SOCKET_PATH, "");
     assert.equal(launch.env.PI_SUBAGENT_ID, "");
@@ -175,9 +220,8 @@ it("launches Pi through Core once with a prepared wrapper and app-adopted named 
     assert.equal((script.match(/Inspect exactly once/g) ?? []).length, 0, "blank-session task must be artifact-backed");
     const appCalls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(appCalls.every(call => call.home === process.env.HERDR_APP_HOME));
-    assert.deepEqual(appCalls.filter(call => call.args[0] === "do").map(call => call.args.slice(0, 2)), [["do", "tab.rename"]]);
-    const rename = appCalls.find(call => call.args[0] === "do");
-    assert.deepEqual(JSON.parse(rename.args[2]), { id: "child-tab", name: "Review task" });
+    assert.ok(appCalls.every(call => ["ls", "status"].includes(call.args[0])), "no rename, split or focus commands");
+    assert.equal(launch.name, "review-task");
     const taskPath = script.match(/'@([^']+)'/)?.[1];
     assert.ok(taskPath);
     assert.equal((readFileSync(taskPath, "utf8").match(/Inspect exactly once/g) ?? []).length, 1);
@@ -206,7 +250,7 @@ it("observes eventual app adoption without creating a replacement terminal", asy
     assert.equal(running.surface, "t2");
     assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
     const calls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line).args);
-    assert.ok(calls.filter(args => args[0] === "ls").length >= 5);
+    assert.ok(calls.filter(args => args[0] === "ls").length >= 4);
     assert.equal(requests.some((request: any) => request.method === "terminal.keys"), false, "Core startup must not send a command into a shell");
   });
 });
@@ -238,9 +282,9 @@ it("rejects a mismapped app parent before terminal.run", async () => {
   });
 });
 
-it("cleans only its owned child when app rename setup fails", async () => {
+it("cleans only its owned child when app pane adoption fails", async () => {
   await coreFixture(async ({ stateFile, ctx, requests }: any) => {
-    writeFileSync(stateFile, JSON.stringify({ renameFails: true }));
+    writeFileSync(stateFile, JSON.stringify({ adoptionFails: true }));
     await assert.rejects(__test__.launchSubagent({ name: "Task", task: "inspect" }, ctx), /visibility setup failed/);
     assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
     const cleanup = requests.filter((request: any) => ["terminal.kill", "terminal.rm"].includes(request.method));
@@ -349,7 +393,7 @@ function registeredRuntime(ctx: any) {
 
 it("retains failed visibility cleanup from the registered tool and retries only removal", async () => {
   await coreFixture(async ({ ctx, stateFile, requests }: any) => {
-    writeFileSync(stateFile, JSON.stringify({ renameFails: true, rmFails: true }));
+    writeFileSync(stateFile, JSON.stringify({ adoptionFails: true, rmFails: true }));
     const runtime = registeredRuntime(ctx);
     try {
       await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /visibility setup failed/);
@@ -361,7 +405,7 @@ it("retains failed visibility cleanup from the registered tool and retries only 
       const termination = await runtime.tools.find(tool => tool.name === "subagent_terminate").execute("terminate", { id: running.id }, undefined, undefined, ctx);
       assert.equal(termination.details.status, "termination_requested_unconfirmed");
       assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1, "an already accepted setup kill must not be repeated by controls");
-      writeFileSync(stateFile, JSON.stringify({ child: true, renameFails: true, rmFails: false }));
+      writeFileSync(stateFile, JSON.stringify({ child: true, adoptionFails: true, rmFails: false }));
       await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
       assert.equal(__test__.runningSubagents.size, 0);
       assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
@@ -459,7 +503,7 @@ async function waitUntil(check: () => boolean) {
 
 it("cleans a retained setup once when an actual module reload aborts the old runtime", async () => {
   await coreFixture(async ({ ctx, stateFile, requests }: any) => {
-    writeFileSync(stateFile, JSON.stringify({ renameFails: true, rmFails: true }));
+    writeFileSync(stateFile, JSON.stringify({ adoptionFails: true, rmFails: true }));
     const runtime = registeredRuntime(ctx);
     try {
       await assert.rejects(runtime.launch({ name: "Task", task: "inspect", tools: "read" }), /visibility setup failed/);
@@ -505,7 +549,7 @@ it("cleans an unconfirmed in-flight setup that settles after the shutdown snapsh
 for (const stage of ["kill", "remove"] as const) {
   it(`describes pre-registration visibility ${stage} failure with its known original identity`, async () => {
     await coreFixture(async ({ ctx, stateFile }: any) => {
-      writeFileSync(stateFile, JSON.stringify({ renameFails: true, killFails: stage === "kill", rmFails: stage === "remove" }));
+      writeFileSync(stateFile, JSON.stringify({ adoptionFails: true, killFails: stage === "kill", rmFails: stage === "remove" }));
       const runtime = registeredRuntime(ctx);
       const stderr: string[] = [];
       const originalError = console.error;
@@ -573,7 +617,7 @@ it("retains failed registered resume setup under the resumed session identity", 
 
 it("preserves failed reload cleanup in a recovery descriptor without a completion delivery", async () => {
   await coreFixture(async ({ ctx, stateFile, requests }: any) => {
-    writeFileSync(stateFile, JSON.stringify({ renameFails: true, rmFails: true }));
+    writeFileSync(stateFile, JSON.stringify({ adoptionFails: true, rmFails: true }));
     const runtime = registeredRuntime(ctx);
     const stderr: string[] = [];
     const originalError = console.error;

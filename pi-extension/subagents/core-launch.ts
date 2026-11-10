@@ -30,7 +30,7 @@ export function resolveParentPiRuntime() {
   throw unsupported();
 }
 
-interface AppContext { home: string; env: NodeJS.ProcessEnv; space: string; parentTab: string; existingTabs: Set<string> }
+interface AppContext { home: string; env: NodeJS.ProcessEnv; placement?: { space: string; parentTab: string; parentPane: string } }
 export interface PreparedCoreLaunch { context: CoreContext; runtime: ReturnType<typeof resolveParentPiRuntime>; app: AppContext; title: string }
 
 async function appCall(env: NodeJS.ProcessEnv, args: string[], timeout = 5000): Promise<any> {
@@ -55,21 +55,22 @@ function addressMatches(space: any, address: string): { tab: any; terminal: any 
   });
 }
 
-export async function prepareCoreLaunch(name: string): Promise<PreparedCoreLaunch> {
+export async function prepareCoreLaunch(name: string, interactive: boolean): Promise<PreparedCoreLaunch> {
   const title = Array.from(stripVTControlCharacters(name)
     .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
     .replace(/\s+/g, " ").trim()).slice(0, 80).join("");
   if (!title) throw new Error("Core task title is empty after sanitization");
   const runtime = resolveParentPiRuntime();
   const context = await resolveCoreContext();
-  const spaceId = context.parentTerminal.labels["herdr.space"];
-  const parentTab = context.parentTerminal.labels["herdr.tab"];
-  if (!spaceId || !parentTab) throw new Error("Core parent must be adopted by herdr-app with space/tab labels");
   const env = { ...process.env };
   // Match herdr-app app_dir(): nonempty override, XDG config root, then ~/.config.
   const configHome = env.XDG_CONFIG_HOME || join(env.HOME ?? homedir(), ".config");
   const home = resolve(env.HERDR_APP_HOME || join(configHome, "herdr-app"));
   env.HERDR_APP_HOME = home;
+  if (!interactive) return { context, runtime, title, app: { home, env } };
+  const spaceId = context.parentTerminal.labels["herdr.space"];
+  const parentTab = context.parentTerminal.labels["herdr.tab"];
+  if (!spaceId || !parentTab) throw new Error("Core parent must be adopted by herdr-app with space/tab labels");
   const listing = await appCall(env, ["ls"]);
   const status = await appCall(env, ["status"]);
   if (typeof status.space !== "string" || typeof status.tab !== "string") throw new Error("Invalid herdr-app status");
@@ -78,25 +79,25 @@ export async function prepareCoreLaunch(name: string): Promise<PreparedCoreLaunc
   if (matches.length !== 1 || matches[0].tab.id !== parentTab || typeof matches[0].terminal.pane !== "string") {
     throw new Error("Herdr app parent address does not match its labeled tab");
   }
-  return { context, runtime, title, app: { home, env, space: spaceId, parentTab, existingTabs: new Set(space.tabs.map((tab: any) => tab.id)) } };
+  return { context, runtime, title, app: { home, env, placement: { space: spaceId, parentTab, parentPane: matches[0].terminal.pane } } };
 }
 
 async function adoptCoreRun(prepared: PreparedCoreLaunch, host: CoreHostRef): Promise<void> {
   const { app } = prepared;
+  if (!app.placement) return;
+  const { space, parentTab, parentPane } = app.placement;
   const deadline = Date.now() + 10_000;
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error("Core child adoption timed out");
     const listing = await appCall(app.env, ["ls"], Math.min(5000, remaining));
-    const matches = addressMatches(localSpace(listing, app.space), host.address);
+    const matches = addressMatches(localSpace(listing, space), host.address);
     if (matches.length > 1) throw new Error("Ambiguous Core child adoption");
     if (matches.length === 1) {
-      const tab = matches[0].tab;
-      if (app.existingTabs.has(tab.id) || tab.id === app.parentTab) throw new Error("Core child was not adopted into a new tab");
-      const reply = await appCall(app.env, ["do", "tab.rename", JSON.stringify({ id: tab.id, name: prepared.title })]);
-      if (reply.ok !== true) throw new Error("Herdr app tab rename was not acknowledged");
-      const confirmed = addressMatches(localSpace(await appCall(app.env, ["ls"]), app.space), host.address);
-      if (confirmed.length !== 1 || confirmed[0].tab.id !== tab.id || confirmed[0].tab.name !== prepared.title) throw new Error("Core child tab rename was not confirmed");
+      const { tab, terminal } = matches[0];
+      if (tab.id !== parentTab || typeof terminal.pane !== "string" || terminal.pane === parentPane) {
+        throw new Error("Core child was not adopted into a distinct pane in the parent tab");
+      }
       return;
     }
     if (Date.now() >= deadline) throw new Error("Core child adoption timed out");
@@ -123,10 +124,10 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   writeFileSync(spec.scriptPath, `#!/bin/bash\n${spec.command}\n`, { mode: 0o600, flag: "wx" });
   chmodSync(spec.scriptPath, 0o600);
   const host = await startCoreRun(prepared.context, {
-    name: `pi-${spec.runId}`.slice(0, 32), runId: spec.runId, scriptPath: spec.scriptPath,
+    name: prepared.title.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "pi-subagent", runId: spec.runId, scriptPath: spec.scriptPath,
     wrapperStartFile: spec.wrapperStartFile, cwd: spec.cwd,
     env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, HERDR_APP_HOME: prepared.app.home },
-    labels: { "herdr.space": prepared.app.space },
+    labels: prepared.app.placement ? { "herdr.space": prepared.app.placement.space, "herdr.tab": prepared.app.placement.parentTab } : {},
   });
   host.runtime = { ...prepared.runtime };
   try { await adoptCoreRun(prepared, host); }

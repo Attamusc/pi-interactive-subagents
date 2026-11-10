@@ -1645,11 +1645,11 @@ async function launchSubagent(
   }
   if (coreSelected && agentDefs?.cli === "claude") throw new Error("Claude-on-Core is unsupported; select a classic backend");
   if (coreSelected && options?.surface) throw new Error("Core launches cannot reuse a classic surface");
-  const coreLaunch = coreSelected ? await prepareCoreLaunch(params.name) : undefined;
+  const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const coreLaunch = coreSelected ? await prepareCoreLaunch(params.name, effectiveInteractive) : undefined;
   const effectiveModel = launchIntent.effective.model;
   const effectiveTools = launchIntent.effective.tools?.join(",");
   const effectiveThinking = launchIntent.effective.thinking;
-  const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -2664,7 +2664,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const coreLaunch = getMuxBackend() === "herdr-core" ? await prepareCoreLaunch(name) : undefined;
+        const coreLaunch = getMuxBackend() === "herdr-core" ? await prepareCoreLaunch(name, interactive) : undefined;
 
         // Record the raw nonempty-line offset before resuming so extraction only
         // sees transcript entries appended by this run.
