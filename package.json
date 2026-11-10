@@ -33,6 +33,6 @@
     "@sinclair/typebox": "^0.34.49"
   },
   "dependencies": {
-    "pi-agent-execution": "github:Attamusc/pi-agent-execution#091fada20c05470af558a5a121932e43186b8144"
+    "pi-agent-execution": "github:Attamusc/pi-agent-execution#766d4f1e19dfdc39c3471e21dc84662cbe4e7fd6"
   }
 }
