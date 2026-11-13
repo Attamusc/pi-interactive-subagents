@@ -4,6 +4,15 @@ import { Type, type Static } from "@sinclair/typebox";
 import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
+  selectAgentDefinition,
+  copilotJobCapabilities,
+  createAgentRunState,
+  reduceAgentRunEvidence,
+  projectAgentRunStatus,
+  projectAgentRunCompletion,
+  type AgentRunState,
+  type AgentRunEvidence,
+  type DefinitionOrigin,
   visibleHerdrCapabilities,
   visibleHerdrCoreCapabilities,
   type AgentRunCompletion,
@@ -11,7 +20,7 @@ import {
   type NormalizedAgentDefinition,
 } from "pi-agent-execution";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -23,6 +32,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { randomUUID, createHash } from "node:crypto";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -41,8 +51,9 @@ import {
   readScreen,
 } from "./cmux.ts";
 
-import { prepareCoreLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
-import { killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
+import { prepareCoreLaunch, prepareCoreJobLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
+import { prepareNativeJob } from "./native-job.ts";
+import { getCoreTerminal, CoreRpcError, killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
 
 import {
   getNewEntries,
@@ -279,9 +290,9 @@ class AgentDefinitionParseError extends Error {
   }
 }
 
-function parseVisibleAgentDefinition(path: string, content: string): AgentDefinition {
+function parseVisibleAgentDefinition(path: string, content: string, origin?: DefinitionOrigin): AgentDefinition {
   const parsed = parseSharedAgentDefinition(
-    { path, content },
+    { path, content, origin },
     { fallbackName: path.split("/").pop()?.replace(/\.md$/, ""), requiredFields: [] },
   );
   if (!parsed.ok) throw new AgentDefinitionParseError(parsed.diagnostics);
@@ -307,28 +318,36 @@ function parseVisibleAgentDefinition(path: string, content: string): AgentDefini
   };
 }
 
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  const agents = new Map<string, ListedAgentDefinition>();
-  const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: getBundledAgentsDir(), source: "package" },
-    { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-  ];
-
+function discoverAgentDefinitions(dirs: Array<{ path: string; source: AgentSource }> = [
+  { path: getBundledAgentsDir(), source: "package" },
+  { path: join(getAgentConfigDir(), "agents"), source: "global" },
+  { path: join(process.cwd(), ".pi", "agents"), source: "project" },
+]): ListedAgentDefinition[] {
+  const agents = new Map<string, ListedAgentDefinition[]>();
+  // Keep the entire inventory until authority/shadow validation has completed.
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
+    const canonicalRoot = realpathSync(dir);
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
       const definitionPath = join(dir, file);
-      try {
-        const parsed = parseVisibleAgentDefinition(definitionPath, readFileSync(definitionPath, "utf8"));
-        agents.set(parsed.name, { ...parsed, source });
-      } catch (error) {
-        if (!(error instanceof AgentDefinitionParseError)) throw error;
+      const canonicalPath = realpathSync(definitionPath);
+      const inside = relative(canonicalRoot, canonicalPath);
+      if (inside === ".." || inside.startsWith("../") || isAbsolute(inside)) {
+        throw new Error(`Agent definition escapes canonical discovery root: ${definitionPath}`);
       }
+      const parsed = parseVisibleAgentDefinition(definitionPath, readFileSync(canonicalPath, "utf8"), {
+        kind: source === "package" ? "installed-package" : source === "global" ? "global-user" : "project",
+        canonicalPath, canonicalRoot,
+      });
+      const candidates = agents.get(parsed.name) ?? [];
+      candidates.push({ ...parsed, source });
+      agents.set(parsed.name, candidates);
     }
   }
-
-  return [...agents.values()];
+  return [...agents.values()].map(candidates => {
+    const selected = selectAgentDefinition(candidates.map(candidate => candidate.definition));
+    return candidates.find(candidate => candidate.definition === selected)!;
+  });
 }
 
 function normalizeOptionalString(value?: string): string | undefined {
@@ -461,19 +480,7 @@ function resolveEffectiveInteractive(
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-    join(getBundledAgentsDir(), `${agentName}.md`),
-  ];
-
-  for (const p of paths) {
-    if (!existsSync(p)) continue;
-    return parseVisibleAgentDefinition(p, readFileSync(p, "utf8"));
-  }
-
-  return null;
+  return discoverAgentDefinitions().find(agent => agent.name === agentName) ?? null;
 }
 
 function formatElapsed(seconds: number): string {
@@ -555,6 +562,8 @@ type PresentableResult = Pick<
   | "claudeSessionId"
   | "error"
   | "errorMessage"
+  | "runner"
+  | "projection"
 >;
 
 function describeResultPresentation(result: PresentableResult, name: string) {
@@ -585,6 +594,10 @@ function describeResultPresentation(result: PresentableResult, name: string) {
 }
 
 function resolveResultPresentation(result: PresentableResult, name: string): string {
+  if (result.runner === "copilot") {
+    return `Copilot job "${name}": ${result.projection?.disposition ?? "unconfirmed"}. ` +
+      `Task outcome is unknown; process completion is invocation evidence only.\n\n${result.summary}`;
+  }
   const sessionRef = result.sessionFile
     ? result.sessionFileExists === false
       ? `\n\nPlanned session (not created): ${result.sessionFile}`
@@ -626,6 +639,11 @@ function projectResultDetails(
     ...(result.failureContext ?? {}),
     ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+    ...(result.runner === "copilot" ? {
+      runner: result.runner, capabilities: copilotJobCapabilities, nativeReference: result.nativeReference,
+      hostEvidence: result.hostEvidence, projection: result.projection, completion: result.completion,
+      outputFile: result.outputFile, outputCapture: result.outputCapture,
+    } : {}),
   };
 }
 
@@ -633,6 +651,13 @@ function projectResultDetails(
  * Result from running a single subagent.
  */
 interface SubagentResult {
+  runner?: "copilot";
+  nativeReference?: ReturnType<typeof prepareNativeJob>["nativeReference"];
+  hostEvidence?: CoreHostRef & { terminal?: Awaited<ReturnType<typeof getCoreTerminal>> };
+  outputCapture?: { source: "core-screen"; lines: number; limitBytes: number; complete: boolean; truncated: boolean };
+  projection?: ReturnType<typeof projectAgentRunStatus>;
+  completion?: AgentRunCompletion;
+  outputFile?: string;
   name: string;
   task: string;
   summary: string;
@@ -668,6 +693,10 @@ interface RunningSubagent {
   agent?: string;
   surface: string;
   coreHost?: CoreHostRef;
+  nativeJob?: ReturnType<typeof prepareNativeJob>;
+  nativeState?: AgentRunState;
+  nativeSequence?: number;
+  nativeDefinition?: { origin: DefinitionOrigin; sha256: string };
   coreLaunchPending?: CoreLaunchUnconfirmed;
   coreCleanupPromise?: Promise<void>;
   coreCleanupError?: string;
@@ -769,7 +798,7 @@ function releaseRunningSubagent(id: string): boolean {
 async function launchOwnedCoreRun(
   prepared: Parameters<typeof launchPreparedCoreRun>[0],
   spec: Parameters<typeof launchPreparedCoreRun>[1],
-  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren"> & { artifactDir: string },
+  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren" | "cli" | "nativeJob" | "nativeState" | "nativeDefinition"> & { artifactDir: string },
 ): Promise<CoreHostRef> {
   const ownerSignal = getModuleAbortSignal();
   try { return await launchPreparedCoreRun(prepared, spec); }
@@ -1141,7 +1170,7 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
+  if (running.cli === "claude" || running.cli === "copilot") return;
 
   if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
     const completionStatus = observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
@@ -1268,14 +1297,14 @@ function handleSubagentInterrupt(
   if (running.coreLaunchPending && !running.coreHost) {
     return { content: [{ type: "text" as const, text: "Core launch is unconfirmed; its captured run must be reconciled during owned cleanup before controls can target a terminal." }], details: { error: "launch-unconfirmed", id: running.id } };
   }
-  if (running.cli === "claude") {
+  if (running.cli === "claude" || running.cli === "copilot") {
     return {
       content: [{
         type: "text" as const,
         text:
-          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
+          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Use subagent_terminate for a correlated hard stop of a native job.",
       }],
-      details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
+      details: { error: `${running.cli} interrupt unsupported`, id: running.id, name: running.name },
     };
   }
 
@@ -1567,6 +1596,7 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  prepareNativeJob,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -1635,7 +1665,41 @@ async function launchSubagent(
   const coreSelected = getMuxBackend() === "herdr-core";
   if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
   else if (params.resumeSessionId) throw new Error("resumeSessionId requires a Claude review agent");
-  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
+  if (agentDefs?.definition.runner === "copilot") {
+    if (!coreSelected) throw new Error("Copilot native jobs require the herdr-core backend; no fallback is available");
+    if (options?.surface) throw new Error("Copilot jobs cannot reuse a classic surface");
+    const managedSessionId = randomUUID();
+    const nativeJob = prepareNativeJob(agentDefs.definition, params, {
+      parentCwd: ctx.cwd, managedSessionId, nativeName: `pi-${managedSessionId}`, env: { ...process.env },
+    });
+    const parentSessionFile = ctx.sessionManager.getSessionFile();
+    if (!parentSessionFile) throw new Error("No session file");
+    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+    const prepared = await prepareCoreJobLaunch(params.name);
+    const launchScriptFile = join(artifactDir, "subagent-scripts", `${id}.copilot.sh`);
+    const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.native-start.json`);
+    const metadata = {
+      name: params.name, task: params.task, agent: params.agent, sessionFile: "", startTime,
+      canSpawnDirectChildren: false, artifactDir, cli: "copilot", nativeJob,
+      nativeState: createAgentRunState(id, "native-job"),
+      nativeDefinition: { origin: agentDefs.definition.origin!, sha256: createHash("sha256").update(readFileSync(agentDefs.definition.origin!.canonicalPath)).digest("hex") },
+    };
+    const coreHost = await launchOwnedCoreRun(prepared, {
+      runId: id, scriptPath: launchScriptFile, wrapperStartFile,
+      command: `exec ${nativeJob.argv.map(shellEscape).join(" ")}`,
+      cwd: nativeJob.cwd, agentDir: getAgentConfigDir(),
+      env: { HOME: process.env.HOME || homedir(), COPILOT_AUTO_UPDATE: "false" },
+    }, metadata);
+    return {
+      ...metadata, id, runId: id, coreHost, surface: coreHost.address, launchScriptFile,
+      transcriptStartLine: 0, interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+    };
+  }
+  // The legacy Claude review route is separate from the shared runner resolver.
+  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs?.cli === "claude"
+    ? { ...agentDefs, definition: { ...agentDefs.definition, metadata: { ...agentDefs.definition.metadata, cli: undefined } } }
+    : agentDefs, ctx.cwd);
   const claudeSystemPrompt = agentDefs?.cli === "claude"
     ? [launchIntent.effective.systemPrompt?.text, params.systemPrompt]
       .filter((text, index, all): text is string => !!text && all.indexOf(text) === index)
@@ -1930,6 +1994,82 @@ async function launchSubagent(
   return running;
 }
 
+function recordNativeEvidence(running: RunningSubagent, data: Record<string, unknown> & { kind: AgentRunEvidence["kind"] }) {
+  running.nativeState = reduceAgentRunEvidence(running.nativeState!, {
+    ...data, runId: running.runId, sourceId: "core-native-job", sequence: running.nativeSequence = (running.nativeSequence ?? 0) + 1,
+    observedAt: new Date().toISOString(),
+  } as AgentRunEvidence);
+}
+
+async function watchNativeSubagent(running: RunningSubagent, signal: AbortSignal, interval: number): Promise<SubagentResult> {
+  const host = running.coreHost!;
+  const combined = AbortSignal.any([signal, getModuleAbortSignal()]);
+  const outputFile = join(running.artifactDir!, "subagent-completion", `${running.runId}.native-output.txt`);
+  let output = "";
+  let observationError: string | undefined;
+  let outputCaptured = false;
+  let outputCapture: SubagentResult["outputCapture"];
+  let observedTerminal: Awaited<ReturnType<typeof getCoreTerminal>> | undefined;
+  recordNativeEvidence(running, { kind: "host-started", hostRef: host.address });
+  for (;;) {
+    try {
+      if (combined.aborted && !running.terminationRequestState) {
+        recordNativeEvidence(running, { kind: "interrupt-requested", mode: "process-abort" });
+        await killCoreTerminal(host);
+        running.terminationRequestState = "accepted";
+      }
+      if (running.terminationRequestedAt) recordNativeEvidence(running, { kind: "terminate-requested", mode: "core-terminal-kill" });
+      const terminal = observedTerminal = await getCoreTerminal(host);
+      if (terminal.state === "finished") {
+        if (terminal.reason !== "exit" && terminal.signal === null) {
+          recordNativeEvidence(running, { kind: "terminate-requested", mode: "core-terminal-kill" });
+        }
+        recordNativeEvidence(running, { kind: "process-exited", exit: { kind: "native", code: terminal.exit_code, signal: terminal.signal === null ? null : `SIG${terminal.signal}` } });
+        const screen = await readCoreScreen(host, 200);
+        const bytes = Buffer.from(screen.text);
+        let offset = Math.max(0, bytes.length - 64 * 1024);
+        while (offset < bytes.length && (bytes[offset] & 0xc0) === 0x80) offset++;
+        output = bytes.subarray(offset).toString("utf8");
+        outputCapture = { source: "core-screen", lines: 200, limitBytes: 64 * 1024, complete: screen.complete, truncated: Buffer.byteLength(screen.text) > 64 * 1024 };
+        mkdirSync(dirname(outputFile), { recursive: true, mode: 0o700 });
+        writeFileSync(outputFile, output, { mode: 0o600, flag: "wx" });
+        outputCaptured = true;
+        recordNativeEvidence(running, { kind: "job-output-captured", output });
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, interval));
+    } catch (error) {
+      if (error instanceof CoreRpcError && error.kind === "timeout") {
+        recordNativeEvidence(running, { kind: "request-timeout", operation: error.method, timeoutMs: error.method === "terminal.kill" ? 15000 : 5000 });
+        // Observation timeout is not process exit, cancellation, or permission to remove.
+        await new Promise(resolve => setTimeout(resolve, interval));
+        continue;
+      }
+      observationError = error instanceof Error ? error.message : String(error);
+      recordNativeEvidence(running, { kind: "transport-failed", message: observationError });
+      break;
+    }
+  }
+  const projection = projectAgentRunStatus(running.nativeState!);
+  const completion = projectAgentRunCompletion(running.nativeState!, { output });
+  if (projection.terminal && projection.disposition !== "pending") {
+    try {
+      await removeCoreTerminal(host);
+      running.coreCleanupPromise = Promise.resolve();
+      releaseRunningSubagent(running.id);
+    } catch (error) { observationError = recordCoreCleanupFailure(running, error); }
+  }
+  const exitCode = completion?.execution === "normal-exit" ? 0 : 1;
+  return {
+    name: running.name, task: running.task, runner: "copilot", nativeReference: running.nativeJob!.nativeReference,
+    hostEvidence: { ...host, terminal: observedTerminal }, projection, completion, outputCapture, outputFile: outputCaptured ? outputFile : undefined,
+    summary: output || (projection.terminal ? `Native job ${projection.disposition}` : "Native job observation is unconfirmed; the owned run remains registered. Do not retry its launch."),
+    exitCode, elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+    ...(observationError ? { errorMessage: observationError } : {}),
+    ...(completion?.execution === "terminated" ? { error: "terminated" } : completion?.execution === "aborted" ? { error: "cancelled" } : {}),
+  };
+}
+
 /** Watch a launched subagent until its foreground child has exited. */
 
 async function watchSubagent(
@@ -1943,6 +2083,7 @@ async function watchSubagent(
     processProbe?: (pid: number, signal: 0) => void;
   } = {},
 ): Promise<SubagentResult> {
+  if (running.cli === "copilot") return watchNativeSubagent(running, signal, dependencies.visibleInterval ?? 1000);
   const { name, task, surface, startTime, sessionFile } = running;
   const moduleSignal = getModuleAbortSignal();
   const waitForExit = dependencies.pollForExit ?? pollForExit;
@@ -2330,7 +2471,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.\n\n` +
                 `ID: ${running.id}\nSurface: ${running.surface}` +
-                (running.cli === "claude" ? "\nClaude session ID will be returned on completion." : `\nSession: ${running.sessionFile}`),
+                (running.cli === "copilot" ? `\nRunner: copilot\nManaged native session: ${running.nativeJob!.nativeReference.managedSessionId}` : running.cli === "claude" ? "\nClaude session ID will be returned on completion." : `\nSession: ${running.sessionFile}`),
             },
           ],
           details: {
@@ -2339,7 +2480,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: params.task,
             agent: params.agent,
             surface: running.surface,
-            ...(running.cli === "claude" ? {} : { sessionFile: running.sessionFile }),
+            ...(running.cli === "copilot" ? { runner: "copilot", capabilities: copilotJobCapabilities, nativeReference: running.nativeJob!.nativeReference, hostEvidence: running.coreHost } : running.cli === "claude" ? {} : { sessionFile: running.sessionFile }),
             launchScriptFile: running.launchScriptFile,
             status: "started",
           },

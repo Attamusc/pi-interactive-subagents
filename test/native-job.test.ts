@@ -1,0 +1,42 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import * as host from '../pi-extension/subagents/index.ts';
+const api = (host as any).__test__;
+const definition = { name: 'worker', runner: 'copilot', native: { runnerVersion: '1.0.106-3', workspaceTrust: 'session', allow: ['write'], deny: ['shell'], mcp: {} }, model: 'gpt-6.1-sol', thinking: 'low', metadata: { 'auto-exit': true, interactive: false } };
+
+test('native launch validates policy before executable lookup and freezes the actual child prefix', () => {
+  assert.equal(typeof api.prepareNativeJob, 'function', 'host exposes the native launch seam');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'copilot-fixture-')));
+  try {
+    const bin = join(root, 'bin'); mkdirSync(bin);
+    const executable = join(bin, 'copilot'); writeFileSync(executable, '#!/bin/sh\nexit 99\n', { mode: 0o700 });
+    const cache = join(root, '.copilot/pkg', `${process.platform}-${process.arch}`, '1.0.106-3'); mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' }));
+    writeFileSync(join(cache, 'app.js'), '');
+    const origin = { kind: 'global-user', canonicalPath: join(root, 'worker.md'), canonicalRoot: root };
+    const trusted = { ...definition, origin };
+    const params = { name: 'job', task: "hello ' $(touch /not-run)", interactive: false };
+    const context = { parentCwd: root, managedSessionId: 'managed-1', nativeName: 'unique-name', env: { PATH: bin, HOME: root, PI_TODO_PATH: '../tasks' } };
+    assert.throws(() => api.prepareNativeJob(definition, params, context), /origin|trusted/i);
+    assert.throws(() => api.prepareNativeJob(trusted, { ...params, fork: true }, context), /fork|standalone/i);
+    assert.throws(() => api.prepareNativeJob(trusted, { ...params, tools: 'read' }, context), /tools/i);
+    assert.throws(() => api.prepareNativeJob(trusted, { ...params, interactive: true }, context), /interactive/i);
+    assert.throws(() => api.prepareNativeJob({ ...trusted, native: { ...trusted.native, mcp: { tasks: { command: 'not-run', args: [] } } } }, params, context), /binding|MCP/i);
+    const plan = api.prepareNativeJob(trusted, params, context);
+    assert.deepEqual(plan.argv.slice(0, 5), ['/usr/bin/env', 'COPILOT_AUTO_UPDATE=false', executable, '--prefer-version', '1.0.106-3']);
+    assert.deepEqual(plan.argv.slice(-5), ['--name', 'unique-name', '--trust-folder', '--prompt', params.task]);
+    assert.ok(plan.argv.includes('--allow-tool=write'));
+    assert.ok(plan.argv.includes('--deny-tool=shell'));
+    assert.equal(plan.argv.includes('--resume'), false);
+    const existing = api.prepareNativeJob({ ...trusted, native: { ...trusted.native, workspaceTrust: 'existing' } }, params, context);
+    assert.equal(existing.argv.includes('--trust-folder'), false);
+    assert.throws(() => api.prepareNativeJob({ ...trusted, model: 'github-copilot/gpt-6.1-sol' }, params, context), /native model|provider/i);
+    assert.throws(() => api.prepareNativeJob({ ...trusted, tools: ['read'] }, params, context), /Pi tools/i);
+    assert.throws(() => api.prepareNativeJob({ ...trusted, native: { ...trusted.native, runnerVersion: '9.9.9' } }, params, context), /not cached|install.*explicit/i);
+    assert.equal(plan.context.env.PI_TODO_PATH, '../tasks');
+    assert.equal(api.prepareNativeJob(trusted, params, { ...context, env: { PATH: bin, HOME: root } }).context.env.PI_TODO_PATH, '');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

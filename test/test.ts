@@ -986,7 +986,7 @@ describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
   it("pins the supported shared execution contract and visible capability profile", () => {
-    assert.equal(contractVersion, 1);
+    assert.equal(contractVersion, 2);
     assert.deepEqual(testApi.visibleHerdrCapabilities, visibleHerdrCapabilities);
   });
 

@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,75 @@ import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts
 import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
 import { getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
 import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
+
+for (const scenario of [
+  { name: 'natural zero exit', exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
+  { name: 'bounded Unicode output', unicodeOutput: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
+  { name: 'bounded private output', longOutput: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
+  { name: 'observation timeout then natural exit', timeout: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
+  { name: 'abnormal exit', exit: { exit_code: 7, signal: null, reason: 'exit' }, disposition: 'abnormal-exit', exitCode: 1 },
+  { name: 'signal exit', exit: { exit_code: 0, signal: 9, reason: 'exit' }, disposition: 'abnormal-exit', exitCode: 1 },
+  { name: 'lost live observation', observationFailure: true, exit: null, disposition: 'transport-failed', exitCode: 1, terminal: false },
+  { name: 'missing output after exit', outputFailure: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'transport-failed', exitCode: 1 },
+  { name: 'cancelled parent', cancel: true, exit: null, disposition: 'aborted', exitCode: 1 },
+  { name: 'explicit termination', terminate: true, exit: null, disposition: 'terminated', exitCode: 1 },
+  { name: 'Core hard kill reporting zero', exit: { exit_code: 0, signal: null, reason: 'killed' }, disposition: 'terminated', exitCode: 1 },
+]) it(`launches a trusted native job before Pi seeding: ${scenario.name}`, async () => {
+  await coreFixture(async ({ dir, ctx, stateFile, requests }: any) => {
+    process.env.HOME = dir;
+    process.env.PI_TODO_PATH = '../explicit-tasks';
+    const cache = join(dir, '.copilot/pkg', `${process.platform}-${process.arch}`, '1.0.106-3');
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' }));
+    writeFileSync(join(cache, 'app.js'), '');
+    writeFileSync(join(dir, 'bin/copilot'), `#!${process.execPath}\nconsole.log(JSON.stringify({argv:process.argv.slice(2),autoUpdate:process.env.COPILOT_AUTO_UPDATE}));\n`, { mode: 0o700 });
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    writeFileSync(join(agents, 'native-worker.md'), '---\nname: native-worker\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: []\nnative-deny: []\nmodel: gpt-6.1-sol\nauto-exit: true\ninteractive: false\n---\nTrusted role');
+    const task = `Do work; $(touch '${join(dir, 'injection')}')`;
+    const running: any = await __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker' }, ctx);
+    try {
+      assert.equal(running.cli, 'copilot');
+      assert.equal(running.nativeJob.context.env.PI_TODO_PATH, '../explicit-tasks');
+      assert.equal(existsSync(running.sessionFile), false, 'no Pi transcript seeding');
+      const script = readFileSync(running.launchScriptFile, 'utf8');
+      assert.match(script, /COPILOT_AUTO_UPDATE=false/);
+      assert.match(script, /--prefer-version/);
+      assert.doesNotMatch(script, /PI_SUBAGENT_COMPLETION_FILE|--session /);
+      const child = JSON.parse(execFileSync('/bin/bash', [running.launchScriptFile], { encoding: 'utf8', env: { ...process.env, COPILOT_AUTO_UPDATE: 'true' } }));
+      assert.equal(child.autoUpdate, 'false');
+      assert.deepEqual(child.argv, running.nativeJob.argv.slice(3));
+      assert.equal(child.argv.at(-1), `Trusted role\n\n${task}`);
+      assert.equal(existsSync(join(dir, 'injection')), false);
+      const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+      writeFileSync(stateFile, JSON.stringify({ ...state, nativeExit: scenario.exit, nativeTimeoutOnce: scenario.timeout === true, nativeObservationFailure: scenario.observationFailure === true, nativeOutputFailure: scenario.outputFailure === true, nativeOutputLarge: scenario.longOutput === true, nativeOutputUnicode: scenario.unicodeOutput === true }));
+      __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
+      const controller = new AbortController();
+      if (scenario.cancel) controller.abort('fixture parent cancelled');
+      if (scenario.terminate) await __test__.handleSubagentTerminate({ id: running.id });
+      const result: any = await __test__.watchSubagent(running, controller.signal, { visibleInterval: 1 });
+      assert.equal(result.runner, 'copilot');
+      assert.equal(result.projection.taskOutcome, 'unknown');
+      assert.equal(result.completion?.settled ?? false, false);
+      assert.equal(result.projection.disposition, scenario.disposition);
+      assert.equal(result.exitCode, scenario.exitCode);
+      if (scenario.timeout) assert.deepEqual(result.completion.requestTimeout, { operation: 'terminal.get', timeoutMs: 5000 });
+      assert.equal(result.completion?.completionEvidence, scenario.disposition === 'completed' ? 'native-job-exit-output' : undefined);
+      const captured = !scenario.observationFailure && !scenario.outputFailure;
+      const expectedOutput = scenario.unicodeOutput ? '€'.repeat(Math.floor(64 * 1024 / 3)) : scenario.longOutput ? 'x'.repeat(64 * 1024) : 'partial';
+      if (captured) assert.equal(result.summary, expectedOutput);
+      assert.equal(result.projection.terminal, scenario.terminal !== false);
+      assert.equal(__test__.runningSubagents.has(running.id), scenario.terminal === false);
+      assert.equal(result.nativeReference.selector.value, running.nativeJob.nativeReference.selector.value);
+      if (captured) {
+        assert.equal(readFileSync(result.outputFile, 'utf8'), expectedOutput);
+        assert.equal(statSync(result.outputFile).mode & 0o777, 0o600);
+      } else assert.equal(result.outputFile, undefined);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.run').length, 1);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, scenario.cancel || scenario.terminate ? 1 : 0);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, scenario.terminal === false ? 0 : 1);
+    } finally { __test__.releaseRunningSubagent(running.id); }
+  });
+});
 
 it("selects explicit Core without classic fallback and requires inherited identity", () => {
   const saved = { ...process.env };
@@ -51,6 +121,19 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           if (request.params.terminal !== "t1" && JSON.parse(readFileSync(stateFile, "utf8")).missingChild) {
             socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture missing registry record", data: { kind: "not_found" } } }) + "\n"); return;
           }
+          if (request.params.terminal !== "t1") {
+            const state = JSON.parse(readFileSync(stateFile, "utf8"));
+            if (state.nativeObservationFailure) {
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation lost', data: { kind: 'busy' } } }) + '\n');
+              return;
+            }
+            if (state.nativeTimeoutOnce) {
+              writeFileSync(stateFile, JSON.stringify({ ...state, nativeTimeoutOnce: false }));
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation timeout', data: { kind: 'timeout' } } }) + '\n');
+              return;
+            }
+            if (state.nativeExit) child = { ...child, state: "finished", pid: null, ...state.nativeExit };
+          }
           result = request.params.terminal === "t1" ? parent : child; break;
         case "terminal.run":
           child = { address: "t2", state: "live", pid: 456, argv: request.params.argv, parent: "t1", labels: request.params.labels };
@@ -80,7 +163,12 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           }
           result = { removed: "t2" }; break;
         case "terminal.keys": result = { turn: 1 }; break;
-        case "terminal.read": result = { text: "partial", complete: true }; break;
+        case "terminal.read":
+          if (JSON.parse(readFileSync(stateFile, 'utf8')).nativeOutputFailure) {
+            socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture missing output', data: { kind: 'not_found' } } }) + '\n');
+            return;
+          }
+          result = { text: JSON.parse(readFileSync(stateFile, 'utf8')).nativeOutputUnicode ? '€'.repeat(33_334) : JSON.parse(readFileSync(stateFile, 'utf8')).nativeOutputLarge ? 'x'.repeat(100_000) : 'partial', complete: true }; break;
         default: throw new Error(`unexpected RPC ${request.method}`);
       }
       socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");

@@ -31,7 +31,8 @@ export function resolveParentPiRuntime() {
 }
 
 interface AppContext { home: string; env: NodeJS.ProcessEnv; placement?: { space: string; parentTab: string; parentPane: string } }
-export interface PreparedCoreLaunch { context: CoreContext; runtime: ReturnType<typeof resolveParentPiRuntime>; app: AppContext; title: string }
+export interface PreparedCoreJobLaunch { context: CoreContext; app: AppContext; title: string; runtime?: ReturnType<typeof resolveParentPiRuntime> }
+export interface PreparedCoreLaunch extends PreparedCoreJobLaunch { runtime: ReturnType<typeof resolveParentPiRuntime> }
 
 async function appCall(env: NodeJS.ProcessEnv, args: string[], timeout = 5000): Promise<any> {
   const { stdout } = await exec("herdr-app", args, { env, timeout, maxBuffer: 1024 * 1024, encoding: "utf8" });
@@ -56,18 +57,22 @@ function addressMatches(space: any, address: string): { tab: any; terminal: any 
 }
 
 export async function prepareCoreLaunch(name: string, interactive: boolean): Promise<PreparedCoreLaunch> {
+  const runtime = resolveParentPiRuntime();
+  return { ...await prepareCoreJobLaunch(name, interactive), runtime };
+}
+
+export async function prepareCoreJobLaunch(name: string, interactive = false): Promise<PreparedCoreJobLaunch> {
   const title = Array.from(stripVTControlCharacters(name)
     .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
     .replace(/\s+/g, " ").trim()).slice(0, 80).join("");
   if (!title) throw new Error("Core task title is empty after sanitization");
-  const runtime = resolveParentPiRuntime();
   const context = await resolveCoreContext();
   const env = { ...process.env };
   // Match herdr-app app_dir(): nonempty override, XDG config root, then ~/.config.
   const configHome = env.XDG_CONFIG_HOME || join(env.HOME ?? homedir(), ".config");
   const home = resolve(env.HERDR_APP_HOME || join(configHome, "herdr-app"));
   env.HERDR_APP_HOME = home;
-  if (!interactive) return { context, runtime, title, app: { home, env } };
+  if (!interactive) return { context, title, app: { home, env } };
   const spaceId = context.parentTerminal.labels["herdr.space"];
   const parentTab = context.parentTerminal.labels["herdr.tab"];
   if (!spaceId || !parentTab) throw new Error("Core parent must be adopted by herdr-app with space/tab labels");
@@ -79,10 +84,10 @@ export async function prepareCoreLaunch(name: string, interactive: boolean): Pro
   if (matches.length !== 1 || matches[0].tab.id !== parentTab || typeof matches[0].terminal.pane !== "string") {
     throw new Error("Herdr app parent address does not match its labeled tab");
   }
-  return { context, runtime, title, app: { home, env, placement: { space: spaceId, parentTab, parentPane: matches[0].terminal.pane } } };
+  return { context, title, app: { home, env, placement: { space: spaceId, parentTab, parentPane: matches[0].terminal.pane } } };
 }
 
-async function adoptCoreRun(prepared: PreparedCoreLaunch, host: CoreHostRef): Promise<void> {
+async function adoptCoreRun(prepared: PreparedCoreJobLaunch, host: CoreHostRef): Promise<void> {
   const { app } = prepared;
   if (!app.placement) return;
   const { space, parentTab, parentPane } = app.placement;
@@ -117,8 +122,9 @@ export class CoreSetupCleanupFailure extends Error {
   }
 }
 
-export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: {
+export async function launchPreparedCoreRun(prepared: PreparedCoreJobLaunch, spec: {
   runId: string; scriptPath: string; wrapperStartFile: string; command: string; cwd: string; agentDir: string;
+  env?: Record<string, string>;
 }): Promise<CoreHostRef> {
   mkdirSync(dirname(spec.scriptPath), { recursive: true });
   writeFileSync(spec.scriptPath, `#!/bin/bash\n${spec.command}\n`, { mode: 0o600, flag: "wx" });
@@ -128,10 +134,10 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   const host = await startCoreRun(prepared.context, {
     name, runId: spec.runId, scriptPath: spec.scriptPath,
     wrapperStartFile: spec.wrapperStartFile, cwd: spec.cwd,
-    env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, HERDR_APP_HOME: prepared.app.home },
+    env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, HERDR_APP_HOME: prepared.app.home, ...spec.env },
     labels: prepared.app.placement ? { "herdr.space": prepared.app.placement.space, "herdr.tab": prepared.app.placement.parentTab } : {},
   });
-  host.runtime = { ...prepared.runtime };
+  if (prepared.runtime) host.runtime = { ...prepared.runtime };
   try { await adoptCoreRun(prepared, host); }
   catch (error) {
     let killAccepted = false;
