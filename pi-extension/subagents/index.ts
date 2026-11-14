@@ -935,6 +935,10 @@ async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: s
         const deadline = nativeDeadline!;
         await withinNativeStopBudget(requestNativeStop(running, "terminate"), deadline);
         await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+        if (running.nativeState?.process.status !== "exited" && running.nativeHostTerminal?.state === "finished"
+          && running.coreKillAccepted && Date.now() < deadline) {
+          await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+        }
         if (running.nativeState?.process.status !== "exited") throw new Error("Native entry/Core closure remains unconfirmed; raw capture and owned Core record retained");
         running.coreCleanupStage = "remove";
         await withinNativeStopBudget(removeCoreTerminal(host), deadline);
@@ -2200,6 +2204,15 @@ function ensureNativeObservation(running: RunningSubagent): Promise<void> {
                 && (error as NodeJS.ErrnoException).path === running.nativeCapturePaths!.status;
               if (missingStoppedStatus || (!transientRead && ++captureFailures >= 3)) {
                 running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+                const probeDeadline = running.nativeStopDeadline ?? Date.now();
+                // Reaping can lag the Core reply: at most two 25ms re-probes of a known alive entry.
+                for (let retry = 0; missingStoppedStatus && running.nativeEntryProof.state === "alive" && retry < 2; retry++) {
+                  const remaining = probeDeadline - Date.now();
+                  if (remaining <= 0) break;
+                  await new Promise(resolve => setTimeout(resolve, Math.min(25, remaining)));
+                  if (Date.now() >= probeDeadline) break;
+                  running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+                }
                 try { running.nativePartialCapture = readNativePartialCapture(running.nativeCapturePaths!); } catch {}
                 if (running.nativeEntryProof.state === "absent") recordNativeClosure(running, terminal);
                 const message = `Capture status unconfirmed; native entry ${running.nativeEntryProof.pid ?? "unknown"} is ${running.nativeEntryProof.state}. Raw files retained: ${error instanceof Error ? error.message : String(error)}`;

@@ -41,6 +41,13 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
         if (state.preBusy-- > 0) return reject('busy');
         if (state.unreachable && state.kills > 0) return reject('transport');
         result = terminal();
+        if (state.delayReadMs) {
+          const delay = state.delayReadMs;
+          state.delayReadMs = 0;
+          state.readInFlight = true;
+          await wait(delay);
+          state.readInFlight = false;
+        }
       } else if (request.method === 'terminal.kill') {
         state.kills++;
         if (state.rejectKill-- > 0) return reject(state.rejectKind ?? 'busy');
@@ -48,7 +55,7 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
         if (wrapper) {
           if (state.wholeGroup) process.kill(-wrapper.pid!, 'SIGKILL'); else wrapper.kill('SIGKILL');
           state.realExit = await wrapperExit;
-          if (state.wholeGroup) for (let i = 0; i < 100 && probeNativeEntry(paths, runId).state !== 'absent'; i++) await wait(10);
+          if (state.wholeGroup && !state.replyBeforeEntryReap) for (let i = 0; i < 100 && probeNativeEntry(paths, runId).state !== 'absent'; i++) await wait(10);
         }
         if (!state.acceptedLive) { state.terminal = 'finished'; state.reason = 'killed'; }
         result = terminal();
@@ -202,7 +209,8 @@ test('shutdown detaches the existing observer with bounded uncertainty rather th
   assert.equal(state.removes, 0);
 }));
 
-for (const mode of ['whole-group', 'wrapper-only', 'missing-pid']) test(`ordinary session shutdown of real pipeline: ${mode}`, async () => fixture(async ({ running, state, paths, wrapper, dir, setPending }: any) => {
+for (const timing of ['ordinary session', 'production poll sleep', 'in-flight read', 'lagged entry reap'])
+for (const mode of timing === 'lagged entry reap' ? ['whole-group'] : ['whole-group', 'wrapper-only', 'missing-pid', 'EPERM']) test(`${timing} shutdown of real pipeline: ${mode}`, async () => fixture(async ({ running, state, paths, wrapper, dir, setPending }: any) => {
   state.wholeGroup = mode !== 'wrapper-only';
   const entry = JSON.parse(readFileSync(paths.status + '.entry.json', 'utf8'));
   if (mode === 'missing-pid') rmSync(paths.status + '.entry.json');
@@ -213,23 +221,62 @@ for (const mode of ['whole-group', 'wrapper-only', 'missing-pid']) test(`ordinar
   } as any);
   handlers.get('session_start')({}, { cwd: dir });
   running.abortController = new AbortController();
-  const watched = __test__.watchSubagent(running, running.abortController.signal, { visibleInterval: 2 });
+  running.nativeStopTimeoutMs = timing === 'ordinary session' ? 1500 : 10000;
+  if (timing === 'in-flight read') state.delayReadMs = 50;
+  if (timing === 'lagged entry reap') state.replyBeforeEntryReap = true;
+  let entryLagActive = false;
+  let entryLagTimer: ReturnType<typeof setTimeout> | undefined;
+  const watched = __test__.watchSubagent(running, running.abortController.signal, {
+    visibleInterval: timing === 'ordinary session' ? 2 : 1000,
+    processProbe(pid, signal) {
+      assert.equal(pid, entry.pid, 'only the correlated known entry is probed');
+      assert.equal(signal, 0, 'production boundary probes never terminate a PID');
+      if (mode === 'EPERM') throw Object.assign(new Error('fixture denied'), { code: 'EPERM' });
+      if (timing === 'lagged entry reap' && state.kills > 0 && state.terminal === 'finished') {
+        if (entryLagTimer === undefined) {
+          entryLagActive = true;
+          entryLagTimer = setTimeout(() => { entryLagActive = false; state.lagReleasedAt = Date.now(); }, 20);
+        }
+        if (entryLagActive) { state.lagInjectedProbes = (state.lagInjectedProbes ?? 0) + 1; return; }
+      }
+      process.kill(pid, signal);
+    },
+  });
+  if (timing === 'production poll sleep') {
+    for (let i = 0; i < 100 && state.gets < 1; i++) await wait(10);
+    assert.ok(state.gets >= 1, 'observer has read the live program');
+    await wait(50); // Exact parent repro: enter production's existing one-second sleep.
+  } else if (timing === 'in-flight read') {
+    for (let i = 0; i < 100 && !state.readInFlight; i++) await wait(1);
+    assert.equal(state.readInFlight, true, 'shutdown overlaps a delayed live read reply');
+  }
   const errors: string[] = [];
   const originalError = console.error;
   console.error = (...args: any[]) => { errors.push(args.join(' ')); };
   try {
+    const shutdownStarted = Date.now();
     const shutdown = handlers.get('session_shutdown')({ reason: 'quit' }, {});
+    const deadlineAtStop = running.nativeStopDeadline;
     setPending(Promise.all([watched, shutdown]));
     await shutdown;
     const result: any = await watched;
+    const shutdownElapsedMs = Date.now() - shutdownStarted;
+    assert.ok(shutdownElapsedMs < 2500, `shutdown stays near poll time, not the ten-second deadline: ${shutdownElapsedMs}ms`);
     assert.equal(state.kills, 1);
+    assert.equal(running.nativeStopDeadline, deadlineAtStop, 'proof does not extend the existing stop deadline');
     assert.equal(existsSync(paths.status), false, 'a real kill has no final capture status');
     assert.ok(result.outputCapture, 'shutdown preserves a truthful partial capture');
     assert.equal(result.outputCapture.complete, false);
     assert.equal(readFileSync(paths.stdout, 'utf8'), 'ready\n', 'shutdown retains raw current-job output');
     if (mode === 'whole-group') {
       assert.deepEqual(errors, [], 'reachable shutdown with entry absence must finish cleanup');
+      if (timing === 'lagged entry reap') {
+        assert.ok(state.lagInjectedProbes > 0, 'the OS-probe boundary first reports known entry alive');
+        assert.ok(state.lagReleasedAt !== undefined, 'closure waits for a new absence observation');
+        assert.ok(shutdownElapsedMs < 1000, 're-probe remains capped, not the ten-second stop budget');
+      }
       assert.equal(state.removes, 1);
+      if (timing === 'production poll sleep' || timing === 'in-flight read') assert.equal(state.gets, 4, 'fresh proof uses cached finish, not a new read RPC');
       assert.equal(__test__.runningSubagents.has(running.id), false);
       assert.equal(running.coreCleanupError, undefined);
       assert.equal(running.nativeEntryProof.state, 'absent');
@@ -237,6 +284,10 @@ for (const mode of ['whole-group', 'wrapper-only', 'missing-pid']) test(`ordinar
       assert.ok(['aborted', 'terminated'].includes(result.completion.execution));
       assert.equal(result.completion.taskOutcome, 'unknown');
       assert.equal(result.completion.completionEvidence, undefined);
+      // A partial-capture recovery receipt remains historical, not an active owner.
+      const recovery = JSON.parse(readFileSync(join(dir, 'subagent-completion', running.id + '.recovery.json'), 'utf8'));
+      assert.equal(recovery.runId, running.id);
+      assert.equal(recovery.childPid, entry.pid);
     } else {
       assert.ok(errors.length > 0);
       assert.equal(state.removes, 0);
@@ -245,17 +296,20 @@ for (const mode of ['whole-group', 'wrapper-only', 'missing-pid']) test(`ordinar
       assert.equal(result.projection.terminal, false);
       assert.equal(result.completion, undefined);
       assert.equal(running.nativeEntryProof.state, mode === 'wrapper-only' ? 'alive' : 'unconfirmed');
+      assert.equal(existsSync(join(dir, 'subagent-completion', running.id + '.recovery.json')), true);
     }
     if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
       const fs = await import('node:fs');
       fs.mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
-      fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, 'session-shutdown-' + mode + '.json'), JSON.stringify({ fixtureOnly: true, mode, wrapperPid: wrapper.pid, wrapperExit: state.realExit, entry,
-        entryProof: running.nativeEntryProof, kills: state.kills, removes: state.removes, cleanupErrors: errors,
+      fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, 'session-shutdown-' + timing.replaceAll(' ', '-') + '-' + mode + '.json'), JSON.stringify({ fixtureOnly: true, mode, timing, shutdownElapsedMs, lagInjectedProbes: state.lagInjectedProbes, replyBeforeEntryReap: state.replyBeforeEntryReap === true, readDelayed: timing === 'in-flight read', wrapperPid: wrapper.pid, wrapperExit: state.realExit, entry,
+        entryProof: running.nativeEntryProof, kills: state.kills, removes: state.removes, coreGets: state.gets, cleanupErrors: errors,
+        stopDeadlineUnchanged: running.nativeStopDeadline === deadlineAtStop, recoveryReceiptPresent: existsSync(join(dir, 'subagent-completion', running.id + '.recovery.json')),
         captureComplete: result.outputCapture.complete, process: running.nativeState.process, projection: result.projection,
         execution: result.completion?.execution, registered: __test__.runningSubagents.has(running.id) }, null, 2));
     }
   } finally {
     console.error = originalError;
+    clearTimeout(entryLagTimer);
     if (mode === 'missing-pid') writeFileSync(paths.status + '.entry.json', JSON.stringify(entry), { mode: 0o600 });
   }
 }, true));
