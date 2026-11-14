@@ -7,7 +7,7 @@ import { tmpdir, constants } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { createAgentRunState } from 'pi-agent-execution';
-import { __test__ } from '../pi-extension/subagents/index.ts';
+import subagentsExtension, { __test__ } from '../pi-extension/subagents/index.ts';
 import { createStatusState } from '../pi-extension/subagents/status.ts';
 import { buildNativeCaptureCommand, probeNativeEntry } from '../pi-extension/subagents/native-job.ts';
 
@@ -201,6 +201,64 @@ test('shutdown detaches the existing observer with bounded uncertainty rather th
   assert.equal(state.kills, 1);
   assert.equal(state.removes, 0);
 }));
+
+for (const mode of ['whole-group', 'wrapper-only', 'missing-pid']) test(`ordinary session shutdown of real pipeline: ${mode}`, async () => fixture(async ({ running, state, paths, wrapper, dir, setPending }: any) => {
+  state.wholeGroup = mode !== 'wrapper-only';
+  const entry = JSON.parse(readFileSync(paths.status + '.entry.json', 'utf8'));
+  if (mode === 'missing-pid') rmSync(paths.status + '.entry.json');
+  const handlers = new Map<string, any>();
+  subagentsExtension({
+    events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
+    registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getAllTools() { return []; },
+  } as any);
+  handlers.get('session_start')({}, { cwd: dir });
+  running.abortController = new AbortController();
+  const watched = __test__.watchSubagent(running, running.abortController.signal, { visibleInterval: 2 });
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: any[]) => { errors.push(args.join(' ')); };
+  try {
+    const shutdown = handlers.get('session_shutdown')({ reason: 'quit' }, {});
+    setPending(Promise.all([watched, shutdown]));
+    await shutdown;
+    const result: any = await watched;
+    assert.equal(state.kills, 1);
+    assert.equal(existsSync(paths.status), false, 'a real kill has no final capture status');
+    assert.ok(result.outputCapture, 'shutdown preserves a truthful partial capture');
+    assert.equal(result.outputCapture.complete, false);
+    assert.equal(readFileSync(paths.stdout, 'utf8'), 'ready\n', 'shutdown retains raw current-job output');
+    if (mode === 'whole-group') {
+      assert.deepEqual(errors, [], 'reachable shutdown with entry absence must finish cleanup');
+      assert.equal(state.removes, 1);
+      assert.equal(__test__.runningSubagents.has(running.id), false);
+      assert.equal(running.coreCleanupError, undefined);
+      assert.equal(running.nativeEntryProof.state, 'absent');
+      assert.equal(result.projection.terminal, true);
+      assert.ok(['aborted', 'terminated'].includes(result.completion.execution));
+      assert.equal(result.completion.taskOutcome, 'unknown');
+      assert.equal(result.completion.completionEvidence, undefined);
+    } else {
+      assert.ok(errors.length > 0);
+      assert.equal(state.removes, 0);
+      assert.equal(__test__.runningSubagents.has(running.id), true);
+      assert.notEqual(running.nativeState.process.status, 'exited');
+      assert.equal(result.projection.terminal, false);
+      assert.equal(result.completion, undefined);
+      assert.equal(running.nativeEntryProof.state, mode === 'wrapper-only' ? 'alive' : 'unconfirmed');
+    }
+    if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
+      const fs = await import('node:fs');
+      fs.mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
+      fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, 'session-shutdown-' + mode + '.json'), JSON.stringify({ fixtureOnly: true, mode, wrapperPid: wrapper.pid, wrapperExit: state.realExit, entry,
+        entryProof: running.nativeEntryProof, kills: state.kills, removes: state.removes, cleanupErrors: errors,
+        captureComplete: result.outputCapture.complete, process: running.nativeState.process, projection: result.projection,
+        execution: result.completion?.execution, registered: __test__.runningSubagents.has(running.id) }, null, 2));
+    }
+  } finally {
+    console.error = originalError;
+    if (mode === 'missing-pid') writeFileSync(paths.status + '.entry.json', JSON.stringify(entry), { mode: 0o600 });
+  }
+}, true));
 
 test('racing stop preserves already finished natural completion without a new control cause', async () => fixture(async ({ running, state }: any) => {
   state.terminal = 'finished';

@@ -1446,7 +1446,7 @@ async function handleSubagentTerminate(
       const capture = running.nativeCapture ?? running.nativePartialCapture;
       const captureText = capture?.capture.complete ? "Current-job capture is complete." : `Capture is incomplete/partial; raw stdout retained at ${running.nativeCapturePaths?.stdout}.`;
       return { content: [{ type: "text" as const, text: confirmed
-        ? `Native entry/pipeline and Core program closure confirmed for "${running.name}". Unrecorded detached descendants are not certified. ${captureText}`
+        ? `Native entry/pipeline and Core program closure confirmed for "${running.name}". Unrecorded descendants are not certified. ${captureText}`
         : "Native termination remains unconfirmed." }],
         details: { id: running.id, status: confirmed ? running.nativeState!.control.status === "none" ? "exited" : "terminated" : "termination_requested_unconfirmed", runner: "copilot",
           hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof }, outputFile: running.nativeCapturePaths?.stdout, outputCapture: capture?.capture } };
@@ -2195,7 +2195,10 @@ function ensureNativeObservation(running: RunningSubagent): Promise<void> {
             } catch (error) {
               running.nativeCapture = undefined;
               const transientRead = ["EIO", "EBUSY", "EAGAIN", "EINTR"].includes((error as NodeJS.ErrnoException).code ?? "");
-              if (!transientRead && ++captureFailures >= 3) {
+              const missingStoppedStatus = running.coreKillAccepted && running.nativeState!.control.status !== "none"
+                && (error as NodeJS.ErrnoException).code === "ENOENT"
+                && (error as NodeJS.ErrnoException).path === running.nativeCapturePaths!.status;
+              if (missingStoppedStatus || (!transientRead && ++captureFailures >= 3)) {
                 running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
                 try { running.nativePartialCapture = readNativePartialCapture(running.nativeCapturePaths!); } catch {}
                 if (running.nativeEntryProof.state === "absent") recordNativeClosure(running, terminal);
