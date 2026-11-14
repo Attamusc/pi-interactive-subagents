@@ -12,12 +12,12 @@ import { createStatusState } from '../pi-extension/subagents/status.ts';
 import { buildNativeCaptureCommand, probeNativeEntry } from '../pi-extension/subagents/native-job.ts';
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-async function fixture(fn: (f: any) => Promise<void>, live = false) {
+async function fixture(fn: (f: any) => Promise<void>, live = false, natural = false) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'native-stop-')));
   const runId = 'stop-fixture';
   const endpoint = join(dir, 'core.sock');
   const paths = { stdout: join(dir, 'stdout'), stderr: join(dir, 'stderr'), status: join(dir, 'status') };
-  const command = buildNativeCaptureCommand([process.execPath, '-e', live ? 'process.stdout.write("ready\\n");setInterval(()=>{},1000)' : 'process.stdout.write("partial")'], paths, runId);
+  const command = buildNativeCaptureCommand([process.execPath, '-e', live ? natural ? 'process.stdout.write("ready\\n");setTimeout(()=>{},100)' : 'process.stdout.write("ready\\n");setInterval(()=>{},1000)' : 'process.stdout.write("partial")'], paths, runId);
   const scriptPath = join(dir, 'capture.sh');
   writeFileSync(scriptPath, '#!/bin/bash\n' + command + '\n', { mode: 0o600 });
   const wrapper = live ? spawn('/bin/bash', [scriptPath], { detached: true, stdio: 'ignore' }) : undefined;
@@ -25,7 +25,7 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
   if (!wrapper) execFileSync('/bin/bash', ['-c', command]);
   const state: any = { preBusy: 0, rejectKill: 0, kills: 0, removes: 0, acceptedLive: false, unreachable: false, gets: 0, terminal: 'live', reason: 'exited' };
   const terminal = () => ({ address: 't2', parent: 't1', argv: ['/bin/bash', join(dir, 'capture.sh')], state: state.terminal, pid: wrapper?.pid ?? 12345,
-    labels: { 'pi.subagent.run': runId }, exit_code: state.terminal === 'finished' ? (state.realExit ? state.realExit[0] : 0) : null, signal: state.realExit?.[1] ? constants.signals[state.realExit[1] as keyof typeof constants.signals] : null, reason: state.terminal === 'finished' ? state.reason : null });
+    labels: { 'pi.subagent.run': runId }, exit_code: state.terminal === 'finished' ? (state.reportedExitCode ?? (state.realExit ? state.realExit[0] : 0)) : null, signal: state.realExit?.[1] ? constants.signals[state.realExit[1] as keyof typeof constants.signals] : null, reason: state.terminal === 'finished' ? state.reason : null });
   const server = createServer(socket => {
     socket.on('error', () => {});
     let buffer = '';
@@ -41,6 +41,13 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
         if (state.preBusy-- > 0) return reject('busy');
         if (state.unreachable && state.kills > 0) return reject('transport');
         result = terminal();
+        if (state.holdRead) {
+          const held = state.holdRead;
+          state.holdRead = undefined;
+          state.readInFlight = true;
+          await held;
+          state.readInFlight = false;
+        }
         if (state.delayReadMs) {
           const delay = state.delayReadMs;
           state.delayReadMs = 0;
@@ -52,7 +59,7 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
         state.kills++;
         if (state.rejectKill-- > 0) return reject(state.rejectKind ?? 'busy');
         if (state.ambiguousKill-- > 0) return reject('transport');
-        if (wrapper) {
+        if (wrapper && wrapper.exitCode === null && wrapper.signalCode === null) {
           if (state.wholeGroup) process.kill(-wrapper.pid!, 'SIGKILL'); else wrapper.kill('SIGKILL');
           state.realExit = await wrapperExit;
           if (state.wholeGroup && !state.replyBeforeEntryReap) for (let i = 0; i < 100 && probeNativeEntry(paths, runId).state !== 'absent'; i++) await wait(10);
@@ -78,7 +85,7 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
     }
     server.listen(endpoint); await once(server, 'listening');
     __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
-    await fn({ running, state, dir, paths, wrapper, setPending(p: Promise<any>) { pending = p; } });
+    await fn({ running, state, dir, paths, wrapper, wrapperExit, setPending(p: Promise<any>) { pending = p; } });
     if (state.evidenceName && process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
       const fs = await import('node:fs');
       fs.mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
@@ -92,10 +99,22 @@ async function fixture(fn: (f: any) => Promise<void>, live = false) {
     if (pending) await Promise.race([pending.catch(() => {}), wait(1000)]);
     __test__.releaseRunningSubagent(runId);
     if (wrapper) {
-      try { process.kill(-wrapper.pid!, 'SIGKILL'); } catch (error) { if ((error as any).code !== 'ESRCH') throw error; }
+      const before = probeNativeEntry(paths, runId); // Real probe; never the injected EPERM/lag boundary.
+      let cleanupGroupSignals = 0;
+      assert.notEqual(before.state, 'unconfirmed', `cannot establish correlated fixture entry for cleanup: ${before.reason}`);
+      if (before.state === 'alive') {
+        process.kill(-wrapper.pid!, 'SIGKILL');
+        cleanupGroupSignals++;
+      }
       await wrapperExit;
       for (let i = 0; i < 200 && probeNativeEntry(paths, runId).state !== 'absent'; i++) await wait(10);
       assert.equal(probeNativeEntry(paths, runId).state, 'absent', 'fixture entry cleanup is proven');
+      if (state.expectedCleanupSignals !== undefined) assert.equal(cleanupGroupSignals, state.expectedCleanupSignals, 'cleanup signals only a still-live correlated fixture group');
+      if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR && state.cleanupEvidenceName) {
+        const fs = await import('node:fs');
+        fs.mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
+        fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, state.cleanupEvidenceName + '-cleanup.json'), JSON.stringify({ fixtureOnly: true, wrapperPid: wrapper.pid, entryBefore: before, cleanupGroupSignals, entryAfter: probeNativeEntry(paths, runId) }, null, 2));
+      }
     }
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
@@ -146,6 +165,8 @@ test('native stop and shutdown are bounded when an accepted stop cannot be obser
 
 for (const wholeGroup of [false, true]) test(`real fake-native pipeline stop: ${wholeGroup ? 'whole group proves known entry absent' : 'wrapper only retains live native entry'}`, async () => fixture(async ({ running, state, paths, wrapper, dir }: any) => {
   state.wholeGroup = wholeGroup;
+  state.expectedCleanupSignals = wholeGroup ? 0 : 1;
+  state.cleanupEvidenceName = wholeGroup ? 'real-group-stop' : 'real-wrapper-stop';
   const entry = JSON.parse(readFileSync(paths.status + '.entry.json', 'utf8'));
   const result: any = await __test__.handleSubagentTerminate({ id: running.id });
   assert.equal(state.kills, 1);
@@ -212,8 +233,9 @@ test('shutdown detaches the existing observer with bounded uncertainty rather th
 for (const timing of ['ordinary session', 'production poll sleep', 'in-flight read', 'lagged entry reap'])
 for (const mode of timing === 'lagged entry reap' ? ['whole-group'] : ['whole-group', 'wrapper-only', 'missing-pid', 'EPERM']) test(`${timing} shutdown of real pipeline: ${mode}`, async () => fixture(async ({ running, state, paths, wrapper, dir, setPending }: any) => {
   state.wholeGroup = mode !== 'wrapper-only';
+  state.expectedCleanupSignals = mode === 'wrapper-only' ? 1 : 0;
+  state.cleanupEvidenceName = 'shutdown-' + timing.replaceAll(' ', '-') + '-' + mode;
   const entry = JSON.parse(readFileSync(paths.status + '.entry.json', 'utf8'));
-  if (mode === 'missing-pid') rmSync(paths.status + '.entry.json');
   const handlers = new Map<string, any>();
   subagentsExtension({
     events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
@@ -254,6 +276,7 @@ for (const mode of timing === 'lagged entry reap' ? ['whole-group'] : ['whole-gr
   const originalError = console.error;
   console.error = (...args: any[]) => { errors.push(args.join(' ')); };
   try {
+    if (mode === 'missing-pid') rmSync(paths.status + '.entry.json');
     const shutdownStarted = Date.now();
     const shutdown = handlers.get('session_shutdown')({ reason: 'quit' }, {});
     const deadlineAtStop = running.nativeStopDeadline;
@@ -313,6 +336,104 @@ for (const mode of timing === 'lagged entry reap' ? ['whole-group'] : ['whole-gr
     if (mode === 'missing-pid') writeFileSync(paths.status + '.entry.json', JSON.stringify(entry), { mode: 0o600 });
   }
 }, true));
+
+for (const scenario of [
+  { name: 'natural finish shutdown during production sleep', timing: 'sleep', reason: 'exited', valid: true },
+  { name: 'natural finish shutdown during in-flight read', timing: 'in-flight', reason: 'exited', valid: true },
+  { name: 'natural finish cached reason killed fails without success', timing: 'sleep', reason: 'killed', valid: false },
+  { name: 'natural finish cached reason null fails without success', timing: 'sleep', reason: null, valid: false },
+  { name: 'natural finish capture status mismatch stays unconfirmed', timing: 'sleep', reason: 'exited', mismatch: true, valid: false },
+]) test(scenario.name, async () => fixture(async ({ running, state, paths, wrapper, wrapperExit, dir, setPending }: any) => {
+  state.expectedCleanupSignals = 0;
+  state.cleanupEvidenceName = scenario.name.replaceAll(' ', '-');
+  const entry = JSON.parse(readFileSync(paths.status + '.entry.json', 'utf8'));
+  let releaseRead: (() => void) | undefined;
+  if (scenario.timing === 'in-flight') state.holdRead = new Promise<void>(resolve => { releaseRead = resolve; });
+  const handlers = new Map<string, any>();
+  subagentsExtension({
+    events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
+    registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getAllTools() { return []; },
+  } as any);
+  handlers.get('session_start')({}, { cwd: dir });
+  running.nativeStopTimeoutMs = 10000;
+  running.abortController = new AbortController();
+  const watched = __test__.watchSubagent(running, running.abortController.signal, { visibleInterval: 1000 });
+  setPending(watched);
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: any[]) => { errors.push(args.join(' ')); };
+  try {
+    for (let i = 0; i < 100 && state.gets < 1; i++) await wait(10);
+    assert.ok(state.gets >= 1, 'observer read begins while the real entry is alive');
+    assert.equal(probeNativeEntry(paths, running.runId).state, 'alive', 'real entry is still alive at the first live Core read');
+    if (scenario.timing === 'sleep') await wait(50);
+    else assert.equal(state.readInFlight, true);
+    state.realExit = await wrapperExit;
+    assert.deepEqual(state.realExit, [0, null], 'real pipeline finishes naturally');
+    assert.equal(existsSync(paths.status), true);
+    state.terminal = 'finished'; state.reason = scenario.reason;
+    if (scenario.mismatch) state.reportedExitCode = 7;
+    if (scenario.timing === 'in-flight') assert.equal(state.readInFlight, true, 'real natural exit occurs during delayed live reply');
+    const getsBeforeStop = state.gets;
+    const started = Date.now();
+    const shutdown = handlers.get('session_shutdown')({ reason: 'quit' }, {});
+    const deadlineAtStop = running.nativeStopDeadline;
+    setPending(Promise.all([watched, shutdown]));
+    if (scenario.timing === 'in-flight') {
+      for (let i = 0; i < 100 && running.nativeHostTerminal?.state !== 'finished'; i++) await wait(1);
+      assert.equal(running.nativeHostTerminal?.state, 'finished', 'stop read caches finished Core before the stale live reply');
+      releaseRead!();
+    }
+    await shutdown;
+    const result: any = await watched;
+    const elapsedMs = Date.now() - started;
+    assert.ok(elapsedMs < 2500);
+    assert.equal(state.kills, 0);
+    assert.equal(running.nativeState.control.status, 'none');
+    assert.equal(running.nativeStopDeadline, deadlineAtStop);
+    assert.equal(readFileSync(paths.stdout, 'utf8'), 'ready\n');
+    if (scenario.valid) {
+      assert.deepEqual(errors, [], 'natural finish during detached observation must close cleanly');
+      assert.equal(state.removes, 1);
+      assert.equal(__test__.runningSubagents.has(running.id), false);
+      assert.equal(running.coreCleanupError, undefined);
+      assert.equal(result.outputCapture.complete, true);
+      assert.equal(result.completion.execution, 'normal-exit');
+      assert.equal(result.completion.taskOutcome, 'unknown');
+      assert.equal(result.error, undefined);
+      assert.equal(result.projection.terminal, true);
+      assert.equal(state.gets, getsBeforeStop + 2, 'only stop read and removal verify Core; fresh proof has no get RPC');
+    } else if (scenario.mismatch) {
+      assert.ok(errors.length > 0);
+      assert.equal(state.removes, 0, 'status/Core mismatch remains owned');
+      assert.equal(__test__.runningSubagents.has(running.id), true);
+      assert.notEqual(result.completion?.execution, 'normal-exit');
+      assert.equal(existsSync(join(dir, 'subagent-completion', running.id + '.recovery.json')), true);
+    } else {
+      // Accepted full-capture semantics: unknown reason is a terminal failure, not success.
+      // The owner's first rejection may leave a historical warning before watcher cleanup.
+      assert.equal(state.removes, 1);
+      assert.equal(__test__.runningSubagents.has(running.id), false);
+      assert.equal(result.outputCapture.complete, true);
+      assert.equal(result.projection.disposition, 'transport-failed');
+      assert.equal(result.projection.terminal, true);
+      assert.equal(result.exitCode, 1);
+      assert.notEqual(result.completion.execution, 'normal-exit');
+      assert.equal(result.completion.completionEvidence, undefined);
+      assert.equal(result.completion.taskOutcome, 'unknown');
+    }
+    if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
+      const fs = await import('node:fs');
+      fs.mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
+      fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, state.cleanupEvidenceName + '.json'), JSON.stringify({ fixtureOnly: true, scenario: scenario.name, wrapperPid: wrapper.pid, wrapperExit: state.realExit, entry,
+        kills: state.kills, removes: state.removes, getsBeforeStop, getsAfterStop: state.gets, elapsedMs, cleanupErrors: errors,
+        control: running.nativeState.control, stopDeadlineUnchanged: running.nativeStopDeadline === deadlineAtStop,
+        captureComplete: result.outputCapture?.complete, execution: result.completion?.execution, exitCode: result.exitCode, error: result.error,
+        completionEvidence: result.completion?.completionEvidence, taskOutcome: result.completion?.taskOutcome, projection: result.projection,
+        registered: __test__.runningSubagents.has(running.id) }, null, 2));
+    }
+  } finally { releaseRead?.(); console.error = originalError; }
+}, true, true));
 
 test('racing stop preserves already finished natural completion without a new control cause', async () => fixture(async ({ running, state }: any) => {
   state.terminal = 'finished';

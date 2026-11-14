@@ -17,6 +17,7 @@ test('real long-running foreground pipeline distinguishes wrapper death from nat
   const wrapper = spawn('/bin/bash', ['-c', command], { detached: true, stdio: 'ignore' });
   const exited = once(wrapper, 'exit');
   let entry: any;
+  let groupStopProven = false;
   try {
     for (let i = 0; i < 200 && !existsSync(paths.status + '.entry.json'); i++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(existsSync(paths.status + '.entry.json'), true);
@@ -36,6 +37,7 @@ test('real long-running foreground pipeline distinguishes wrapper death from nat
     process.kill(-wrapper.pid!, 'SIGKILL'); // Only the detached group created above.
     for (let i = 0; i < 200 && api.probeNativeEntry(paths, 'live-fixture').state !== 'absent'; i++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(api.probeNativeEntry(paths, 'live-fixture').state, 'absent');
+    groupStopProven = true;
     assert.equal(existsSync(paths.status), false, 'a real kill has no completed capture status');
     const partial = api.readNativePartialCapture(paths);
     assert.equal(partial.capture.complete, false);
@@ -45,8 +47,22 @@ test('real long-running foreground pipeline distinguishes wrapper death from nat
       fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, 'real-pipeline.json'), JSON.stringify({ fixtureOnly: true, wrapperPid: wrapper.pid, entry, wrapperOnlyEntryState: 'alive', groupStopEntryState: api.probeNativeEntry(paths, 'live-fixture').state, captureStatusPresent: existsSync(paths.status) }, null, 2));
     }
   } finally {
-    try { process.kill(-wrapper.pid!, 'SIGKILL'); } catch (error) { if ((error as any).code !== 'ESRCH') throw error; }
+    const before = api.probeNativeEntry(paths, 'live-fixture');
+    let cleanupGroupSignals = 0;
+    assert.notEqual(before.state, 'unconfirmed', `cannot establish correlated fixture entry for cleanup: ${before.reason}`);
+    if (before.state === 'alive') {
+      process.kill(-wrapper.pid!, 'SIGKILL');
+      cleanupGroupSignals++;
+    }
     await exited;
+    for (let i = 0; i < 200 && api.probeNativeEntry(paths, 'live-fixture').state !== 'absent'; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(api.probeNativeEntry(paths, 'live-fixture').state, 'absent');
+    if (groupStopProven) assert.equal(cleanupGroupSignals, 0, 'proven stopped group is not signaled a second time');
+    if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
+      const fs = await import('node:fs');
+      fs.mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
+      fs.writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, 'real-pipeline-cleanup.json'), JSON.stringify({ fixtureOnly: true, entryBefore: before, cleanupGroupSignals, entryAfter: api.probeNativeEntry(paths, 'live-fixture') }, null, 2));
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });

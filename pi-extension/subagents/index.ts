@@ -936,7 +936,7 @@ async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: s
         await withinNativeStopBudget(requestNativeStop(running, "terminate"), deadline);
         await withinNativeStopBudget(ensureNativeObservation(running), deadline);
         if (running.nativeState?.process.status !== "exited" && running.nativeHostTerminal?.state === "finished"
-          && running.coreKillAccepted && Date.now() < deadline) {
+          && (running.coreKillAccepted || running.nativeHostTerminal.reason === "exited") && Date.now() < deadline) {
           await withinNativeStopBudget(ensureNativeObservation(running), deadline);
         }
         if (running.nativeState?.process.status !== "exited") throw new Error("Native entry/Core closure remains unconfirmed; raw capture and owned Core record retained");
