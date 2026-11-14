@@ -45,6 +45,23 @@ test('native launch validates policy before executable lookup and freezes the ac
     assert.throws(() => api.prepareNativeJob({ ...trusted, model: 'github-copilot/gpt-6.1-sol' }, params, context), /native model|provider/i);
     assert.throws(() => api.prepareNativeJob({ ...trusted, tools: ['read'] }, params, context), /Pi tools/i);
     assert.throws(() => api.prepareNativeJob({ ...trusted, native: { ...trusted.native, runnerVersion: '9.9.9' } }, params, context), /not cached|install.*explicit/i);
+    const taskPolicy = { ...trusted, native: { ...trusted.native, allow: ['write', 'shell', 'tasks(todo)'], deny: [], mcp: { tasks: {
+      command: '{node}', args: ['{home}/.local/bin/pi-agent-tasks-mcp', '--scope-cwd', '{parentCwd}', '--store-override={env.PI_TODO_PATH}', '--actor', '{managedSessionId}', '--actions', 'get,claim,update,append,release'], env: { HOME: '{home}' },
+    } } } };
+    const bound = api.prepareNativeJob(taskPolicy, params, { ...context, env: { PATH: bin, HOME: root, PI_TODO_PATH: '' } });
+    const config = JSON.parse(bound.argv[bound.argv.indexOf('--additional-mcp-config') + 1]);
+    assert.deepEqual(config.mcpServers.tasks, { type: 'local', command: process.execPath, args: [join(root, '.local/bin/pi-agent-tasks-mcp'), '--scope-cwd', root, '--store-override=', '--actor', 'managed-1', '--actions', 'get,claim,update,append,release'], env: { HOME: root }, tools: ['*'] });
+    assert.match(bound.argv.at(-1), /MCP server.*tasks.*todo/);
+    const readonly = api.prepareNativeJob({ ...taskPolicy, native: { ...taskPolicy.native, allow: ['tasks(todo)'], deny: ['write', 'shell'] } }, { ...params, task: 'Read again' }, { ...context, resume: true });
+    assert.ok(readonly.argv.includes('--deny-tool=write'));
+    assert.ok(readonly.argv.includes('--deny-tool=shell'));
+    assert.ok(!readonly.argv.includes('--allow-tool=write'));
+    assert.ok(!readonly.argv.includes('--name'));
+    assert.equal(readonly.argv[readonly.argv.indexOf('--resume') + 1], 'unique-name');
+    assert.throws(() => api.prepareNativeJob({ ...taskPolicy, native: { ...taskPolicy.native, mcp: {} } }, params, context), /required.*tasks|tasks.*binding/i);
+    assert.throws(() => api.prepareNativeJob(taskPolicy, params, { ...context, bindings: { parentCwd: '/wrong-scope', managedSessionId: 'managed-1', todoPathLiteral: '' } }), /scope mismatch/i);
+    assert.throws(() => api.prepareNativeJob({ ...trusted, skills: ['large'] }, params, { ...context, skills: [{ name: 'large', baseDir: root, body: 'x'.repeat(61 * 1024) }] }), /60 KiB|truncated/);
+    assert.throws(() => api.prepareNativeJob({ ...trusted, systemPrompt: { mode: 'replace', text: 'Not materializable' } }, params, context), /system-prompt mode/i);
     assert.equal(plan.context.env.PI_TODO_PATH, '../tasks');
     assert.equal(api.prepareNativeJob(trusted, params, { ...context, env: { PATH: bin, HOME: root } }).context.env.PI_TODO_PATH, '');
   } finally { rmSync(root, { recursive: true, force: true }); }

@@ -1,7 +1,7 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { requireTrustedNativeOrigin, type NormalizedAgentDefinition } from 'pi-agent-execution';
+import { bindNativeMcp, requireTrustedNativeOrigin, type NormalizedAgentDefinition, type NativeScopeBindings } from 'pi-agent-execution';
 import { shellEscape } from './cmux.ts';
 
 export interface NativeCapturePaths { stdout: string; stderr: string; status: string }
@@ -83,6 +83,9 @@ export interface NativeJobParams {
 export interface NativeHostContext {
   parentCwd: string; managedSessionId: string; nativeName: string;
   env: NodeJS.ProcessEnv;
+  skills?: readonly import('pi-agent-execution').NativeSkillSnapshot[];
+  bindings?: NativeScopeBindings;
+  resume?: boolean;
 }
 
 /** No native command is executed here. Authority and supported modes precede even lookup. */
@@ -102,17 +105,34 @@ export function prepareNativeJob(definition: NormalizedAgentDefinition, params: 
   if (definition.tools !== undefined || definition.metadata['deny-tools'] !== undefined || definition.metadata.spawning !== undefined) {
     throw new Error('Copilot jobs cannot enforce Pi tools/deny-tools/spawning controls; use native-allow/native-deny');
   }
-  if (definition.skills?.length) throw new Error('Copilot selected skills require trusted host skill bindings (not yet bound)');
-  if (Object.keys(policy.mcp).length) throw new Error('Copilot MCP declarations require host bindings before launch; unbound MCP policy is not executable');
+  if ((definition.skills ?? []).some((name, index) => context.skills?.[index]?.name !== name) || (context.skills?.length ?? 0) !== (definition.skills?.length ?? 0)) throw new Error('Copilot selected skills require trusted host skill bindings');
+  const bindings = context.bindings ?? { parentCwd: context.parentCwd, managedSessionId: context.managedSessionId, todoPathLiteral: context.env.PI_TODO_PATH ?? '' };
+  if (bindings.parentCwd !== context.parentCwd || bindings.managedSessionId !== context.managedSessionId) throw new Error('Native MCP binding scope mismatch');
+  const home = context.env.HOME || homedir();
+  const mcp = bindNativeMcp(policy, { ...bindings, home, node: process.execPath });
+  if (policy.allow.some(value => value.startsWith('tasks(')) && !mcp.tasks) throw new Error('Required tasks MCP binding is missing');
+  if (mcp.tasks) {
+    const args = mcp.tasks.args;
+    if (mcp.tasks.command !== process.execPath || mcp.tasks.env?.HOME !== home
+      || ['--scope-cwd', '--actor', '--actions'].some(flag => args.filter(arg => arg === flag).length !== 1)
+      || args[args.indexOf('--scope-cwd') + 1] !== bindings.parentCwd
+      || args.filter(arg => arg.startsWith('--store-override=')).length !== 1
+      || !args.includes(`--store-override=${bindings.todoPathLiteral}`)
+      || args[args.indexOf('--actor') + 1] !== bindings.managedSessionId
+      || !args[args.indexOf('--actions') + 1]?.trim()) throw new Error('Tasks MCP binding requires explicit host node/HOME, captured scope, store override, actor and actions');
+  }
+  const mcpConfig = Object.keys(mcp).length ? JSON.stringify({ mcpServers: Object.fromEntries(Object.entries(mcp).map(([name, server]) => [name, { type: 'local', ...server, tools: ['*'] }])) }) : undefined;
   if (definition.systemPrompt?.mode) throw new Error('Copilot cannot materialize Pi system-prompt modes; use the definition body as role instructions');
   if (!definition.model || definition.model.includes('/')) throw new Error('Copilot requires a native model name, not a provider-prefixed Pi model');
   if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(policy.runnerVersion)) throw new Error('Copilot requires an explicit cached runner-version');
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(context.nativeName)) throw new Error('Invalid host-owned native session name');
-  const prompt = [definition.systemPrompt?.text, params.task].filter(Boolean).join('\n\n');
+  const prompt = [definition.systemPrompt?.text,
+    mcp.tasks ? 'Binding hint: todo(...) examples refer to MCP server tasks, tool todo. Use only its declared actions.' : undefined,
+    ...(context.skills ?? []).map(skill => `Skill: ${skill.name}\nBase directory: ${skill.baseDir}\n${skill.body}`),
+    params.task].filter(Boolean).join('\n\n');
   if (Buffer.byteLength(prompt) > 60 * 1024 || prompt.includes('\0')) throw new Error('Copilot prompt exceeds 60 KiB or contains NUL; instructions were not truncated');
   const cwd = resolve(context.parentCwd, params.cwd?.trim() || definition.cwd || '.');
   if (!statSync(cwd).isDirectory()) throw new Error('Copilot cwd must be an existing directory');
-  const home = context.env.HOME || homedir();
   const cached = join(home, '.copilot', 'pkg', `${process.platform}-${process.arch}`, policy.runnerVersion);
   let manifest: any;
   try { manifest = JSON.parse(readFileSync(join(cached, 'package.json'), 'utf8')); accessSync(join(cached, 'app.js'), constants.R_OK); }
@@ -127,10 +147,12 @@ export function prepareNativeJob(definition: NormalizedAgentDefinition, params: 
     '--model', definition.model, ...(definition.thinking ? ['--reasoning-effort', definition.thinking === 'off' ? 'none' : definition.thinking] : []),
     '--silent', '--stream', 'off', '--no-color', '--output-format', 'text',
     ...policy.allow.map(value => `--allow-tool=${value}`), ...policy.deny.map(value => `--deny-tool=${value}`),
-    '--name', context.nativeName, ...(policy.workspaceTrust === 'session' ? ['--trust-folder'] : []), '--prompt', prompt];
+    ...(mcpConfig ? ['--additional-mcp-config', mcpConfig] : []),
+    context.resume ? '--resume' : '--name', context.nativeName, ...(!context.resume && policy.workspaceTrust === 'session' ? ['--trust-folder'] : []), '--prompt', prompt];
   return {
     argv, cwd,
     nativeReference: { runner: 'copilot' as const, selector: { kind: 'name' as const, value: context.nativeName }, managedSessionId: context.managedSessionId, cwd },
-    context: { parentCwd: context.parentCwd, managedSessionId: context.managedSessionId, env: { PI_TODO_PATH: context.env.PI_TODO_PATH ?? '' } },
+    context: { parentCwd: bindings.parentCwd, managedSessionId: bindings.managedSessionId, env: { PI_TODO_PATH: bindings.todoPathLiteral } },
+    skills: context.skills ?? [],
   };
 }

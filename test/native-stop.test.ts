@@ -241,7 +241,7 @@ for (const mode of timing === 'lagged entry reap' ? ['whole-group'] : ['whole-gr
     events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
     registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getAllTools() { return []; },
   } as any);
-  handlers.get('session_start')({}, { cwd: dir });
+  handlers.get('session_start')({}, { cwd: dir, sessionManager: { getBranch: () => [], getSessionId: () => 'fixture' } });
   running.abortController = new AbortController();
   running.nativeStopTimeoutMs = timing === 'ordinary session' ? 1500 : 10000;
   if (timing === 'in-flight read') state.delayReadMs = 50;
@@ -354,7 +354,7 @@ for (const scenario of [
     events: { emit() {}, on() { return () => {}; } }, on(name: string, handler: any) { handlers.set(name, handler); },
     registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getAllTools() { return []; },
   } as any);
-  handlers.get('session_start')({}, { cwd: dir });
+  handlers.get('session_start')({}, { cwd: dir, sessionManager: { getBranch: () => [], getSessionId: () => 'fixture' } });
   running.nativeStopTimeoutMs = 10000;
   running.abortController = new AbortController();
   const watched = __test__.watchSubagent(running, running.abortController.signal, { visibleInterval: 1000 });

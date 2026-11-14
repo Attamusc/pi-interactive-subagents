@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { execFileSync } from "node:child_process";
 import { createHash } from 'node:crypto';
 import assert from "node:assert/strict";
@@ -97,7 +98,7 @@ for (const scenario of [
       if (scenario.shutdown) assert.deepEqual(await __test__.shutdownOwnedSubagents('fixture'), []);
       const result: any = await watched;
       assert.equal(result.runner, 'copilot');
-      assert.equal(__test__.projectResultDetails(result, { name: 'Native', task }).capabilities.resume, 'unsupported');
+      assert.equal(__test__.projectResultDetails(result, { name: 'Native', task }).capabilities.resume, 'managed-native-name');
       assert.equal(result.projection.taskOutcome, 'unknown');
       if (scenario.reason === 'exited') assert.equal(result.hostEvidence.terminal.pid, 456, 'finished Core records may retain their original PID');
       assert.equal(requests.filter((r: any) => r.method === 'terminal.read').length, 0, 'screen completeness is not capture authority');
@@ -166,6 +167,174 @@ it("selects explicit Core without classic fallback and requires inherited identi
     assert.equal(getMuxBackend(), "herdr-core");
     assert.match(muxSetupHint(), /Core/);
   } finally { process.env = saved; }
+});
+
+for (const capturedOverride of ['../captured task store', '']) it(`registered native tools persist caller-branch authority and resume captured data (override=${JSON.stringify(capturedOverride)})`, async () => {
+  await coreFixture(async ({ dir, ctx, stateFile, requests }: any) => {
+    const originalCwd = process.cwd();
+    process.env.HOME = dir;
+    process.env.PI_TODO_PATH = capturedOverride;
+    const cache = join(dir, '.copilot/pkg', `${process.platform}-${process.arch}`, '1.0.106-3'); mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' })); writeFileSync(join(cache, 'app.js'), '');
+    const proof = join(dir, 'native-argv.json');
+    writeFileSync(join(dir, 'bin/copilot'), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.argv.slice(2)));console.log('owned native output');\n`, { mode: 0o700 });
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    const codingPath = join(agents, 'native-worker.md');
+    const policy = (name: string, readonly = false) => `---\nname: ${name}\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: ${readonly ? '["tasks(todo)"]' : '[write, shell, "tasks(todo)"]'}\nnative-deny: ${readonly ? '[write, shell]' : '[]'}\nmodel: gpt-6.1-sol\n${readonly ? '' : 'skills: selected\n'}auto-exit: true\ninteractive: false\nmcp:\n  tasks:\n    command: "{node}"\n    args: ["{home}/.local/bin/pi-agent-tasks-mcp", "--scope-cwd", "{parentCwd}", "--store-override={env.PI_TODO_PATH}", "--actor", "{managedSessionId}", "--actions", "${readonly ? 'get,list,list-all' : 'get,claim,update,append,release'}"]\n    env:\n      HOME: "{home}"\n---\n${readonly ? 'READ ONLY ROLE' : 'CODING ROLE'}`;
+    writeFileSync(codingPath, policy('native-worker'));
+    writeFileSync(join(agents, 'native-reader.md'), policy('native-reader', true));
+    const skillPath = join(process.env.PI_CODING_AGENT_DIR!, 'skills/selected/SKILL.md'); mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, 'ORIGINAL CANONICAL SKILL BYTES');
+    const caller = SessionManager.create(dir, join(dir, 'caller-sessions'));
+    const rootEntry = caller.appendCustomEntry('fixture-root', {});
+    const callerCtx = { ...ctx, sessionManager: caller };
+    const tools: any[] = [];
+    const handlers = new Map<string, any>();
+    const pi = { events: { emit() {} }, on(name: string, fn: any) { handlers.set(name, fn); }, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+      sendMessage() {},
+      appendEntry(type: string, data: unknown) { caller.appendCustomEntry(type, structuredClone(data)); },
+      getCommands() { return [{ name: 'skill:selected', source: 'skill', sourceInfo: { path: skillPath, baseDir: dirname(skillPath), scope: 'user', origin: 'top-level', source: 'auto' } }]; },
+    };
+    subagentsExtension(pi as any);
+    const launch = tools.find(t => t.name === 'subagent');
+    let resume = tools.find(t => t.name === 'subagent_resume');
+    const call = (tool: any, params: any, context = callerCtx) => tool.execute('fixture', params, undefined, undefined, context);
+    const records = () => caller.getBranch().filter((e: any) => e.type === 'custom' && e.customType === 'pi-interactive-subagents.native-session');
+    const complete = async () => {
+      const running: any = [...__test__.runningSubagents.values()][0];
+      assert.ok(running);
+      execFileSync('/bin/bash', [running.launchScriptFile], { env: { ...process.env, HOME: '/contradictory-child-home' } });
+      writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeExit: { exit_code: 0, signal: null, reason: 'exited' } }));
+      const deadline = Date.now() + 4000;
+      while (__test__.runningSubagents.has(running.id) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(__test__.runningSubagents.has(running.id), false);
+      assert.equal((records().at(-1) as any).data.state, 'closed');
+      return { running, argv: JSON.parse(readFileSync(proof, 'utf8')) };
+    };
+    try {
+      const first = await call(launch, { name: 'Native', task: 'First task', agent: 'native-worker' });
+      const managedSessionId = first.details.nativeReference.managedSessionId;
+      assert.equal(first.details.capabilities.resume, 'managed-native-name');
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Concurrent' }), /active|unconfirmed/i);
+      const one = await complete();
+      const closedLeaf = caller.getLeafId()!;
+      const firstRecord = structuredClone((records().at(-1) as any).data);
+      caller.branch(rootEntry);
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Abandoned branch' }), /unknown.*managed/i);
+      caller.branch(closedLeaf);
+      // A replacement extension runtime must restore the current caller branch,
+      // not rely on the original factory's record map.
+      tools.length = 0;
+      subagentsExtension(pi as any);
+      handlers.get('session_start')({}, callerCtx);
+      resume = tools.find(t => t.name === 'subagent_resume');
+      const foreign = { ...callerCtx, sessionManager: { getBranch: () => caller.getBranch(), getSessionId: () => 'another-caller' } };
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Foreign' }, foreign as any), /unknown.*managed/i);
+      await assert.rejects(() => call(resume, { managedSessionId, message: ' ', autoExit: true }), /follow.up message/i);
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'No', autoExit: false }), /autoExit/);
+      writeFileSync(skillPath, 'MUTATED SKILL MUST NOT REPLACE SNAPSHOT');
+      // A worker-controlled sidecar is not an authority source.
+      writeFileSync(join(dir, 'forged-native-snapshot.json'), JSON.stringify({ managedSessionId, command: '/forged', allow: ['*'] }));
+      delete process.env.PI_TODO_PATH;
+      const changedCwd = join(dir, 'other-parent-cwd'); mkdirSync(changedCwd);
+      process.chdir(changedCwd);
+      writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeExit: null }));
+      const next = await call(resume, { managedSessionId, message: 'Follow-up', agent: ' ', sessionPath: ' ' }, { ...callerCtx, cwd: changedCwd });
+      assert.equal(next.details.nativeReference.selector.value, first.details.nativeReference.selector.value);
+      const two = await complete();
+      assert.notEqual(two.running.runId, one.running.runId);
+      assert.ok(two.argv.includes('--resume'));
+      assert.ok(!two.argv.includes('--name'));
+      assert.ok(!two.argv.includes('--trust-folder'));
+      assert.match(two.argv.at(-1), /ORIGINAL CANONICAL SKILL BYTES/);
+      assert.doesNotMatch(two.argv.at(-1), /MUTATED/);
+      const mcp = JSON.parse(two.argv[two.argv.indexOf('--additional-mcp-config') + 1]).mcpServers.tasks;
+      assert.deepEqual(mcp.env, { HOME: dir });
+      assert.equal(mcp.command, process.execPath);
+      assert.ok(mcp.args.includes(`--store-override=${capturedOverride}`));
+      assert.equal(mcp.args.filter((arg: string) => arg.startsWith('--store-override=')).length, 1);
+      assert.equal(mcp.args[mcp.args.indexOf('--scope-cwd') + 1], dir);
+      assert.equal(mcp.args[mcp.args.indexOf('--actor') + 1], managedSessionId);
+      const before = requests.length;
+      writeFileSync(codingPath, policy('native-worker') + '\nChanged definition');
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Changed defaults' }), /definition changed/i);
+      assert.equal(requests.length, before);
+      writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeExit: null }));
+      await call(resume, { managedSessionId, agent: 'native-reader', message: 'Read only follow-up' });
+      const three = await complete();
+      assert.ok(three.argv.includes('--deny-tool=write')); assert.ok(three.argv.includes('--deny-tool=shell'));
+      assert.ok(!three.argv.includes('--allow-tool=write'));
+      assert.match(three.argv.at(-1), /READ ONLY ROLE/); assert.doesNotMatch(three.argv.at(-1), /CODING ROLE|ORIGINAL CANONICAL/);
+      const restricted = JSON.parse(three.argv[three.argv.indexOf('--additional-mcp-config') + 1]).mcpServers.tasks;
+      assert.equal(restricted.args.at(-1), 'get,list,list-all');
+      assert.deepEqual((records()[1] as any).data, firstRecord, 'original closed snapshot is immutable');
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.run').length, 3);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, 3);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, 0);
+      const beforeRejectedProfiles = requests.length;
+      const validLeaf = caller.getLeafId()!;
+      const lastRecord = structuredClone((records().at(-1) as any).data);
+      delete lastRecord.record.definitionOrigin;
+      caller.appendCustomEntry('pi-interactive-subagents.native-session', lastRecord);
+      await assert.rejects(() => call(resume, { managedSessionId, agent: 'native-reader', message: 'Missing origin' }), /invalid caller native session/i);
+      caller.branch(validLeaf);
+      rmSync(join(agents, 'native-reader.md'));
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Missing definition' }), /missing trusted native/i);
+      writeFileSync(join(agents, 'native-reader.md'), policy('native-reader', true));
+      const projectAgents = join(dir, '.pi/agents'); mkdirSync(projectAgents, { recursive: true });
+      writeFileSync(join(projectAgents, 'native-reader.md'), '---\nname: native-reader\n---\nProject shadow');
+      for (const agent of [undefined, 'native-reader']) await assert.rejects(() => call(resume, { managedSessionId, agent, message: 'Shadow must reject' }), /shadow/i);
+      writeFileSync(join(projectAgents, 'project-native.md'), policy('project-native', true));
+      await assert.rejects(() => call(resume, { managedSessionId, agent: 'project-native', message: 'Project policy must reject' }), /origin|trusted|project/i);
+      assert.equal(requests.length, beforeRejectedProfiles);
+      if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
+        mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
+        writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, capturedOverride ? 'managed-relative.json' : 'managed-empty.json'), JSON.stringify({ fixtureOnly: true, capturedOverride, managedSessionId, nativeName: first.details.nativeReference.selector.value,
+          runs: [one, two, three].map(({ running, argv }) => ({ runId: running.runId, argv, cwd: running.nativeJob.cwd, context: running.nativeJob.context })),
+          coreCalls: Object.fromEntries(['terminal.run', 'terminal.kill', 'terminal.rm'].map(method => [method, requests.filter((r: any) => r.method === method).length])),
+          callerEntries: records(), ownedResourcesRemaining: __test__.runningSubagents.size,
+        }, null, 2));
+      }
+    } finally {
+      process.chdir(originalCwd);
+      await handlers.get('session_shutdown')({ reason: 'fixture' }, callerCtx);
+    }
+  });
+});
+
+it('registered native resume accepts only one caller-owned reference and rejects paths/profiles before Core effects', async () => {
+  await coreFixture(async ({ ctx, requests }: any) => {
+    const tools: any[] = [];
+    subagentsExtension({ events: { emit() {} }, on() {}, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {} } as any);
+    const tool = tools.find(tool => tool.name === 'subagent_resume');
+    const caller = { ...ctx, sessionManager: { ...ctx.sessionManager, getBranch: () => [] } };
+    for (const params of [{}, { managedSessionId: 'unknown', sessionPath: '/also' }, { managedSessionId: 'unknown', command: 'forged' }, { managedSessionId: 'unknown', snapshotPath: '/forged' }, { managedSessionId: 'unknown', selector: 'history' }, { managedSessionId: 'unknown', grants: ['*'] }, { sessionPath: '/pi', agent: 'native' }]) {
+      await assert.rejects(() => tool.execute('invalid', params, undefined, undefined, caller), /exactly one|unknown.*field|native.only|agent.*native/i);
+    }
+    await assert.rejects(() => tool.execute('unknown', { managedSessionId: 'unknown', sessionPath: ' ', agent: ' ' }, undefined, undefined, caller), /unknown.*managed/i);
+    assert.equal(requests.length, 0);
+  });
+});
+
+it('registered native launch rejects a hidden project-package skill shadow before any Core RPC', async () => {
+  await coreFixture(async ({ dir, ctx, requests }: any) => {
+    process.env.HOME = dir;
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    writeFileSync(join(agents, 'native-worker.md'), '---\nname: native-worker\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: []\nnative-deny: []\nmodel: gpt-6.1-sol\nskills: collision\nauto-exit: true\ninteractive: false\n---\nTrusted role');
+    const globalSkill = join(process.env.PI_CODING_AGENT_DIR!, 'skills/collision/SKILL.md');
+    mkdirSync(dirname(globalSkill), { recursive: true });
+    writeFileSync(globalSkill, '---\nname: collision\ndescription: Fixture skill\n---\nTRUSTED BODY');
+    const pkg = join(dir, '.pi/npm/node_modules/shadow-package'); mkdirSync(join(pkg, 'skills/collision'), { recursive: true });
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'shadow-package', version: '1.0.0', pi: { skills: ['./skills'] } }));
+    writeFileSync(join(pkg, 'skills/collision/SKILL.md'), '---\nname: collision\ndescription: Project skill\n---\nPROJECT BODY');
+    writeFileSync(join(dir, '.pi/settings.json'), JSON.stringify({ packages: ['npm:shadow-package'] }));
+    const tools: any[] = [];
+    subagentsExtension({ events: { emit() {} }, on() {}, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+      getCommands() { return [{ name: 'skill:collision', source: 'skill', sourceInfo: { path: globalSkill, baseDir: dirname(globalSkill), scope: 'user', origin: 'top-level', source: 'auto' } }]; },
+    } as any);
+    await assert.rejects(() => tools.find(tool => tool.name === 'subagent').execute('shadow', { name: 'Native', task: 'Work', agent: 'native-worker' }, undefined, undefined, ctx), /project skill shadow/i);
+    assert.equal(requests.length, 0);
+  });
 });
 
 async function coreFixture(run: (fixture: any) => Promise<void>) {

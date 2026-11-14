@@ -2093,7 +2093,7 @@ describe("semantic Herdr blocked lifecycle", () => {
     const dir = createTestDir();
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
-    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false, sessionManager: { getBranch: () => [], getSessionId: () => 'fixture' } });
     const testApi = (subagentsModule as any).__test__;
     const paths = buildVisibleCompletionPaths(dir, "race");
     const sessionFile = join(dir, "race.jsonl");
@@ -2141,7 +2141,7 @@ describe("semantic Herdr blocked lifecycle", () => {
     const dir = createTestDir();
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
-    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false, sessionManager: { getBranch: () => [], getSessionId: () => 'fixture' } });
     const testApi = (subagentsModule as any).__test__;
     const paths = buildVisibleCompletionPaths(dir, "late-gone");
     const sessionFile = join(dir, "late-gone.jsonl");
@@ -2169,7 +2169,7 @@ describe("semantic Herdr blocked lifecycle", () => {
     const dir = createTestDir();
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
-    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false, sessionManager: { getBranch: () => [], getSessionId: () => 'fixture' } });
     const testApi = (subagentsModule as any).__test__;
     const paths = buildVisibleCompletionPaths(dir, "cancel");
     const sessionFile = join(dir, "cancel.jsonl");
@@ -2200,7 +2200,7 @@ describe("semantic Herdr blocked lifecycle", () => {
   it("surfaces fresh output-read failures through the production parent summary", async () => {
     const runtime = createMockExtensionApi();
     (subagentsModule as any).default(runtime.api);
-    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false });
+    runtime.registeredHandlers.get("session_start")![0]({}, { ui: {}, hasUI: false, sessionManager: { getBranch: () => [], getSessionId: () => 'fixture' } });
     const testApi = (subagentsModule as any).__test__;
     for (const variant of ["missing", "malformed"]) {
       const dir = createTestDir();

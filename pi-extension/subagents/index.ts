@@ -4,6 +4,8 @@ import { Type, type Static } from "@sinclair/typebox";
 import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
+  resolveManagedNativeResume,
+  type ManagedNativeSessionRecord,
   selectAgentDefinition,
   copilotJobCapabilities as sharedCopilotJobCapabilities,
   createAgentRunState,
@@ -52,8 +54,10 @@ import {
 } from "./cmux.ts";
 
 import { prepareCoreLaunch, prepareCoreJobLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
+import { resolveNativeSkills, assertNoNativeSkillShadows } from './native-skills.ts';
+import { nativeSessionRecords, NATIVE_SESSION_ENTRY, type NativeSessionEntry } from './native-session.ts';
 import { prepareNativeJob, buildNativeCaptureCommand, readNativeCapture, readNativePartialCapture, probeNativeEntry, type NativeEntryProof, type NativeCapturePaths } from "./native-job.ts";
-const copilotJobCapabilities = { ...sharedCopilotJobCapabilities, resume: "unsupported" as const };
+const copilotJobCapabilities = sharedCopilotJobCapabilities;
 import { getCoreTerminal, CoreRpcError, killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
 
 import {
@@ -502,8 +506,12 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  return discoverAgentDefinitions(undefined, agentName)[0] ?? null;
+function loadAgentDefaults(agentName: string, callerCwd?: string): AgentDefaults | null {
+  return discoverAgentDefinitions(callerCwd === undefined ? undefined : [
+    { path: getBundledAgentsDir(), source: 'package' },
+    { path: join(getAgentConfigDir(), 'agents'), source: 'global' },
+    { path: join(callerCwd, '.pi', 'agents'), source: 'project' },
+  ], agentName)[0] ?? null;
 }
 
 function formatElapsed(seconds: number): string {
@@ -745,6 +753,7 @@ interface RunningSubagent {
   nativeCaptureRead?: typeof readNativeCapture;
   nativePollInterval?: number;
   nativeDefinition?: { origin: DefinitionOrigin; sha256: string };
+  nativeOnClosed?: () => void;
   coreLaunchPending?: CoreLaunchUnconfirmed;
   coreCleanupPromise?: Promise<void>;
   coreCleanupError?: string;
@@ -835,6 +844,7 @@ function releaseRunningSubagent(id: string): boolean {
   const running = runningSubagents.get(id);
   if (!running) return false;
 
+  if (running.cli === 'copilot' && running.nativeState?.process.status === 'exited' && !running.coreCleanupError) running.nativeOnClosed?.();
   runningSubagents.delete(id);
   if (running.blockedEventBus) {
     emitHerdrBlocked(running.blockedEventBus, { active: false });
@@ -1749,25 +1759,37 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; skillCatalog?: ReturnType<ExtensionAPI['getCommands']>;
+    nativeResume?: ReturnType<typeof resolveManagedNativeResume>; nativeDefinition?: AgentDefaults;
+    nativeLifecycle?: (record: ManagedNativeSessionRecord, agent: string, runId: string) => () => void;
+  },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const agentDefs = options?.nativeDefinition ?? (params.agent ? loadAgentDefaults(params.agent) : null);
   const coreSelected = getMuxBackend() === "herdr-core";
   if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
   else if (normalizeOptionalString(params.resumeSessionId)) throw new Error("resumeSessionId requires a Claude review agent");
   if (agentDefs?.definition.runner === "copilot") {
     if (!coreSelected) throw new Error("Copilot native jobs require the herdr-core backend; no fallback is available");
     if (options?.surface) throw new Error("Copilot jobs cannot reuse a classic surface");
-    const managedSessionId = randomUUID();
-    const nativeJob = prepareNativeJob(agentDefs.definition, params, {
-      parentCwd: ctx.cwd, managedSessionId, nativeName: `pi-${managedSessionId}`, env: { ...process.env },
+    const resumed = options?.nativeResume;
+    const managedSessionId = resumed?.reference.managedSessionId ?? randomUUID();
+    const skills = resumed?.skills ?? await resolveNativeSkills(agentDefs.definition.skills ?? [], options?.skillCatalog ?? [], ctx.cwd, getAgentConfigDir());
+    const nativeJob = prepareNativeJob(agentDefs.definition, resumed ? { ...params, cwd: resumed.reference.cwd } : params, {
+      parentCwd: resumed?.bindings.parentCwd ?? ctx.cwd, managedSessionId,
+      nativeName: resumed?.reference.selector.value ?? `pi-${managedSessionId}`, env: { ...process.env }, skills,
+      bindings: resumed?.bindings, resume: !!resumed,
     });
     const parentSessionFile = ctx.sessionManager.getSessionFile();
     if (!parentSessionFile) throw new Error("No session file");
     const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+    const nativeOnClosed = options?.nativeLifecycle?.({
+      callerSessionId: ctx.sessionManager.getSessionId(), reference: nativeJob.nativeReference,
+      definitionOrigin: agentDefs.definition.origin!, definitionSha256: agentDefs.definitionSha256!,
+      bindings: { parentCwd: nativeJob.context.parentCwd, managedSessionId, todoPathLiteral: nativeJob.context.env.PI_TODO_PATH }, skills,
+    }, agentDefs.definition.name, id);
     const prepared = await prepareCoreJobLaunch(params.name);
     const launchScriptFile = join(artifactDir, "subagent-scripts", `${id}.copilot.sh`);
     const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.native-start.json`);
@@ -1779,7 +1801,7 @@ async function launchSubagent(
     mkdirSync(dirname(nativeCapturePaths.stdout), { recursive: true, mode: 0o700 });
     const metadata = {
       name: params.name, task: params.task, agent: params.agent, sessionFile: "", startTime,
-      canSpawnDirectChildren: false, artifactDir, cli: "copilot", nativeJob, nativeCapturePaths,
+      canSpawnDirectChildren: false, artifactDir, cli: "copilot", nativeJob, nativeCapturePaths, nativeOnClosed,
       nativeState: createAgentRunState(id, "native-job"),
       nativeDefinition: { origin: agentDefs.definition.origin!, sha256: agentDefs.definitionSha256! },
     };
@@ -2492,12 +2514,29 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  const managedNativeSessions = new Map<string, NativeSessionEntry>();
+  const nativeLifecycle = (record: ManagedNativeSessionRecord, agent: string, runId: string, ctx: ExtensionContext) => {
+    const entry: NativeSessionEntry = { version: 1, record: structuredClone(record), agent, runId, state: 'open' };
+    pi.appendEntry(NATIVE_SESSION_ENTRY, entry);
+    managedNativeSessions.set(record.reference.managedSessionId, entry);
+    return () => {
+      if (managedNativeSessions.get(record.reference.managedSessionId)?.runId !== runId) throw new Error('Native caller record changed during invocation');
+      const closed: NativeSessionEntry = { ...entry, state: 'closed' };
+      // Do not introduce abandoned-launch authority onto a different branch.
+      // A branch without this invocation retains no durable resume authority.
+      if (ctx.sessionManager.getSessionId() === record.callerSessionId
+        && nativeSessionRecords(ctx).get(record.reference.managedSessionId)?.runId === runId) pi.appendEntry(NATIVE_SESSION_ENTRY, closed);
+      managedNativeSessions.set(record.reference.managedSessionId, closed);
+    };
+  };
   // Cached extension modules are instantiated again after /new, /resume, and
   // /fork. The old runtime aborts its poll controller during session_shutdown;
   // re-arm it before the replacement runtime starts accepting tool calls.
   pi.on("session_start", (_event, ctx) => {
     ensureModuleAbortController();
     latestCtx = ctx;
+    managedNativeSessions.clear();
+    if (typeof ctx.sessionManager.getBranch === 'function') for (const [id, entry] of nativeSessionRecords(ctx)) managedNativeSessions.set(id, entry);
     sessionActive = true;
     setDirectChildCountProvider(() => runningSubagents.size + pendingOwnedLaunches);
   });
@@ -2597,7 +2636,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const finishOwnedLaunch = beginOwnedLaunch();
         let running: RunningSubagent;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchSubagent(params, ctx, { skillCatalog: pi.getCommands?.() ?? [], nativeLifecycle: (record, agent, runId) => nativeLifecycle(record, agent, runId, ctx) });
           registerRunningSubagent(pi, running);
         } finally {
           finishOwnedLaunch();
@@ -2922,21 +2961,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume Pi by sessionPath, or a closed caller-owned native conversation by managedSessionId (never a snapshot/history path). Native jobs require message and autoExit:true; agent selects a trusted native profile only. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume Pi by sessionPath, or a closed caller-owned native conversation by managedSessionId. Native requires a follow-up message; optional agent selects a trusted native profile, never grants or snapshot paths. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       parameters: Type.Object({
-        sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
+        sessionPath: Type.Optional(Type.String({ description: "Pi-only session .jsonl path; mutually exclusive with managedSessionId" })),
+        managedSessionId: Type.Optional(Type.String({ description: 'Caller-managed native session ID returned by a prior completed invocation' })),
+        agent: Type.Optional(Type.String({ description: 'Native-only trusted same-runner resume profile' })),
         name: Type.Optional(
           Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
         ),
@@ -2983,6 +3024,55 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        for (const key of Object.keys(params)) if (!['sessionPath', 'managedSessionId', 'agent', 'name', 'message', 'autoExit'].includes(key)) throw new Error(`Unknown resume field '${key}'`);
+        const managedSessionId = normalizeOptionalString(params.managedSessionId);
+        const sessionPath = normalizeOptionalString(params.sessionPath);
+        const agent = normalizeOptionalString(params.agent);
+        const message = normalizeOptionalString(params.message) ? params.message : undefined;
+        if (!!managedSessionId === !!sessionPath) throw new Error('Resume requires exactly one of managedSessionId or Pi sessionPath');
+        if (sessionPath && agent) throw new Error('agent is native-only; Pi file resumes retain their recorded policy');
+        if (managedSessionId) {
+          if (normalizeOptionalString(params.name)) throw new Error('Native resume accepts managedSessionId, agent, message and autoExit only');
+          if (params.autoExit === false) throw new Error('Copilot native resume requires autoExit:true');
+          const captured = nativeSessionRecords(ctx).get(managedSessionId);
+          if (!captured) throw new Error('Unknown caller-owned managed native session');
+          const active = managedNativeSessions.get(managedSessionId);
+          if (captured.state !== 'closed' || active?.state === 'open' || [...runningSubagents.values()].some(run => run.nativeJob?.nativeReference.managedSessionId === managedSessionId)) throw new Error('Managed native session invocation is active or closure/launch remains unconfirmed');
+          if (!message) throw new Error('Copilot headless resume requires a nonblank follow-up message before launch');
+          const reservation: NativeSessionEntry = { ...captured, state: 'open', runId: randomUUID() };
+          managedNativeSessions.set(managedSessionId, reservation);
+          try {
+            const selected = loadAgentDefaults(agent ?? captured.agent, ctx.cwd);
+            if (!selected || selected.definition.runner !== 'copilot' || !selected.definitionSha256) throw new Error('Missing trusted native resume definition; select an explicit trusted profile');
+            const skills = agent ? await resolveNativeSkills(selected.definition.skills ?? [], pi.getCommands(), ctx.cwd, getAgentConfigDir()) : undefined;
+            if (!agent) await assertNoNativeSkillShadows(captured.record.skills.map(skill => skill.name), ctx.cwd, getAgentConfigDir());
+            const resumed = resolveManagedNativeResume({ managedSessionId, ...(agent ? { agent } : {}), message, autoExit: true }, ctx.sessionManager.getSessionId(), [captured.record], {
+              definition: selected.definition, sha256: selected.definitionSha256, runtime: { home: process.env.HOME || homedir(), node: process.execPath }, skills,
+            });
+            const finishOwnedLaunch = beginOwnedLaunch();
+            let running: RunningSubagent;
+            try {
+              running = await launchSubagent({ name: 'Resume', task: message, agent: selected.definition.name }, ctx, {
+                nativeDefinition: selected, nativeResume: resumed,
+                nativeLifecycle: (record, agent, runId) => nativeLifecycle(record, agent, runId, ctx),
+              });
+              registerRunningSubagent(pi, running);
+            } finally { finishOwnedLaunch(); }
+            const watcher = new AbortController(); running.abortController = watcher;
+            watchSubagent(running, watcher.signal).then(result => sendIfActive(pi, {
+              customType: 'subagent_result', content: resolveResultPresentation(result, running.name), display: true,
+              details: projectResultDetails(result, { name: running.name, task: running.task, agent: running.agent }),
+            }, { triggerTurn: true, deliverAs: 'steer' })).catch(error => {
+              console.error(`Native resume observation failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
+            return { content: [{ type: 'text', text: `Native follow-up launched. Managed native session: ${managedSessionId}. Results will be delivered automatically; do not poll.` }],
+              details: { id: running.id, status: 'started', runner: 'copilot', capabilities: copilotJobCapabilities, nativeReference: running.nativeJob!.nativeReference, hostEvidence: running.coreHost } };
+          } finally {
+            if (managedNativeSessions.get(managedSessionId) === reservation) managedNativeSessions.set(managedSessionId, captured);
+          }
+        }
+        if (!sessionPath) throw new Error('Pi resume requires a sessionPath');
+        params = { ...params, message };
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -2992,10 +3082,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return muxUnavailableResult();
         }
 
-        if (!existsSync(params.sessionPath)) {
+        if (!existsSync(sessionPath)) {
           return {
             content: [
-              { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
+              { type: "text", text: `Error: session file not found: ${sessionPath}` },
             ],
             details: { error: "session not found" },
           };
@@ -3003,7 +3093,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         let resumePolicy: ResumePolicy;
         try {
-          resumePolicy = readResumePolicy(params.sessionPath);
+          resumePolicy = readResumePolicy(sessionPath);
         } catch (error) {
           return {
             content: [{
@@ -3027,7 +3117,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Record the raw nonempty-line offset before resuming so extraction only
         // sees transcript entries appended by this run.
-        const transcriptStartLine = countNonemptyLines(params.sessionPath);
+        const transcriptStartLine = countNonemptyLines(sessionPath);
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -3036,7 +3126,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build pi resume command from the immutable authority captured by the
         // original child process. Display name and auto-exit are run-local only.
-        const parts = [...(coreLaunch ? [shellEscape(coreLaunch.runtime.node), shellEscape(coreLaunch.runtime.script)] : ["pi"]), "--session", shellEscape(params.sessionPath)];
+        const parts = [...(coreLaunch ? [shellEscape(coreLaunch.runtime.node), shellEscape(coreLaunch.runtime.script)] : ["pi"]), "--session", shellEscape(sessionPath)];
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
         parts.push("--tools", shellEscape(resumePolicy.activeTools.join(",")));
@@ -3073,7 +3163,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumeEnvParts: string[] = [
           `PI_CODING_AGENT_DIR=${shellEscape(resumePolicy.agentDir)}`,
           `PI_SUBAGENT_NAME=${shellEscape(name)}`,
-          `PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`,
+          `PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`,
           `PI_SUBAGENT_ID=${shellEscape(id)}`,
           `PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`,
           `PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`,
@@ -3117,7 +3207,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               cwd: resumePolicy.cwd, agentDir: resumePolicy.agentDir,
             }, {
               name, task: params.message ?? "resumed session", agent: resumePolicy.agent ?? undefined,
-              sessionFile: params.sessionPath, artifactDir, startTime, canSpawnDirectChildren: resumePolicyCanSpawn(resumePolicy),
+              sessionFile: sessionPath, artifactDir, startTime, canSpawnDirectChildren: resumePolicyCanSpawn(resumePolicy),
             });
             surface = coreHost.address;
           } else await sendLongCommand(surface, command, {
@@ -3125,7 +3215,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             scriptPreamble: [
               `# Subagent resume script for ${name}`,
               `# Generated: ${new Date().toISOString()}`,
-              `# Session: ${params.sessionPath}`,
+              `# Session: ${sessionPath}`,
               `# Surface: ${surface}`,
               `# Agent: ${resumePolicy.agent ?? "unnamed"}`,
               `# Working directory: ${resumePolicy.cwd}`,
@@ -3147,8 +3237,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           agent: resumePolicy.agent ?? undefined,
           surface,
           startTime,
-          sessionFile: params.sessionPath,
-          piSessionRef: params.sessionPath,
+          sessionFile: sessionPath,
+          piSessionRef: sessionPath,
           coreHost,
           artifactDir,
           transcriptStartLine,
@@ -3189,7 +3279,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             updateWidget();
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              const sessionRef = `\n\nSession: ${sessionPath}\nResume: pi --session ${sessionPath}`;
               sendIfActive(pi,
                 {
                   customType: "subagent_ping",
@@ -3198,7 +3288,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   details: {
                     name: result.ping.name,
                     message: result.ping.message,
-                    sessionFile: params.sessionPath,
+                    sessionFile: sessionPath,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -3216,7 +3306,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: projectResultDetails(result, {
                   name,
                   task: params.message ?? "resumed session",
-                  sessionFile: params.sessionPath,
+                  sessionFile: sessionPath,
                 }),
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -3240,7 +3330,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: {
             id,
             name,
-            sessionPath: params.sessionPath,
+            sessionPath,
             agent: resumePolicy.agent ?? undefined,
             launchScriptFile,
             status: "started",
