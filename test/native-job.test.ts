@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as host from '../pi-extension/subagents/index.ts';
@@ -25,6 +25,15 @@ test('native launch validates policy before executable lookup and freezes the ac
     assert.throws(() => api.prepareNativeJob(trusted, { ...params, tools: 'read' }, context), /tools/i);
     assert.throws(() => api.prepareNativeJob(trusted, { ...params, interactive: true }, context), /interactive/i);
     assert.throws(() => api.prepareNativeJob({ ...trusted, native: { ...trusted.native, mcp: { tasks: { command: 'not-run', args: [] } } } }, params, context), /binding|MCP/i);
+    for (const key of ['tools', 'skills', 'model', 'thinking', 'systemPrompt', 'resumeSessionId']) {
+      assert.doesNotThrow(() => api.prepareNativeJob(trusted, { ...params, [key]: '   ' }, context));
+    }
+    assert.doesNotThrow(() => api.prepareNativeJob({ ...trusted, metadata: { ...trusted.metadata, 'session-mode': 'new' } }, params, context));
+    const off = api.prepareNativeJob({ ...trusted, thinking: 'off' }, params, context);
+    assert.equal(off.argv[off.argv.indexOf('--reasoning-effort') + 1], 'none');
+    const shimDir = join(root, 'shims'); mkdirSync(shimDir);
+    symlinkSync(executable, join(shimDir, 'copilot'));
+    assert.equal(api.prepareNativeJob(trusted, params, { ...context, env: { ...context.env, PATH: shimDir } }).argv[2], join(shimDir, 'copilot'));
     const plan = api.prepareNativeJob(trusted, params, context);
     assert.deepEqual(plan.argv.slice(0, 5), ['/usr/bin/env', 'COPILOT_AUTO_UPDATE=false', executable, '--prefer-version', '1.0.106-3']);
     assert.deepEqual(plan.argv.slice(-5), ['--name', 'unique-name', '--trust-folder', '--prompt', params.task]);

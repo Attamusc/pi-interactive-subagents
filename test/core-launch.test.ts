@@ -1,5 +1,6 @@
 import { it } from "node:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from 'node:crypto';
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,20 +12,31 @@ import { createChildCompletionRecorder } from "../pi-extension/subagents/complet
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
 import { getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
+import { readNativeCapture } from '../pi-extension/subagents/native-job.ts';
 import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
 
 for (const scenario of [
-  { name: 'natural zero exit', exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
-  { name: 'bounded Unicode output', unicodeOutput: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
-  { name: 'bounded private output', longOutput: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
-  { name: 'observation timeout then natural exit', timeout: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'completed', exitCode: 0 },
-  { name: 'abnormal exit', exit: { exit_code: 7, signal: null, reason: 'exit' }, disposition: 'abnormal-exit', exitCode: 1 },
-  { name: 'signal exit', exit: { exit_code: 0, signal: 9, reason: 'exit' }, disposition: 'abnormal-exit', exitCode: 1 },
-  { name: 'lost live observation', observationFailure: true, exit: null, disposition: 'transport-failed', exitCode: 1, terminal: false },
-  { name: 'missing output after exit', outputFailure: true, exit: { exit_code: 0, signal: null, reason: 'exit' }, disposition: 'transport-failed', exitCode: 1 },
-  { name: 'cancelled parent', cancel: true, exit: null, disposition: 'aborted', exitCode: 1 },
-  { name: 'explicit termination', terminate: true, exit: null, disposition: 'terminated', exitCode: 1 },
-  { name: 'Core hard kill reporting zero', exit: { exit_code: 0, signal: null, reason: 'killed' }, disposition: 'terminated', exitCode: 1 },
+  { name: 'natural zero exit', reason: 'exited', disposition: 'completed' },
+  { name: 'bounded Unicode output', unicodeOutput: true, reason: 'exited', disposition: 'completed' },
+  { name: 'complete private stdout beyond 200 lines', longOutput: true, reason: 'exited', disposition: 'completed' },
+  { name: 'observation timeout then natural exit', timeout: true, reason: 'exited', disposition: 'completed' },
+  { name: 'busy once then natural exit', transient: 'busy', reason: 'exited', disposition: 'completed' },
+  { name: 'transport once then natural exit', transient: 'transport', reason: 'exited', disposition: 'completed' },
+  { name: 'invalid reply once then natural exit', transient: 'invalid_reply', reason: 'exited', disposition: 'completed' },
+  { name: 'capture read once then natural exit', readOnce: true, reason: 'exited', disposition: 'completed' },
+  { name: 'five transient capture read failures', readFailures: 5, reason: 'exited', disposition: 'completed' },
+  { name: 'abnormal exit', code: 7, reason: 'exited', disposition: 'abnormal-exit' },
+  { name: 'signal exit', signal: 9, reason: 'exited', disposition: 'abnormal-exit' },
+  { name: 'lost live observation then explicit termination', observationFailure: true, disposition: 'transport-failed', terminal: false },
+  { name: 'missing capture status after exit', outputFailure: true, reason: 'exited', disposition: 'transport-failed', retained: true },
+  { name: 'cancelled parent', cancel: true, disposition: 'aborted' },
+  { name: 'explicit termination', terminate: true, disposition: 'terminated' },
+  { name: 'lost kill reply is not resent', killReplyLost: true, cancel: true, disposition: 'aborted' },
+  { name: 'concurrent abort and shutdown', shutdown: true, disposition: 'aborted' },
+  { name: 'cleanup failure visible', cleanupFailure: true, reason: 'exited', disposition: 'completed', retained: true },
+  { name: 'unknown Core reason', reason: 'unknown', disposition: 'transport-failed' },
+  { name: 'null Core reason', reason: null, disposition: 'transport-failed' },
+  { name: 'Core hard kill reporting zero', reason: 'killed', disposition: 'transport-failed' },
 ]) it(`launches a trusted native job before Pi seeding: ${scenario.name}`, async () => {
   await coreFixture(async ({ dir, ctx, stateFile, requests }: any) => {
     process.env.HOME = dir;
@@ -33,51 +45,111 @@ for (const scenario of [
     mkdirSync(cache, { recursive: true });
     writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' }));
     writeFileSync(join(cache, 'app.js'), '');
-    writeFileSync(join(dir, 'bin/copilot'), `#!${process.execPath}\nconsole.log(JSON.stringify({argv:process.argv.slice(2),autoUpdate:process.env.COPILOT_AUTO_UPDATE}));\n`, { mode: 0o700 });
+    const fullOutput = scenario.unicodeOutput ? '€'.repeat(33_334) : scenario.longOutput ? ('x'.repeat(1000) + '\n').repeat(400) : 'partial';
+    const proof = join(dir, 'argv-proof.json');
+    writeFileSync(join(dir, 'bin/copilot'), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify({argv:process.argv.slice(2),autoUpdate:process.env.COPILOT_AUTO_UPDATE}));process.stdout.write(${JSON.stringify(fullOutput)});process.stderr.write('private diagnostic');process.exitCode=${scenario.code ?? 0};\n`, { mode: 0o700 });
     const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
     writeFileSync(join(agents, 'native-worker.md'), '---\nname: native-worker\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: []\nnative-deny: []\nmodel: gpt-6.1-sol\nauto-exit: true\ninteractive: false\n---\nTrusted role');
     const task = `Do work; $(touch '${join(dir, 'injection')}')`;
-    const running: any = await __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker' }, ctx);
+    const parsedBytes = readFileSync(join(agents, 'native-worker.md'), 'utf8');
+    const launchCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionFile() {
+      writeFileSync(join(agents, 'native-worker.md'), parsedBytes.replace('Trusted role', 'Changed after parsing'));
+      return ctx.sessionManager.getSessionFile();
+    } } };
+    const running: any = await __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ', resumeSessionId: ' ' }, launchCtx);
     try {
       assert.equal(running.cli, 'copilot');
+      assert.equal(running.nativeDefinition.sha256, createHash('sha256').update(parsedBytes).digest('hex'));
       assert.equal(running.nativeJob.context.env.PI_TODO_PATH, '../explicit-tasks');
       assert.equal(existsSync(running.sessionFile), false, 'no Pi transcript seeding');
       const script = readFileSync(running.launchScriptFile, 'utf8');
       assert.match(script, /COPILOT_AUTO_UPDATE=false/);
       assert.match(script, /--prefer-version/);
       assert.doesNotMatch(script, /PI_SUBAGENT_COMPLETION_FILE|--session /);
-      const child = JSON.parse(execFileSync('/bin/bash', [running.launchScriptFile], { encoding: 'utf8', env: { ...process.env, COPILOT_AUTO_UPDATE: 'true' } }));
+      assert.ok(running.nativeCapturePaths, 'native stdout has an owned current-job capture');
+      try { execFileSync('/bin/bash', [running.launchScriptFile], { encoding: 'utf8', env: { ...process.env, COPILOT_AUTO_UPDATE: 'true' } }); }
+      catch (error) { if (!scenario.code) throw error; }
+      const child = JSON.parse(readFileSync(proof, 'utf8'));
       assert.equal(child.autoUpdate, 'false');
       assert.deepEqual(child.argv, running.nativeJob.argv.slice(3));
       assert.equal(child.argv.at(-1), `Trusted role\n\n${task}`);
       assert.equal(existsSync(join(dir, 'injection')), false);
       const state = JSON.parse(readFileSync(stateFile, 'utf8'));
-      writeFileSync(stateFile, JSON.stringify({ ...state, nativeExit: scenario.exit, nativeTimeoutOnce: scenario.timeout === true, nativeObservationFailure: scenario.observationFailure === true, nativeOutputFailure: scenario.outputFailure === true, nativeOutputLarge: scenario.longOutput === true, nativeOutputUnicode: scenario.unicodeOutput === true }));
+      writeFileSync(stateFile, JSON.stringify({ ...state,
+        nativeExit: scenario.reason !== undefined || scenario.reason === null ? { exit_code: scenario.code ?? 0, signal: scenario.signal ?? null, reason: scenario.reason } : null,
+        nativeTimeoutOnce: scenario.timeout === true, nativeTransientOnce: scenario.transient,
+        nativeObservationFailure: scenario.observationFailure === true, nativeKillReplyLost: scenario.killReplyLost === true, rmFails: scenario.cleanupFailure === true,
+      }));
+      if (scenario.outputFailure) rmSync(running.nativeCapturePaths.status);
       __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
       const controller = new AbortController();
+      running.abortController = controller;
       if (scenario.cancel) controller.abort('fixture parent cancelled');
-      if (scenario.terminate) await __test__.handleSubagentTerminate({ id: running.id });
-      const result: any = await __test__.watchSubagent(running, controller.signal, { visibleInterval: 1 });
+      if (scenario.terminate) {
+        const termination: any = await __test__.handleSubagentTerminate({ id: running.id });
+        assert.equal(termination.details.status, 'terminated');
+      }
+      let reads = 0;
+      const watched = __test__.watchSubagent(running, controller.signal, { visibleInterval: 1, nativeCaptureRead(paths: any, id: string) {
+        if (reads++ < (scenario.readFailures ?? (scenario.readOnce ? 1 : 0))) throw Object.assign(new Error('fixture transient capture read'), { code: 'EIO' });
+        return readNativeCapture(paths, id);
+      } });
+      if (scenario.shutdown) assert.deepEqual(await __test__.shutdownOwnedSubagents('fixture'), []);
+      const result: any = await watched;
       assert.equal(result.runner, 'copilot');
+      assert.equal(__test__.projectResultDetails(result, { name: 'Native', task }).capabilities.resume, 'unsupported');
       assert.equal(result.projection.taskOutcome, 'unknown');
+      if (scenario.reason === 'exited') assert.equal(result.hostEvidence.terminal.pid, 456, 'finished Core records may retain their original PID');
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.read').length, 0, 'screen completeness is not capture authority');
       assert.equal(result.completion?.settled ?? false, false);
       assert.equal(result.projection.disposition, scenario.disposition);
-      assert.equal(result.exitCode, scenario.exitCode);
+      assert.equal(result.exitCode, scenario.disposition === 'completed' ? 0 : 1);
       if (scenario.timeout) assert.deepEqual(result.completion.requestTimeout, { operation: 'terminal.get', timeoutMs: 5000 });
       assert.equal(result.completion?.completionEvidence, scenario.disposition === 'completed' ? 'native-job-exit-output' : undefined);
       const captured = !scenario.observationFailure && !scenario.outputFailure;
-      const expectedOutput = scenario.unicodeOutput ? '€'.repeat(Math.floor(64 * 1024 / 3)) : scenario.longOutput ? 'x'.repeat(64 * 1024) : 'partial';
-      if (captured) assert.equal(result.summary, expectedOutput);
+      if (captured) assert.ok(Buffer.byteLength(result.summary) <= 65536);
+      assert.equal(result.outputFile, running.nativeCapturePaths.stdout);
+      assert.equal(readFileSync(result.outputFile, 'utf8'), fullOutput);
       assert.equal(result.projection.terminal, scenario.terminal !== false);
-      assert.equal(__test__.runningSubagents.has(running.id), scenario.terminal === false);
+      assert.equal(__test__.runningSubagents.has(running.id), scenario.terminal === false || scenario.retained === true);
       assert.equal(result.nativeReference.selector.value, running.nativeJob.nativeReference.selector.value);
+      assert.equal(statSync(result.outputFile).mode & 0o777, 0o600);
       if (captured) {
-        assert.equal(readFileSync(result.outputFile, 'utf8'), expectedOutput);
-        assert.equal(statSync(result.outputFile).mode & 0o777, 0o600);
-      } else assert.equal(result.outputFile, undefined);
+        assert.equal(result.outputCapture.source, 'current-job-stdout');
+        const presentation = __test__.resolveResultPresentation(result, 'Native');
+        assert.ok(presentation.includes(result.outputFile));
+        assert.match(presentation, /private diagnostic/);
+        if (scenario.longOutput || scenario.unicodeOutput) assert.match(presentation, /truncated/i);
+        if (scenario.cleanupFailure) assert.match(presentation, /cleanup|fixture remove failure/i);
+      }
+      if (scenario.outputFailure) assert.notEqual(result.completion?.execution, 'normal-exit');
+      if (scenario.observationFailure) {
+        writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeObservationFailure: false }));
+        const terminated: any = await __test__.handleSubagentTerminate({ id: running.id });
+        assert.equal(terminated.details.status, 'terminated');
+        assert.equal(__test__.runningSubagents.has(running.id), false);
+      }
       assert.equal(requests.filter((r: any) => r.method === 'terminal.run').length, 1);
-      assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, scenario.cancel || scenario.terminate ? 1 : 0);
-      assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, scenario.terminal === false ? 0 : 1);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, scenario.cancel || scenario.terminate || scenario.shutdown || scenario.observationFailure ? 1 : 0);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, scenario.outputFailure ? 0 : 1);
+      if (scenario.cleanupFailure) {
+        writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), rmFails: false }));
+        assert.deepEqual(await __test__.shutdownOwnedSubagents('retry removal'), []);
+        assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, 0);
+        assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, 2);
+      }
+      const evidenceDir = process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR;
+      if (evidenceDir) {
+        mkdirSync(evidenceDir, { recursive: true });
+        writeFileSync(join(evidenceDir, scenario.name.replace(/[^a-z0-9]+/gi, '-') + '.json'), JSON.stringify({
+          fixtureOnly: true, scenario: scenario.name, invokedExecutable: running.nativeJob.argv[2], child,
+          launchRequest: requests.find((r: any) => r.method === 'terminal.run').params,
+          coreCalls: Object.fromEntries(['terminal.run', 'terminal.kill', 'terminal.rm'].map(method => [method, requests.filter((r: any) => r.method === method).length])),
+          hostEvidence: result.hostEvidence, projection: result.projection, capture: result.outputCapture,
+          rawStdoutBytes: statSync(result.outputFile).size, rawStdoutMode: statSync(result.outputFile).mode & 0o777,
+          registeredBeforeFixtureTeardown: __test__.runningSubagents.has(running.id),
+        }, null, 2));
+      }
     } finally { __test__.releaseRunningSubagent(running.id); }
   });
 });
@@ -124,7 +196,12 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           if (request.params.terminal !== "t1") {
             const state = JSON.parse(readFileSync(stateFile, "utf8"));
             if (state.nativeObservationFailure) {
-              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation lost', data: { kind: 'busy' } } }) + '\n');
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation lost', data: { kind: 'not_found' } } }) + '\n');
+              return;
+            }
+            if (state.nativeTransientOnce) {
+              writeFileSync(stateFile, JSON.stringify({ ...state, nativeTransientOnce: undefined }));
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture transient observation', data: { kind: state.nativeTransientOnce } } }) + '\n');
               return;
             }
             if (state.nativeTimeoutOnce) {
@@ -132,7 +209,7 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
               socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation timeout', data: { kind: 'timeout' } } }) + '\n');
               return;
             }
-            if (state.nativeExit) child = { ...child, state: "finished", pid: null, ...state.nativeExit };
+            if (state.nativeExit) child = { ...child, state: "finished", ...state.nativeExit };
           }
           result = request.params.terminal === "t1" ? parent : child; break;
         case "terminal.run":
@@ -153,6 +230,11 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           break;
         }
         case "terminal.kill":
+          if (JSON.parse(readFileSync(stateFile, 'utf8')).nativeKillReplyLost) {
+            child = { ...child, state: 'finished', exit_code: 143, signal: null, reason: 'killed' };
+            socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture lost kill reply', data: { kind: 'transport' } } }) + '\n');
+            return;
+          }
           if (JSON.parse(readFileSync(stateFile, "utf8")).killFails) {
             socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture kill failure", data: { kind: "busy" } } }) + "\n"); return;
           }

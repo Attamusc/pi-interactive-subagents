@@ -1,11 +1,58 @@
-import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, readFileSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { requireTrustedNativeOrigin, type NormalizedAgentDefinition } from 'pi-agent-execution';
+import { shellEscape } from './cmux.ts';
+
+export interface NativeCapturePaths { stdout: string; stderr: string; status: string }
+
+export function buildNativeCaptureCommand(argv: readonly string[], paths: NativeCapturePaths, runId: string): string {
+  const format = JSON.stringify({ runId, nativeExit: '%NATIVE%', captureExit: '%CAPTURE%' })
+    .replace('"%NATIVE%"', '%d').replace('"%CAPTURE%"', '%d') + '\\n';
+  return [
+    'umask 077', 'set -o pipefail', 'set -o noclobber',
+    `: > ${shellEscape(paths.stdout)} || exit 64`,
+    `: > ${shellEscape(paths.stderr)} || exit 64`,
+    `${argv.map(shellEscape).join(' ')} 2>> ${shellEscape(paths.stderr)} | /usr/bin/tee -a ${shellEscape(paths.stdout)}`,
+    'statuses=("${PIPESTATUS[@]}")',
+    `printf ${shellEscape(format)} "${'${statuses[0]}'}" "${'${statuses[1]}'}" > ${shellEscape(paths.status)} || exit 65`,
+    'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi',
+    'exit "${statuses[1]}"',
+  ].join('\n');
+}
+
+function readPrivateTail(path: string, limit: number) {
+  const fd = openSync(path, 'r');
+  try {
+    const bytes = fstatSync(fd).size;
+    const buffer = Buffer.alloc(Math.min(bytes, limit));
+    const count = readSync(fd, buffer, 0, buffer.length, Math.max(0, bytes - limit));
+    let offset = 0;
+    while (offset < count && (buffer[offset] & 0xc0) === 0x80) offset++;
+    return { text: buffer.subarray(offset, count).toString('utf8'), bytes, truncated: bytes > limit };
+  } finally { closeSync(fd); }
+}
+
+export function readNativeCapture(paths: NativeCapturePaths, runId: string) {
+  const status = JSON.parse(readFileSync(paths.status, 'utf8'));
+  if (status.runId !== runId || ![status.nativeExit, status.captureExit].every(value => Number.isInteger(value) && value >= 0 && value <= 255)) {
+    throw new Error('Uncorrelated or invalid native capture status');
+  }
+  if (status.captureExit !== 0) throw new Error(`Native stdout capture failed with status ${status.captureExit}`);
+  const stdout = readPrivateTail(paths.stdout, 64 * 1024);
+  const stderr = readPrivateTail(paths.stderr, 8 * 1024);
+  return {
+    output: stdout.text, diagnostic: stderr.text, nativeExit: status.nativeExit,
+    capture: { source: 'current-job-stdout' as const, path: paths.stdout, diagnosticPath: paths.stderr,
+      complete: true, bytes: stdout.bytes, limitBytes: 64 * 1024, truncated: stdout.truncated,
+      diagnosticBytes: stderr.bytes, diagnosticLimitBytes: 8 * 1024, diagnosticTruncated: stderr.truncated },
+  };
+}
+
 
 export interface NativeJobParams {
   name: string; task: string; interactive?: boolean; fork?: boolean;
-  sessionMode?: string; model?: string; thinking?: string; tools?: string;
+  model?: string; thinking?: string; tools?: string;
   skills?: string; systemPrompt?: string; cwd?: string; resumeSessionId?: string;
 }
 export interface NativeHostContext {
@@ -21,11 +68,11 @@ export function prepareNativeJob(definition: NormalizedAgentDefinition, params: 
   if (definition.metadata['auto-exit'] !== true || (params.interactive ?? definition.metadata.interactive ?? false) !== false) {
     throw new Error('Copilot jobs require auto-exit: true and interactive: false');
   }
-  if (params.fork || (params.sessionMode ?? definition.metadata['session-mode'] ?? 'standalone') !== 'standalone') {
-    throw new Error('Copilot jobs support standalone sessions only; fork and lineage modes require Pi');
+  if (params.fork || (definition.metadata['session-mode'] !== undefined && definition.metadata['session-mode'] !== 'new')) {
+    throw new Error('Copilot jobs support new sessions only; fork and lineage modes require Pi');
   }
   for (const key of ['tools', 'skills', 'model', 'thinking', 'systemPrompt', 'resumeSessionId'] as const) {
-    if (params[key] != null) throw new Error(`Copilot jobs do not accept ${key} overrides; select a trusted native definition`);
+    if (params[key]?.trim()) throw new Error(`Copilot jobs do not accept ${key} overrides; select a trusted native definition`);
   }
   if (definition.tools !== undefined || definition.metadata['deny-tools'] !== undefined || definition.metadata.spawning !== undefined) {
     throw new Error('Copilot jobs cannot enforce Pi tools/deny-tools/spawning controls; use native-allow/native-deny');
@@ -50,8 +97,9 @@ export function prepareNativeJob(definition: NormalizedAgentDefinition, params: 
     try { accessSync(path, constants.X_OK); return statSync(path).isFile(); } catch { return false; }
   });
   if (!executable) throw new Error('Copilot executable is not installed on the host PATH; no installation was attempted');
-  const argv = ['/usr/bin/env', 'COPILOT_AUTO_UPDATE=false', realpathSync(executable), '--prefer-version', policy.runnerVersion,
-    '--model', definition.model, ...(definition.thinking ? ['--reasoning-effort', definition.thinking] : []),
+  realpathSync(executable); // Validate the target, but preserve shim argv[0] dispatch.
+  const argv = ['/usr/bin/env', 'COPILOT_AUTO_UPDATE=false', executable, '--prefer-version', policy.runnerVersion,
+    '--model', definition.model, ...(definition.thinking ? ['--reasoning-effort', definition.thinking === 'off' ? 'none' : definition.thinking] : []),
     '--silent', '--stream', 'off', '--no-color', '--output-format', 'text',
     ...policy.allow.map(value => `--allow-tool=${value}`), ...policy.deny.map(value => `--deny-tool=${value}`),
     '--name', context.nativeName, ...(policy.workspaceTrust === 'session' ? ['--trust-folder'] : []), '--prompt', prompt];
