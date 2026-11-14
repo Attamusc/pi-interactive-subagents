@@ -52,7 +52,7 @@ import {
 } from "./cmux.ts";
 
 import { prepareCoreLaunch, prepareCoreJobLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
-import { prepareNativeJob, buildNativeCaptureCommand, readNativeCapture, type NativeCapturePaths } from "./native-job.ts";
+import { prepareNativeJob, buildNativeCaptureCommand, readNativeCapture, readNativePartialCapture, probeNativeEntry, type NativeEntryProof, type NativeCapturePaths } from "./native-job.ts";
 const copilotJobCapabilities = { ...sharedCopilotJobCapabilities, resume: "unsupported" as const };
 import { getCoreTerminal, CoreRpcError, killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
 
@@ -621,7 +621,8 @@ function describeResultPresentation(result: PresentableResult, name: string) {
 
 function resolveResultPresentation(result: PresentableResult, name: string): string {
   if (result.runner === "copilot") {
-    return `Copilot job "${name}": ${result.projection?.disposition ?? "unconfirmed"}. ` +
+    const disposition = result.projection?.terminal ? result.projection.disposition : `${result.projection?.disposition ?? "pending"} (closure unconfirmed; owner retained)`;
+    return `Copilot job "${name}": ${disposition}. ` +
       `Task outcome is unknown; process completion is invocation evidence only.\n` +
       `Capture: current-job-stdout; ${result.outputCapture?.complete ? "complete private file" : "unconfirmed"}; ` +
       `model view ${result.outputCapture ? result.outputCapture.truncated ? "truncated to 64 KiB" : "not truncated" : "unavailable"}.\n` +
@@ -685,7 +686,7 @@ interface SubagentResult {
   runner?: "copilot";
   nativeDiagnostics?: string;
   nativeReference?: ReturnType<typeof prepareNativeJob>["nativeReference"];
-  hostEvidence?: CoreHostRef & { terminal?: Awaited<ReturnType<typeof getCoreTerminal>> };
+  hostEvidence?: CoreHostRef & { terminal?: Awaited<ReturnType<typeof getCoreTerminal>>; nativeEntry?: NativeEntryProof };
   outputCapture?: ReturnType<typeof readNativeCapture>["capture"];
   projection?: ReturnType<typeof projectAgentRunStatus>;
   completion?: AgentRunCompletion;
@@ -732,6 +733,13 @@ interface RunningSubagent {
   nativeCapture?: ReturnType<typeof readNativeCapture>;
   nativeObservation?: Promise<void>;
   nativeControlPromise?: Promise<void>;
+  nativeKillAmbiguous?: boolean;
+  nativeStopDeadline?: number;
+  nativeStopTimeoutMs?: number;
+  nativeObserverDetached?: boolean;
+  nativeEntryProof?: NativeEntryProof;
+  nativeProcessProbe?: (pid: number, signal: 0) => void;
+  nativePartialCapture?: ReturnType<typeof readNativePartialCapture>;
   nativeHostTerminal?: Awaited<ReturnType<typeof getCoreTerminal>>;
   nativeDiagnostic?: string;
   nativeCaptureRead?: typeof readNativeCapture;
@@ -881,6 +889,9 @@ async function launchOwnedCoreRun(
 }
 
 function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): string {
+  if (running.cli === "copilot" && running.nativeCapturePaths) {
+    running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths, running.runId, running.nativeProcessProbe);
+  }
   const message = error instanceof Error ? error.message : String(error);
   let recovery = "";
   if ((running.coreHost || running.coreLaunchPending) && running.artifactDir) {
@@ -898,7 +909,7 @@ function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): str
       writeCoreRecoveryDescriptor(file, {
         runId: running.runId, endpoint: owner.endpoint, coreId: owner.coreId, parent: owner.parent, address: host?.address,
         wrapperPid: host?.wrapperPid ?? (startup?.ok ? startup.value.wrapperPid : undefined),
-        childPid: running.completionState?.childPid, script, wrapperStartFile, session: running.sessionFile,
+        childPid: running.cli === "copilot" ? running.nativeEntryProof?.pid : running.completionState?.childPid, script, wrapperStartFile, session: running.sessionFile,
         stage: running.coreCleanupStage ?? (host ? "kill" : "reconcile"), error: message,
       });
       recovery = `; recovery descriptor: ${file}`;
@@ -910,20 +921,23 @@ function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): str
 async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: string) => Promise<void> = closeSurface): Promise<void> {
   if (!running.coreHost && !running.coreLaunchPending) return classic(running.surface);
   if (!running.coreCleanupPromise) {
+    const nativeDeadline = running.cli === "copilot" ? nativeStopDeadline(running) : undefined;
     running.coreCleanupPromise = (async () => {
       if (!running.coreHost && running.coreLaunchPending) {
         running.coreCleanupStage = "reconcile";
-        running.coreHost = await reconcileCoreRun(running.coreLaunchPending);
+        const reconciliation = reconcileCoreRun(running.coreLaunchPending);
+        running.coreHost = nativeDeadline === undefined ? await reconciliation : await withinNativeStopBudget(reconciliation, nativeDeadline);
         if (!running.coreHost) { running.coreCleanupError = undefined; return; }
         running.surface = running.coreHost.address;
       }
       const host = running.coreHost!;
       if (running.cli === "copilot") {
-        await requestNativeStop(running, "terminate");
-        await ensureNativeObservation(running);
-        if (running.nativeState?.process.status !== "exited") throw new Error("Native exit remains unconfirmed; owned Core record retained");
+        const deadline = nativeDeadline!;
+        await withinNativeStopBudget(requestNativeStop(running, "terminate"), deadline);
+        await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+        if (running.nativeState?.process.status !== "exited") throw new Error("Native entry/Core closure remains unconfirmed; raw capture and owned Core record retained");
         running.coreCleanupStage = "remove";
-        await removeCoreTerminal(host);
+        await withinNativeStopBudget(removeCoreTerminal(host), deadline);
         running.coreCleanupError = undefined;
         return;
       }
@@ -950,6 +964,7 @@ async function shutdownOwnedSubagents(
 ): Promise<string[]> {
   const owned = [...runningSubagents.values()];
   for (const running of owned) {
+    if (running.cli === "copilot") { running.nativeObserverDetached = true; nativeStopDeadline(running); }
     running.abortController?.abort(`session_shutdown:${reason}`);
     if (!running.coreHost && !running.coreLaunchPending) releaseRunningSubagent(running.id);
   }
@@ -960,6 +975,10 @@ async function shutdownOwnedSubagents(
       if (running.coreHost || running.coreLaunchPending) releaseRunningSubagent(running.id);
     } catch (error) {
       failures.push(recordCoreCleanupFailure(running, error));
+    }
+    if (running.cli === "copilot" && running.nativeObservation) {
+      try { await withinNativeStopBudget(running.nativeObservation, running.nativeStopDeadline!); }
+      catch (error) { failures.push(recordCoreCleanupFailure(running, error)); }
     }
   }));
   return failures;
@@ -1419,15 +1438,23 @@ async function handleSubagentTerminate(
   }
   if (running.cli === "copilot") {
     try {
-      await requestNativeStop(running, "terminate");
-      await closeOwnedSubagent(running);
+      const deadline = nativeStopDeadline(running);
+      await withinNativeStopBudget(requestNativeStop(running, "terminate"), deadline);
+      await withinNativeStopBudget(closeOwnedSubagent(running), deadline);
       const confirmed = running.nativeState?.process.status === "exited";
       if (confirmed) releaseRunningSubagent(running.id);
-      return { content: [{ type: "text" as const, text: confirmed ? `Termination confirmed for native job "${running.name}".` : "Native termination remains unconfirmed." }],
-        details: { id: running.id, status: confirmed ? "terminated" : "termination_requested_unconfirmed", runner: "copilot", hostEvidence: running.coreHost } };
+      const capture = running.nativeCapture ?? running.nativePartialCapture;
+      const captureText = capture?.capture.complete ? "Current-job capture is complete." : `Capture is incomplete/partial; raw stdout retained at ${running.nativeCapturePaths?.stdout}.`;
+      return { content: [{ type: "text" as const, text: confirmed
+        ? `Native entry/pipeline and Core program closure confirmed for "${running.name}". Unrecorded detached descendants are not certified. ${captureText}`
+        : "Native termination remains unconfirmed." }],
+        details: { id: running.id, status: confirmed ? running.nativeState!.control.status === "none" ? "exited" : "terminated" : "termination_requested_unconfirmed", runner: "copilot",
+          hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof }, outputFile: running.nativeCapturePaths?.stdout, outputCapture: capture?.capture } };
     } catch (error) {
-      return { content: [{ type: "text" as const, text: `Native termination/cleanup unconfirmed: ${error instanceof Error ? error.message : String(error)}` }],
-        details: { id: running.id, error: "termination-unconfirmed" } };
+      running.nativeDiagnostic = recordCoreCleanupFailure(running, error);
+      return { content: [{ type: "text" as const, text: `Native termination/cleanup unconfirmed: ${running.nativeDiagnostic}` }],
+        details: { id: running.id, error: "termination-unconfirmed", hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof },
+          outputFile: running.nativeCapturePaths?.stdout, outputCapture: (running.nativeCapture ?? running.nativePartialCapture)?.capture } };
     }
   }
   const claudeGone = () => {
@@ -2070,27 +2097,62 @@ function recordNativeEvidence(running: RunningSubagent, data: Record<string, unk
 }
 
 function recordNativeExit(running: RunningSubagent, terminal: Awaited<ReturnType<typeof getCoreTerminal>>) {
-  running.nativeHostTerminal = terminal;
-  if (terminal.state !== "finished") return;
+  if (running.nativeHostTerminal?.state !== "finished" || terminal.state === "finished") running.nativeHostTerminal = terminal;
+}
+
+function recordNativeClosure(running: RunningSubagent, terminal: Awaited<ReturnType<typeof getCoreTerminal>>) {
   recordNativeEvidence(running, { kind: "process-exited", exit: { kind: "native", code: terminal.exit_code, signal: terminal.signal === null ? null : `SIG${terminal.signal}` } });
   if (terminal.reason !== "exited" && running.nativeState!.control.status === "none") {
     recordNativeEvidence(running, { kind: "transport-failed", message: `Core finished with unconfirmed exit reason: ${terminal.reason ?? "null"}` });
   }
 }
 
+function nativeStopDeadline(running: RunningSubagent): number {
+  if (!running.nativeStopDeadline || running.nativeStopDeadline <= Date.now()) {
+    running.nativeStopDeadline = Date.now() + (running.nativeStopTimeoutMs ?? 10_000);
+  }
+  return running.nativeStopDeadline;
+}
+
+async function withinNativeStopBudget<T>(operation: Promise<T>, deadline: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([operation, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Native stop observation budget expired; closure is unconfirmed")), Math.max(0, deadline - Date.now()));
+    })]);
+  } finally { clearTimeout(timer!); }
+}
+
 function requestNativeStop(running: RunningSubagent, cause: "abort" | "terminate"): Promise<void> {
-  if (running.nativeState?.process.status === "exited") return Promise.resolve();
+  if (running.nativeState?.process.status === "exited" || running.nativeKillAmbiguous) return Promise.resolve();
+  const deadline = nativeStopDeadline(running);
   if (!running.nativeControlPromise) {
-    recordNativeEvidence(running, cause === "abort" ? { kind: "interrupt-requested", mode: "process-abort" } : { kind: "terminate-requested", mode: "core-terminal-kill" });
+    const control = () => recordNativeEvidence(running, cause === "abort" ? { kind: "interrupt-requested", mode: "process-abort" } : { kind: "terminate-requested", mode: "core-terminal-kill" });
     running.nativeControlPromise = (async () => {
-      const current = await getCoreTerminal(running.coreHost!);
-      if (current.state === "finished") { recordNativeExit(running, current); return; }
-      if (running.coreKillAccepted) return;
-      // Retain this promise even on failure: a lost kill reply is not permission to resend.
-      const killed = await killCoreTerminal(running.coreHost!);
-      running.coreKillAccepted = true;
-      running.terminationRequestState = "accepted";
-      recordNativeExit(running, killed);
+      try {
+        const current = await getCoreTerminal(running.coreHost!);
+        if (current.state === "finished") { recordNativeExit(running, current); return; }
+        if (running.coreKillAccepted) return;
+        const killed = await killCoreTerminal(running.coreHost!, { skipFinished: true, beforeSend() {
+          if (Date.now() >= deadline) throw new CoreRpcError("terminal.kill", "not_sent", "stop deadline expired before kill submission");
+        } });
+        // A natural exit observed by the kill precheck is not a new control cause.
+        if (killed.reason !== "exited") {
+          control();
+          running.coreKillAccepted = true;
+          running.terminationRequestState = "accepted";
+        }
+        recordNativeExit(running, killed);
+      } catch (error) {
+        const ambiguousSentKill = error instanceof CoreRpcError && error.method === "terminal.kill" && error.requestSent
+          && !["busy", "rpc_error", "invalid_params", "not_found", "unsupported"].includes(error.kind);
+        if (ambiguousSentKill) { running.nativeKillAmbiguous = true; control(); }
+        else {
+          running.nativeControlPromise = undefined;
+          if (!running.nativeObserverDetached) running.nativeStopDeadline = undefined;
+        }
+        throw error;
+      }
     })();
   }
   return running.nativeControlPromise;
@@ -2100,10 +2162,21 @@ function ensureNativeObservation(running: RunningSubagent): Promise<void> {
   if (!running.nativeObservation) {
     running.nativeObservation = (async () => {
       let captureFailures = 0;
+      let observations = 0;
       if (running.nativeState!.process.status !== "exited") recordNativeEvidence(running, { kind: "host-started", hostRef: running.coreHost!.address });
       for (;;) {
+        if ((running.nativeObserverDetached && observations > 0) || (running.nativeStopDeadline !== undefined && Date.now() >= running.nativeStopDeadline)) {
+          running.nativeDiagnostic = recordCoreCleanupFailure(running, new Error("Native stop/observer teardown ended with unconfirmed entry/Core closure"));
+          return;
+        }
+        observations++;
         try {
-          const terminal = running.nativeHostTerminal?.state === "finished" ? running.nativeHostTerminal : await getCoreTerminal(running.coreHost!);
+          const detachedAtStart = running.nativeObserverDetached === true;
+          const terminal = running.nativeHostTerminal?.state === "finished" ? running.nativeHostTerminal : await getCoreTerminal(running.coreHost!, { beforeRead() {
+            if ((!detachedAtStart && running.nativeObserverDetached) || (running.nativeStopDeadline !== undefined && Date.now() >= running.nativeStopDeadline)) {
+              throw new CoreRpcError("terminal.get", "observer_stopped", "old native observer stopped before its next read");
+            }
+          } });
           recordNativeExit(running, terminal);
           if (terminal.state === "finished") {
             try {
@@ -2111,14 +2184,25 @@ function ensureNativeObservation(running: RunningSubagent): Promise<void> {
               if (terminal.reason === "exited" && terminal.signal === null && terminal.exit_code !== running.nativeCapture.nativeExit) {
                 throw new Error("Core exit and native capture status disagree");
               }
+              running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+              if (running.nativeState!.control.status !== "none" && running.nativeEntryProof.state !== "absent") {
+                running.nativeDiagnostic = recordCoreCleanupFailure(running, new Error(`Core wrapper finished but native entry ${running.nativeEntryProof.pid ?? "unknown"} remains ${running.nativeEntryProof.state}; closure unconfirmed`));
+                return;
+              }
+              recordNativeClosure(running, terminal);
               recordNativeEvidence(running, { kind: "job-output-captured", output: running.nativeCapture.output });
               return;
             } catch (error) {
               running.nativeCapture = undefined;
               const transientRead = ["EIO", "EBUSY", "EAGAIN", "EINTR"].includes((error as NodeJS.ErrnoException).code ?? "");
               if (!transientRead && ++captureFailures >= 3) {
-                running.nativeDiagnostic = `Current-job capture unconfirmed; retained raw files and Core record: ${error instanceof Error ? error.message : String(error)}`;
-                recordNativeEvidence(running, { kind: "transport-failed", message: running.nativeDiagnostic });
+                running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+                try { running.nativePartialCapture = readNativePartialCapture(running.nativeCapturePaths!); } catch {}
+                if (running.nativeEntryProof.state === "absent") recordNativeClosure(running, terminal);
+                const message = `Capture status unconfirmed; native entry ${running.nativeEntryProof.pid ?? "unknown"} is ${running.nativeEntryProof.state}. Raw files retained: ${error instanceof Error ? error.message : String(error)}`;
+                running.nativeDiagnostic = recordCoreCleanupFailure(running, new Error(message));
+                recordNativeEvidence(running, { kind: "transport-failed", message });
+                if (running.nativePartialCapture) recordNativeEvidence(running, { kind: "job-output-captured", output: running.nativePartialCapture.output });
                 return;
               }
             }
@@ -2133,7 +2217,10 @@ function ensureNativeObservation(running: RunningSubagent): Promise<void> {
           if (error instanceof CoreRpcError && error.kind === "timeout") recordNativeEvidence(running, { kind: "request-timeout", operation: error.method, timeoutMs: 5000 });
           // Busy, transport and malformed replies are observation loss, not process exit.
         }
-        await new Promise(resolve => setTimeout(resolve, running.nativePollInterval ?? 1000));
+        if (!running.nativeObserverDetached) {
+          const remaining = running.nativeStopDeadline === undefined ? Infinity : Math.max(0, running.nativeStopDeadline - Date.now());
+          await new Promise(resolve => setTimeout(resolve, Math.min(running.nativePollInterval ?? 1000, remaining)));
+        }
       }
     })().finally(() => {
       if (running.nativeState!.process.status !== "exited") running.nativeObservation = undefined;
@@ -2144,25 +2231,37 @@ function ensureNativeObservation(running: RunningSubagent): Promise<void> {
 
 async function watchNativeSubagent(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult> {
   const combined = AbortSignal.any([signal, getModuleAbortSignal()]);
-  const stop = () => { void requestNativeStop(running, "abort").catch(error => { running.nativeDiagnostic = `Native stop unconfirmed: ${error.message}`; }); };
+  const stop = () => {
+    if (getModuleAbortSignal().aborted) running.nativeObserverDetached = true;
+    void requestNativeStop(running, "abort").catch(error => { running.nativeDiagnostic = recordCoreCleanupFailure(running, error); });
+  };
   if (combined.aborted) stop(); else combined.addEventListener("abort", stop, { once: true });
-  try { await ensureNativeObservation(running); }
-  finally { combined.removeEventListener("abort", stop); }
+  try {
+    await ensureNativeObservation(running);
+    if (running.nativeObserverDetached && running.nativeControlPromise && running.nativeState!.process.status !== "exited") {
+      try {
+        const deadline = running.nativeStopDeadline!;
+        await withinNativeStopBudget(running.nativeControlPromise, deadline);
+        await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+      } catch (error) { running.nativeDiagnostic = recordCoreCleanupFailure(running, error); }
+    }
+  } finally { combined.removeEventListener("abort", stop); }
   const projection = projectAgentRunStatus(running.nativeState!);
-  const output = running.nativeCapture?.output ?? "";
+  const captured = running.nativeCapture ?? running.nativePartialCapture;
+  const output = captured?.output ?? "";
   const completion = projectAgentRunCompletion(running.nativeState!, { output });
-  if (projection.terminal && projection.disposition !== "pending" && running.nativeCapture) {
+  if (projection.terminal && projection.disposition !== "pending" && (running.nativeCapture || (running.nativeEntryProof?.state === "absent" && running.nativeState!.control.status !== "none"))) {
     try { await closeOwnedSubagent(running); releaseRunningSubagent(running.id); }
     catch (error) { running.nativeDiagnostic = recordCoreCleanupFailure(running, error); }
   }
   return {
     name: running.name, task: running.task, runner: "copilot", nativeReference: running.nativeJob!.nativeReference,
-    hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal }, projection, completion,
-    outputCapture: running.nativeCapture?.capture, outputFile: running.nativeCapturePaths!.stdout,
+    hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof }, projection, completion,
+    outputCapture: captured?.capture, outputFile: running.nativeCapturePaths!.stdout,
     summary: output || (projection.terminal ? `Native job ${projection.disposition}` : "Native observation unconfirmed; the owned run remains registered. Do not retry its launch."),
     exitCode: completion?.execution === "normal-exit" ? 0 : 1, elapsed: Math.floor((Date.now() - running.startTime) / 1000),
     errorMessage: running.nativeDiagnostic || completion?.errorMessage,
-    nativeDiagnostics: [running.nativeDiagnostic, running.nativeCapture?.diagnostic ? `Native stderr: ${running.nativeCapture.diagnostic}` : undefined, completion?.errorMessage].filter(Boolean).join("\n") || undefined,
+    nativeDiagnostics: [running.nativeDiagnostic, captured?.diagnostic ? `Native stderr: ${captured.diagnostic}` : undefined, completion?.errorMessage].filter(Boolean).join("\n") || undefined,
     ...(completion?.execution === "terminated" ? { error: "terminated" } : completion?.execution === "aborted" ? { error: "cancelled" } : {}),
   };
 }
@@ -2183,6 +2282,7 @@ async function watchSubagent(
 ): Promise<SubagentResult> {
   if (running.cli === "copilot") {
     running.nativeCaptureRead = dependencies.nativeCaptureRead;
+    running.nativeProcessProbe = dependencies.processProbe;
     running.nativePollInterval = dependencies.visibleInterval ?? 1000;
     return watchNativeSubagent(running, signal);
   }

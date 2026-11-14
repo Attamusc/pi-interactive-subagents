@@ -9,11 +9,13 @@ export interface NativeCapturePaths { stdout: string; stderr: string; status: st
 export function buildNativeCaptureCommand(argv: readonly string[], paths: NativeCapturePaths, runId: string): string {
   const format = JSON.stringify({ runId, nativeExit: '%NATIVE%', captureExit: '%CAPTURE%' })
     .replace('"%NATIVE%"', '%d').replace('"%CAPTURE%"', '%d') + '\\n';
+  const entryFormat = JSON.stringify({ runId, pid: '%PID%' }).replace('"%PID%"', '%d') + '\\n';
+  const entryScript = `printf ${shellEscape(entryFormat)} "$$" > ${shellEscape(paths.status + '.entry.json')} || exit 66; exec "$@"`;
   return [
     'umask 077', 'set -o pipefail', 'set -o noclobber',
     `: > ${shellEscape(paths.stdout)} || exit 64`,
     `: > ${shellEscape(paths.stderr)} || exit 64`,
-    `${argv.map(shellEscape).join(' ')} 2>> ${shellEscape(paths.stderr)} | /usr/bin/tee -a ${shellEscape(paths.stdout)}`,
+    `/bin/bash -c ${shellEscape(entryScript)} native-entry ${argv.map(shellEscape).join(' ')} 2>> ${shellEscape(paths.stderr)} | /usr/bin/tee -a ${shellEscape(paths.stdout)}`,
     'statuses=("${PIPESTATUS[@]}")',
     `printf ${shellEscape(format)} "${'${statuses[0]}'}" "${'${statuses[1]}'}" > ${shellEscape(paths.status)} || exit 65`,
     'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi',
@@ -39,16 +41,39 @@ export function readNativeCapture(paths: NativeCapturePaths, runId: string) {
     throw new Error('Uncorrelated or invalid native capture status');
   }
   if (status.captureExit !== 0) throw new Error(`Native stdout capture failed with status ${status.captureExit}`);
+  return readCapturedOutput(paths, true, status.nativeExit);
+}
+
+export function readNativePartialCapture(paths: NativeCapturePaths) {
+  return readCapturedOutput(paths, false, null);
+}
+
+function readCapturedOutput(paths: NativeCapturePaths, complete: boolean, nativeExit: number | null) {
   const stdout = readPrivateTail(paths.stdout, 64 * 1024);
   const stderr = readPrivateTail(paths.stderr, 8 * 1024);
   return {
-    output: stdout.text, diagnostic: stderr.text, nativeExit: status.nativeExit,
+    output: stdout.text, diagnostic: stderr.text, nativeExit,
     capture: { source: 'current-job-stdout' as const, path: paths.stdout, diagnosticPath: paths.stderr,
-      complete: true, bytes: stdout.bytes, limitBytes: 64 * 1024, truncated: stdout.truncated,
+      complete, bytes: stdout.bytes, limitBytes: 64 * 1024, truncated: stdout.truncated,
       diagnosticBytes: stderr.bytes, diagnosticLimitBytes: 8 * 1024, diagnosticTruncated: stderr.truncated },
   };
 }
 
+export interface NativeEntryProof { state: 'alive' | 'absent' | 'unconfirmed'; pid?: number; reason?: string }
+
+export function probeNativeEntry(paths: NativeCapturePaths, runId: string, probe: (pid: number, signal: 0) => void = process.kill): NativeEntryProof {
+  let pid: number;
+  try {
+    const record = JSON.parse(readFileSync(paths.status + '.entry.json', 'utf8'));
+    if (record.runId !== runId || !Number.isSafeInteger(record.pid) || record.pid <= 0) throw new Error('Uncorrelated native entry PID');
+    pid = record.pid;
+  } catch (error) { return { state: 'unconfirmed', reason: error instanceof Error ? error.message : String(error) }; }
+  try { probe(pid, 0); return { state: 'alive', pid }; }
+  catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? { state: 'absent', pid }
+      : { state: 'unconfirmed', pid, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 export interface NativeJobParams {
   name: string; task: string; interactive?: boolean; fork?: boolean;

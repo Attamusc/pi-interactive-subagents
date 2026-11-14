@@ -8,6 +8,7 @@ const MAX_REPLY_BYTES = 1024 * 1024;
 export class CoreRpcError extends Error {
   readonly method: string;
   readonly kind: string;
+  requestSent = false;
   constructor(method: string, kind: string, message: string) {
     super(`Herdr Core ${method}: ${message}`);
     this.method = method;
@@ -38,7 +39,7 @@ function object(value: unknown): Record<string, any> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
 }
 
-export async function coreRpcCall(endpoint: string, method: string, params: Record<string, unknown>, timeout = 5000): Promise<unknown> {
+export async function coreRpcCall(endpoint: string, method: string, params: Record<string, unknown>, timeout = 5000, beforeWrite?: () => void): Promise<unknown> {
   const id = randomUUID();
   return new Promise((resolve, reject) => {
     const socket = connect({ path: endpoint });
@@ -46,15 +47,23 @@ export async function coreRpcCall(endpoint: string, method: string, params: Reco
     let buffer = "";
     let bytes = 0;
     let settled = false;
+    let sent = false;
     const finish = (error?: Error, result?: unknown) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      if (error) reject(error); else resolve(result);
+      if (error) {
+        if (error instanceof CoreRpcError) error.requestSent = sent;
+        reject(error);
+      } else resolve(result);
     };
     const timer = setTimeout(() => finish(new CoreRpcError(method, "timeout", `request exceeded ${timeout}ms`)), timeout);
-    socket.on("connect", () => socket.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"));
+    socket.on("connect", () => {
+      try { beforeWrite?.(); } catch (error) { finish(error instanceof Error ? error : new Error(String(error))); return; }
+      sent = true;
+      socket.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    });
     socket.on("data", chunk => {
       bytes += Buffer.byteLength(chunk);
       if (bytes > MAX_REPLY_BYTES) return finish(new CoreRpcError(method, "invalid_reply", "reply exceeds 1 MiB"));
@@ -230,9 +239,10 @@ export async function reconcileCoreRun(launch: Pick<CoreLaunchUnconfirmed, "cont
     scriptPath: launch.scriptPath, wrapperStartFile: launch.wrapperStartFile };
 }
 
-export async function getCoreTerminal(host: CoreHostRef): Promise<CoreTerminal> {
+export async function getCoreTerminal(host: CoreHostRef, options: { beforeRead?: () => void } = {}): Promise<CoreTerminal> {
   await verifyCore(host);
-  const record = terminal(await coreRpcCall(host.endpoint, "terminal.get", { terminal: host.address }), "terminal.get");
+  options.beforeRead?.();
+  const record = terminal(await coreRpcCall(host.endpoint, "terminal.get", { terminal: host.address }, 5000, options.beforeRead), "terminal.get");
   if (record.address !== host.address || record.parent !== host.parent || record.labels["pi.subagent.run"] !== host.runId) {
     throw new CoreRpcError("terminal.get", "owner_mismatch", "terminal ownership no longer matches this run");
   }
@@ -256,13 +266,21 @@ export async function sendCoreEscape(host: CoreHostRef): Promise<void> {
   }
 }
 
-export async function killCoreTerminal(host: CoreHostRef): Promise<CoreTerminal> {
-  await getCoreTerminal(host);
-  const result = terminal(await coreRpcCall(host.endpoint, "terminal.kill", { terminal: host.address }, 15000), "terminal.kill");
-  if (result.address !== host.address || result.parent !== host.parent || result.labels["pi.subagent.run"] !== host.runId) {
-    throw new CoreRpcError("terminal.kill", "owner_mismatch", "exit of the owned terminal was not confirmed");
+export async function killCoreTerminal(host: CoreHostRef, options: { skipFinished?: boolean; beforeSend?: () => void } = {}): Promise<CoreTerminal> {
+  const current = await getCoreTerminal(host);
+  if (options.skipFinished && current.state === "finished") return current;
+  options.beforeSend?.();
+  const reply = await coreRpcCall(host.endpoint, "terminal.kill", { terminal: host.address }, 15000, options.beforeSend);
+  try {
+    const result = terminal(reply, "terminal.kill");
+    if (result.address !== host.address || result.parent !== host.parent || result.labels["pi.subagent.run"] !== host.runId) {
+      throw new CoreRpcError("terminal.kill", "owner_mismatch", "exit of the owned terminal was not confirmed");
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof CoreRpcError) error.requestSent = true;
+    throw error;
   }
-  return result;
 }
 
 export async function removeCoreTerminal(host: CoreHostRef): Promise<void> {
