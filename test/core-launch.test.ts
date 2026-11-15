@@ -9,7 +9,7 @@ import { waitForVisibleCompletion } from "../pi-extension/subagents/completion-w
 import { createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
-import { getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
+import { pollForExit, getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
 import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
 
 it("selects explicit Core without classic fallback and requires inherited identity", () => {
@@ -25,6 +25,9 @@ it("selects explicit Core without classic fallback and requires inherited identi
     assert.match(muxSetupHint(), /Core/);
   } finally { process.env = saved; }
 });
+
+const block = (id: string, terminal: string) => ({ id, type: "block", content: { terminal } });
+const layout = (root: any) => ({ version: 1, value: { spaces: [{ id: "space-test", tabs: [{ id: "parent-tab", root }] }] } });
 
 async function coreFixture(run: (fixture: any) => Promise<void>) {
   const saved = { ...process.env };
@@ -46,7 +49,23 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
       requests.push(request);
       let result: any;
       switch (request.method) {
-        case "hello": result = { generation: 1, core: { id: "test-core" }, methods: ["terminal.run", "terminal.get", "terminal.list", "terminal.read", "terminal.keys", "terminal.kill", "terminal.rm"] }; break;
+        case "hello": result = { generation: 1, core: { id: JSON.parse(readFileSync(stateFile, "utf8")).coreId ?? "test-core" }, methods: ["doc.get", "terminal.run", "terminal.get", "terminal.list", "terminal.read", "terminal.keys", "terminal.kill", "terminal.rm"] }; break;
+        case "doc.get": {
+          assert.deepEqual(request.params, { name: "herdr-app" });
+          const state = JSON.parse(readFileSync(stateFile, "utf8"));
+          const children = [block("parent-pane", state.badParent ? "t9" : "t1")];
+          if (state.child && state.childSpace && !(state.adoptPending > 0) && !state.adoptNever) {
+            children.push(block(state.adoptionFails ? "parent-pane" : "child-pane", state.childAddress ?? "t2"));
+            if (state.duplicateChild) children.push(block("duplicate-pane", "t2"));
+            if (state.remoteChild) children.push(block("remote-child-pane", "remote/t2"));
+          }
+          const document = layout({ type: "row", children: [{ type: "column", children: [{ type: "stack", children }] }] });
+          if (state.child && state.wrongTab) document.value.spaces[0].tabs[0].id = "other-tab";
+          if (state.child && state.wrongSpace) document.value.spaces[0].id = "other-space";
+          result = state.document ?? document;
+          if (state.child && state.adoptPending > 0) writeFileSync(stateFile, JSON.stringify({ ...state, adoptPending: state.adoptPending - 1 }));
+          break;
+        }
         case "terminal.get":
           if (request.params.terminal !== "t1" && JSON.parse(readFileSync(stateFile, "utf8")).missingChild) {
             socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture missing registry record", data: { kind: "not_found" } } }) + "\n"); return;
@@ -55,8 +74,7 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
         case "terminal.run":
           child = { address: "t2", state: "live", pid: 456, argv: request.params.argv, parent: "t1", labels: request.params.labels };
           const serviceState = JSON.parse(readFileSync(stateFile, "utf8"));
-          const childEnv = { HERDR_APP_HOME: serviceState.coreServerHome, ...request.params.env };
-          writeFileSync(stateFile, JSON.stringify({ ...serviceState, child: true, childTab: request.params.labels["herdr.tab"], childSpace: request.params.labels["herdr.space"], childHome: childEnv.HERDR_APP_HOME }));
+          writeFileSync(stateFile, JSON.stringify({ ...serviceState, child: true, childTab: request.params.labels["herdr.tab"], childSpace: request.params.labels["herdr.space"] }));
           if (JSON.parse(readFileSync(stateFile, "utf8")).unconfirmed) {
             const reply = () => socket.end(JSON.stringify({ jsonrpc: "2.0", id: "uncorrelated", result: child }) + "\n");
             if (JSON.parse(readFileSync(stateFile, "utf8")).delayRunReply) setTimeout(reply, 50); else reply();
@@ -94,7 +112,7 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
     writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "fixture", bin: { pi: "cli.js" } }));
     process.argv[1] = entry;
     writeFileSync(stateFile, JSON.stringify({ child: false }));
-    writeFileSync(join(bin, "herdr-app"), `#!${process.execPath}\nconst fs=require('node:fs');const file=${JSON.stringify(stateFile)};const log=${JSON.stringify(appLog)};const args=process.argv.slice(2);fs.appendFileSync(log,JSON.stringify({args,home:process.env.HERDR_APP_HOME})+'\\n');const state=JSON.parse(fs.readFileSync(file));const visibleChild=state.child&&state.childSpace&&!(state.adoptPending>0);if(state.child&&state.adoptPending>0&&args[0]==='ls'){state.adoptPending--;fs.writeFileSync(file,JSON.stringify(state));}let result;if(args[0]==='ls')result={spaces:[{id:'space-test',machine:null,tabs:[{id:'parent-tab',name:'parent',terminals:[{terminal:state.badParent?'t9':'t1',pane:'parent-pane'},...(visibleChild&&state.childTab==='parent-tab'?[{terminal:'t2',pane:state.adoptionFails?null:'child-pane'}]:[])]},...(visibleChild&&state.childTab!=='parent-tab'?[{id:'child-tab',name:'child',terminals:[{terminal:'t2',pane:'child-pane'}]}]:[])]}]};else if(args[0]==='status')result={space:'space-test',tab:'parent-tab'};else throw Error('forbidden app command');console.log(JSON.stringify(result));\n`, { mode: 0o700 });
+    writeFileSync(join(bin, "herdr-app"), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(appLog)}, 'forbidden desktop CLI invocation\\n');process.exit(99);\n`, { mode: 0o700 });
     process.env.PATH = `${bin}:${saved.PATH}`;
     process.env.HERDR_APP_HOME = join(dir, "selected-app");
     process.env.PI_CODING_AGENT_DIR = join(dir, "profile"); mkdirSync(process.env.PI_CODING_AGENT_DIR);
@@ -104,6 +122,8 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
     const session = join(dir, "parent.jsonl"); writeFileSync(session, JSON.stringify({ type: "session", id: "parent", cwd: dir }) + "\n");
     server.listen(process.env.HC_TERMINAL_SOCKET); await once(server, "listening");
     await run({ dir, entry, requests, parent, appLog, stateFile, ctx: { cwd: dir, sessionManager: { getSessionFile: () => session, getSessionId: () => "parent", getSessionDir: () => dir } } });
+    assert.equal(existsSync(appLog), false, "desktop herdr-app CLI is forbidden");
+    assert.equal(requests.some(request => request.method === "doc.set"), false);
   } finally {
     process.env = saved; process.argv[1] = originalArgv;
     await new Promise<void>(resolve => server.close(() => resolve()));
@@ -135,7 +155,8 @@ for (const autoExit of [true, false]) {
         const launch = requests.find((request: any) => request.method === "terminal.run").params;
         assert.equal(launch.labels["herdr.space"], autoExit ? undefined : "space-test");
         assert.equal(launch.labels["herdr.tab"], autoExit ? undefined : "parent-tab");
-        assert.equal(existsSync(appLog), !autoExit);
+        assert.equal(requests.some((request: any) => request.method === "doc.get"), !autoExit);
+        assert.equal(existsSync(appLog), false);
         const script = readFileSync(launch.argv[1], "utf8");
         assert.ok(script.includes(entry));
         assert.match(script, /PI_SUBAGENT_RESTORE_POLICY=1/);
@@ -164,6 +185,7 @@ for (const scenario of [
   { name: "explicit false overrides interactive definition", agent: "interactive", interactive: false, expected: false },
   { name: "explicit false on bare launch", interactive: false, expected: false },
   { name: "nested row without app labels", agent: "autonomous", nested: true, expected: false },
+  { name: "unlabeled mobile parent", interactive: true, nested: true, expected: true },
 ]) {
   it(`presents ${scenario.name} using resolved interactivity`, async () => {
     await coreFixture(async ({ ctx, requests, parent, appLog }: any) => {
@@ -184,12 +206,9 @@ for (const scenario of [
         assert.equal(launch.labels["herdr.space"], scenario.expected ? "space-test" : undefined);
         assert.equal(launch.labels["herdr.tab"], scenario.expected ? "parent-tab" : undefined);
         assert.ok(launch.labels["pi.subagent.run"]);
-        assert.equal(launch.env.HERDR_APP_HOME, process.env.HERDR_APP_HOME);
-        assert.equal(existsSync(appLog), scenario.expected, "rows never call the app");
-        if (scenario.expected) {
-          const calls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line).args);
-          assert.ok(calls.every(args => ["ls", "status"].includes(args[0])));
-        }
+        assert.equal(launch.env.HERDR_APP_HOME, undefined, "app home is not a Core launch dependency");
+        assert.equal(existsSync(appLog), false);
+        assert.equal(requests.some((request: any) => request.method === "doc.get"), scenario.expected);
       } finally {
         await runtime.handlers.get("session_shutdown")({ reason: "quit" }, ctx);
       }
@@ -220,7 +239,7 @@ it("keeps Core names unique by run for repeated, long and non-ASCII titles", asy
   });
 });
 
-it("launches Pi through Core once with a prepared wrapper and same-tab right pane", async () => {
+it("launches Pi through Core once with a prepared wrapper and same-tab distinct pane", async () => {
   await coreFixture(async ({ ctx, requests, entry, appLog }: any) => {
     const running = await __test__.launchSubagent({ name: "Review\u001b[31m task", task: "Inspect exactly once", tools: "read", interactive: true }, ctx);
     const launches = requests.filter((request: any) => request.method === "terminal.run");
@@ -242,39 +261,42 @@ it("launches Pi through Core once with a prepared wrapper and same-tab right pan
     assert.ok(script.includes(running.wrapperExitFile));
     assert.ok(script.includes(running.coreHost.wrapperStartFile));
     assert.equal((script.match(/Inspect exactly once/g) ?? []).length, 0, "blank-session task must be artifact-backed");
-    const appCalls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
-    assert.ok(appCalls.every(call => call.home === process.env.HERDR_APP_HOME));
-    assert.ok(appCalls.every(call => ["ls", "status"].includes(call.args[0])), "no rename, split or focus commands");
+    assert.equal(existsSync(appLog), false);
+    assert.ok(requests.filter((request: any) => request.method === "doc.get").length >= 2);
     assert.equal(launch.name, `review-task-${running.runId}`);
     const taskPath = script.match(/'@([^']+)'/)?.[1];
     assert.ok(taskPath);
     assert.equal((readFileSync(taskPath, "utf8").match(/Inspect exactly once/g) ?? []).length, 1);
     assert.equal(launch.env.PATH, process.env.PATH);
-    assert.equal(launch.env.HERDR_APP_HOME, process.env.HERDR_APP_HOME);
+    assert.equal(launch.env.HERDR_APP_HOME, undefined);
   });
 });
 
-it("preserves classic detection precedence despite stale HC indicators", async () => {
-  await coreFixture(async ({ dir }: any) => {
+it("prefers Core before classic indicators, fails closed on stale Core, and honors explicit legacy", async () => {
+  await coreFixture(async ({ dir, requests }: any) => {
     writeFileSync(join(dir, "bin", "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     delete process.env.PI_SUBAGENT_MUX;
     process.env.HERDR_SOCKET_PATH = "/stale-classic.sock";
-    process.env.HC_TERMINAL_SOCKET = "/stale-core.sock";
-    assert.equal(getMuxBackend(), "herdr");
+    assert.equal(getMuxBackend(), "herdr-core", "valid Core context takes precedence over classic");
+    process.env.HC_TERMINAL_SOCKET = join(dir, "stale-core.sock");
+    assert.equal(getMuxBackend(), "herdr-core");
+    await assert.rejects(prepareCoreLaunch("Stale", true), /Herdr Core hello/);
+    assert.equal(requests.some((request: any) => request.method === "terminal.run"), false);
+    process.env.PI_SUBAGENT_MUX = "herdr";
+    assert.equal(getMuxBackend(), "herdr", "explicit legacy override remains authoritative");
     process.env.PI_SUBAGENT_MUX = "herdr-core";
     delete process.env.HC_TERMINAL_ID;
     assert.equal(getMuxBackend(), null, "explicit Core must not fall back to classic");
   });
 });
 
-it("observes eventual app adoption without creating a replacement terminal", async () => {
-  await coreFixture(async ({ ctx, stateFile, requests, appLog }: any) => {
+it("observes eventual client adoption in Core Doc without creating a replacement terminal", async () => {
+  await coreFixture(async ({ ctx, stateFile, requests }: any) => {
     writeFileSync(stateFile, JSON.stringify({ adoptPending: 2 }));
     const running = await __test__.launchSubagent({ name: "Delayed task", task: "inspect", tools: "read" }, ctx);
     assert.equal(running.surface, "t2");
     assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
-    const calls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line).args);
-    assert.ok(calls.filter(args => args[0] === "ls").length >= 4);
+    assert.ok(requests.filter((request: any) => request.method === "doc.get").length >= 4);
     assert.equal(requests.some((request: any) => request.method === "terminal.keys"), false, "Core startup must not send a command into a shell");
   });
 });
@@ -298,15 +320,119 @@ it("rejects an unsupported parent runtime before Core or app mutation", async ()
   });
 });
 
-it("rejects a mismapped app parent before terminal.run", async () => {
+it("rejects a missing Core Doc parent before terminal.run", async () => {
   await coreFixture(async ({ stateFile, ctx, requests }: any) => {
     writeFileSync(stateFile, JSON.stringify({ badParent: true }));
-    await assert.rejects(__test__.launchSubagent({ name: "Task", task: "inspect" }, ctx), /parent address/);
+    await assert.rejects(__test__.launchSubagent({ name: "Task", task: "inspect" }, ctx), /parent.*missing|parent.*ambiguous/);
     assert.equal(requests.some((request: any) => request.method === "terminal.run"), false);
   });
 });
 
-it("cleans only its owned child when app pane adoption fails", async () => {
+for (const [name, document] of [
+  ["substring address", layout(block("parent-pane", "t10"))],
+  ["remote-qualified parent address", layout(block("parent-pane", "remote/t1"))],
+  ["missing mapping", layout({ type: "row", children: [] })],
+  ["duplicate terminal", layout({ type: "row", children: [block("one", "t1"), block("two", "t1")] })],
+  ["missing pane ID", layout({ type: "block", content: { terminal: "t1" } })],
+  ["unknown node", layout({ type: "grid", children: [block("parent-pane", "t1")] })],
+  ["malformed children", layout({ type: "stack", children: {} })],
+  ["malformed content", layout({ id: "parent-pane", type: "block", content: { terminal: 1 } })],
+  ["mixed content", layout({ id: "parent-pane", type: "block", content: { terminal: "t1", mod: "notes" } })],
+  ["missing document", { version: 0, value: null }],
+  ["invalid version", { ...layout(block("parent-pane", "t1")), version: "1" }],
+  ["malformed spaces", { version: 1, value: { spaces: {} } }],
+  ["duplicate spaces", { version: 1, value: { spaces: [...layout(block("one", "t1")).value.spaces, ...layout(block("two", "t1")).value.spaces] } }],
+  ["duplicate tabs", { version: 1, value: { spaces: [{ id: "space-test", tabs: [{ id: "parent-tab", root: block("one", "t1") }, { id: "parent-tab", root: block("two", "t9") }] }] } }],
+  ["cross-space duplicate address", { version: 1, value: { spaces: [...layout(block("one", "t1")).value.spaces, { id: "other-space", tabs: [{ id: "other-tab", root: block("two", "t1") }] }] } }],
+  ["cross-space duplicate tab ID", { version: 1, value: { spaces: [...layout(block("one", "t1")).value.spaces, { id: "other-space", tabs: [{ id: "parent-tab", root: block("two", "t9") }] }] } }],
+  ["cross-tab duplicate node ID", { version: 1, value: { spaces: [{ id: "space-test", tabs: [{ id: "parent-tab", root: block("shared-node", "t1") }, { id: "other-tab", root: { type: "stack", id: "shared-node", children: [] } }] }] } }],
+  ["cross-space duplicate node ID", { version: 1, value: { spaces: [...layout(block("shared-node", "t1")).value.spaces, { id: "other-space", tabs: [{ id: "other-tab", root: block("shared-node", "t9") }] }] } }],
+] as const) {
+  it(`rejects ${name} in Core Doc before terminal.run`, async () => {
+    await coreFixture(async ({ stateFile, requests }: any) => {
+      writeFileSync(stateFile, JSON.stringify({ document }));
+      await assert.rejects(prepareCoreLaunch("Task", true), /Core.*(layout|parent)/);
+      assert.equal(requests.some((request: any) => request.method === "terminal.run"), false);
+    });
+  });
+}
+
+for (const label of ["herdr.space", "herdr.tab"]) {
+  it(`cross-checks the optional ${label} parent hint`, async () => {
+    await coreFixture(async ({ parent, requests }: any) => {
+      parent.labels = { [label]: "wrong" };
+      await assert.rejects(prepareCoreLaunch("Task", true), /parent.*label/);
+      assert.equal(requests.some((request: any) => request.method === "terminal.run"), false);
+    });
+  });
+  it(`accepts a matching ${label} hint without requiring the other`, async () => {
+    await coreFixture(async ({ parent }: any) => {
+      parent.labels = { [label]: label === "herdr.space" ? "space-test" : "parent-tab" };
+      await prepareCoreLaunch("Task", true);
+    });
+  });
+}
+
+it("ignores nonterminal content and unknown metadata rather than treating embedded addresses as panes", async () => {
+  await coreFixture(async ({ stateFile }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ document: layout({ type: "row", metadata: block("fake", "t1"), children: [
+      block("parent-pane", "t1"), { type: "block", id: "notes", content: { mod: "notes", props: { terminal: "t1" } } },
+      { type: "block", id: "agent", content: { agent: "t1" } },
+      { type: "block", id: "tab", content: { tab: "t1" } },
+    ] }) }));
+    await prepareCoreLaunch("Task", true);
+  });
+});
+
+for (const state of [{ wrongTab: true }, { wrongSpace: true }, { duplicateChild: true }]) {
+  it(`cleans owned child on invalid adoption ${JSON.stringify(state)}`, async () => {
+    await coreFixture(async ({ stateFile, ctx, requests }: any) => {
+      writeFileSync(stateFile, JSON.stringify(state));
+      await assert.rejects(__test__.launchSubagent({ name: "Task", task: "inspect", interactive: true }, ctx), /visibility setup failed/);
+      assert.deepEqual(requests.filter((request: any) => ["terminal.kill", "terminal.rm"].includes(request.method)).map((request: any) => [request.method, request.params.terminal]), [["terminal.kill", "t2"], ["terminal.rm", "t2"]]);
+    });
+  });
+}
+
+it("does not confuse a remote-qualified child with the exact local child address", async () => {
+  await coreFixture(async ({ stateFile, ctx, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ remoteChild: true }));
+    const running = await __test__.launchSubagent({ name: "Task", task: "inspect", interactive: true }, ctx);
+    assert.equal(running.surface, "t2", "remote/t2 must not become a second match for t2");
+    assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+  });
+});
+
+it("times out on a substring-only child address and cleans only its exact owned terminal", async () => {
+  await coreFixture(async ({ stateFile, ctx, requests }: any) => {
+    writeFileSync(stateFile, JSON.stringify({ childAddress: "t20" }));
+    const started = Date.now();
+    await assert.rejects(__test__.launchSubagent({ name: "Task", task: "inspect", interactive: true }, ctx), /adoption timed out/);
+    assert.ok(Date.now() - started < 12_000);
+    assert.equal(requests.filter((request: any) => request.method === "terminal.run").length, 1);
+    assert.deepEqual(requests.filter((request: any) => ["terminal.kill", "terminal.rm"].includes(request.method)).map((request: any) => request.params.terminal), ["t2", "t2"]);
+  });
+});
+
+it("binds document reads and launch to the captured Core identity", async () => {
+  await coreFixture(async ({ stateFile, dir, requests }: any) => {
+    const prepared = await prepareCoreLaunch("Task", true);
+    writeFileSync(stateFile, JSON.stringify({ coreId: "replacement" }));
+    await assert.rejects(launchPreparedCoreRun(prepared, { runId: "binding", scriptPath: join(dir, "binding.sh"), wrapperStartFile: join(dir, "binding.json"), command: "true", cwd: dir, agentDir: process.env.PI_CODING_AGENT_DIR! }), /different Core/);
+    assert.equal(requests.some((request: any) => request.method === "terminal.run"), false);
+  });
+});
+
+it("autonomous children require neither layout document nor desktop app", async () => {
+  await coreFixture(async ({ stateFile, parent, requests }: any) => {
+    parent.labels = {};
+    writeFileSync(stateFile, JSON.stringify({ document: { invalid: true } }));
+    await prepareCoreLaunch("Autonomous", false);
+    assert.equal(requests.some((request: any) => request.method === "doc.get"), false);
+  });
+});
+
+it("cleans only its owned child when client pane adoption fails", async () => {
   await coreFixture(async ({ stateFile, ctx, requests }: any) => {
     writeFileSync(stateFile, JSON.stringify({ adoptionFails: true }));
     await assert.rejects(__test__.launchSubagent({ name: "Task", task: "inspect" }, ctx), /visibility setup failed/);
@@ -728,32 +854,95 @@ it("keeps wrapper loss unconfirmed while known Pi lives and rereads final sideca
   });
 });
 
-for (const defaultHome of ["xdg", "home"] as const) {
-  it(`pins the parent's ${defaultHome} default app home over a conflicting Core service environment`, async () => {
-    await coreFixture(async ({ dir, ctx, stateFile, requests, appLog }: any) => {
-      process.env.HOME = join(dir, "parent-home");
-      process.env.XDG_CONFIG_HOME = defaultHome === "xdg" ? join(dir, "parent-config") : "";
-      if (defaultHome === "xdg") delete process.env.HERDR_APP_HOME;
-      else process.env.HERDR_APP_HOME = "";
-      const expected = defaultHome === "xdg" ? join(dir, "parent-config", "herdr-app") : join(dir, "parent-home", ".config", "herdr-app");
-      const staleServerHome = join(dir, "stale-server-app");
-      writeFileSync(stateFile, JSON.stringify({ coreServerHome: staleServerHome }));
-      await __test__.launchSubagent({ name: "Task", task: "inspect", tools: "read" }, ctx);
-      const state = JSON.parse(readFileSync(stateFile, "utf8"));
-      assert.equal(state.childHome, expected, "overlay must not reintroduce the server's different app selection into nested Pi");
-      const launch = requests.find((request: any) => request.method === "terminal.run");
-      assert.equal(launch.params.env.HERDR_APP_HOME, expected);
-      const appCalls = readFileSync(appLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
-      assert.ok(appCalls.every(call => call.home === expected), "preflight/adoption and nested child must use the same recorded home");
+it("captures parent PATH and propagates the selected profile without app-home scaffolding", async () => {
+  await coreFixture(async ({ dir, requests }: any) => {
+    const path = process.env.PATH;
+    const profile = process.env.PI_CODING_AGENT_DIR!;
+    const prepared = await prepareCoreLaunch("Task", true);
+    process.env.PATH = "/unrelated-server-path";
+    process.env.PI_CODING_AGENT_DIR = join(dir, "other-profile");
+    await launchPreparedCoreRun(prepared, { runId: "profile", scriptPath: join(dir, "profile.sh"),
+      wrapperStartFile: join(dir, "profile.json"), command: "true", cwd: dir, agentDir: profile });
+    const launch = requests.find((request: any) => request.method === "terminal.run").params;
+    assert.equal(launch.env.PATH, path);
+    assert.equal(launch.env.PI_CODING_AGENT_DIR, profile);
+    assert.equal(launch.env.HERDR_APP_HOME, undefined);
+  });
+});
+
+for (const scenario of ["success", "nonzero", "cancel", "timeout", "cleanup-failure", "missing-wrapper"] as const) {
+  it(`observes Core Claude ${scenario} without classic cleanup`, async () => {
+    await coreFixture(async ({ ctx, requests, stateFile }: any) => {
+      const agents = join(process.env.PI_CODING_AGENT_DIR!, "agents"); mkdirSync(agents);
+      writeFileSync(join(agents, "review.md"), "---\nname: review\ncli: claude\nmodel: sonnet\nauto-exit: true\nspawning: false\nsystem-prompt: append\n---\nReview only.\n");
+      const running = await __test__.launchSubagent({ name: "Review", agent: "review", task: "inspect" }, ctx);
+      const uuid = "12345678-1234-4234-8234-123456789abc";
+      writeFileSync(running.claudeResultFile!, JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "review output", session_id: uuid }));
+      if (["success", "nonzero", "cleanup-failure"].includes(scenario)) {
+        writeFileSync(running.wrapperExitFile!, JSON.stringify({ version: 1, runId: running.runId, sourceId: `wrapper:${running.runId}`, sequence: 1, observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: scenario === "nonzero" ? 7 : 0 } }));
+      } else {
+        writeFileSync(running.claudeProcessIdFile!, `${running.runId} 4321\n`);
+      }
+      if (scenario === "missing-wrapper") {
+        writeFileSync(join(running.artifactDir!, "subagent-completion", `${running.runId}.recovery.json`), JSON.stringify({ runId: running.runId, stage: "remove" }));
+      }
+      if (scenario === "cleanup-failure") writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), rmFails: true }));
+      __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
+      process.env.PI_SUBAGENT_MUX = "zellij";
+      const controller = new AbortController();
+      if (scenario === "cancel") controller.abort("cancelled");
+      try {
+        const result = await __test__.watchSubagent(running, controller.signal, {
+          visibleInterval: 1,
+          closeSurface: async () => { throw Error("classic cleanup forbidden"); },
+          processProbe: () => { throw Object.assign(Error("gone"), { code: "ESRCH" }); },
+          ...(["timeout", "missing-wrapper"].includes(scenario) ? { pollForExit: async (surface: string, signal: AbortSignal, options: any) => pollForExit(surface, signal, { ...options, timeoutMs: 0 }) } : {}),
+        });
+        assert.equal(result.exitCode, ["success", "cleanup-failure"].includes(scenario) ? 0 : scenario === "nonzero" ? 7 : 1);
+        if (result.exitCode === 0) assert.equal(result.claudeSessionId, uuid);
+        else assert.match(result.summary, /review output/);
+        if (scenario === "timeout" || scenario === "missing-wrapper") assert.match(result.summary, /deadline exceeded/);
+        assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+        assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 1);
+        assert.equal(__test__.runningSubagents.has(running.id), scenario === "cleanup-failure");
+        if (scenario === "cleanup-failure") {
+          writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), rmFails: false }));
+          assert.deepEqual(await __test__.shutdownOwnedSubagents("retry"), []);
+          assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+          assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 2);
+        }
+      } finally { __test__.releaseRunningSubagent(running.id); }
     });
   });
 }
 
-it("rejects Claude-on-Core before accessing native context", async () => {
-  await coreFixture(async ({ dir, ctx, requests }: any) => {
+it("launches read-only Claude through Core once with captured ownership", async () => {
+  await coreFixture(async ({ dir, ctx, requests, appLog }: any) => {
     const agents = join(process.env.PI_CODING_AGENT_DIR!, "agents"); mkdirSync(agents);
     writeFileSync(join(agents, "review.md"), "---\nname: review\ncli: claude\nmodel: sonnet\nauto-exit: true\nspawning: false\nsystem-prompt: append\n---\nReview only.\n");
-    await assert.rejects(__test__.launchSubagent({ name: "Review", agent: "review", task: "inspect" }, ctx), /Claude-on-Core/);
-    assert.equal(requests.length, 0);
+    const running = await __test__.launchSubagent({ name: "Review", agent: "review", task: "inspect", resumeSessionId: "12345678-1234-4234-8234-123456789abc" }, ctx);
+    const launches = requests.filter((request: any) => request.method === "terminal.run");
+    assert.equal(launches.length, 1);
+    assert.equal(running.coreHost?.address, "t2");
+    assert.equal(running.coreHost?.parent, "t1");
+    assert.equal(running.cli, "claude");
+    assert.equal(existsSync(appLog), false);
+    const script = readFileSync(running.launchScriptFile!, "utf8");
+    assert.ok(script.includes(process.execPath));
+    assert.match(script, /--safe-mode --restricted --strict-mcp-config/);
+    assert.match(script, /--permission-mode dontAsk --tools 'Read,Glob,Grep'/);
+    assert.match(script, /--resume '12345678-1234-4234-8234-123456789abc'/);
+    assert.doesNotMatch(script, /--max-turns/);
+    assert.ok(script.includes(running.runId));
+    assert.ok(script.includes(running.coreHost!.wrapperStartFile));
+    __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
+    process.env.PI_SUBAGENT_MUX = "zellij";
+    try {
+      const failures = await __test__.shutdownOwnedSubagents("test", async () => { throw Error("classic close forbidden"); });
+      assert.deepEqual(failures, []);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
+      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 1);
+    } finally { __test__.releaseRunningSubagent(running.id); }
+
   });
 });

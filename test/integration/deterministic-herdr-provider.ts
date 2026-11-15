@@ -10,7 +10,7 @@ const config = JSON.parse(readFileSync(join(agentDir, "extensions", "determinist
 const { eventsFile, gateFile, releaseFile, versionsFile, scenario = "completion", childName = "DeterministicChild", siblingReleaseFile, invalidSessionFile, fixtureToolCallId, missingSkillAgent, resumeSessionId } = config;
 
 function record(event: string, details: Record<string, unknown> = {}) {
-  appendFileSync(eventsFile, `${JSON.stringify({ event, at: new Date().toISOString(), pid: process.pid, subagentId: process.env.PI_SUBAGENT_ID ?? null, subagentName: process.env.PI_SUBAGENT_NAME ?? null, ...details })}\n`);
+  appendFileSync(eventsFile, `${JSON.stringify({ event, at: new Date().toISOString(), pid: process.pid, subagentId: process.env.PI_SUBAGENT_ID ?? null, subagentName: process.env.PI_SUBAGENT_NAME ?? null, runtimeEnvironment: { legacySocket: process.env.HERDR_SOCKET_PATH ?? null, legacyEnv: process.env.HERDR_ENV ?? null, explicitMux: process.env.PI_SUBAGENT_MUX ?? null, pathFirst: process.env.PATH?.split(":")[0] ?? null }, ...details })}\n`);
 }
 
 function snapshot() {
