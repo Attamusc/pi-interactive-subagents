@@ -89,7 +89,7 @@ describe("visible completion sidecars", () => {
       runId: "core-start", wrapperExitFile: paths.wrapperExit,
       wrapperStartFile: startFile, nodeExecutable: process.execPath,
     });
-    execFileSync("/bin/bash", ["-e", "-c", script], { env: { PATH: "/no-command-path", HC_TERMINAL_ID: "tchild" } });
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-e", "-c", script], { env: { PATH: "/no-command-path", HC_TERMINAL_ID: "tchild" } });
     const observed = readWrapperStartRecord(startFile, "core-start", "tchild");
     assert.equal(observed.ok, true);
     if (!observed.ok) return;
@@ -129,7 +129,7 @@ describe("visible completion sidecars", () => {
         runId: "invalid-core", wrapperExitFile: join(dir, "exit.json"),
         wrapperStartFile: join(dir, "start.json"), nodeExecutable: process.execPath,
       });
-      assert.throws(() => execFileSync("/bin/bash", ["-c", script], { stdio: "pipe", env: { HC_TERMINAL_ID: identity } }));
+      assert.throws(() => execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", script], { stdio: "pipe", env: { HC_TERMINAL_ID: identity } }));
       assert.throws(() => readFileSync(marker));
     }
   });
@@ -144,7 +144,7 @@ describe("visible completion sidecars", () => {
       runId: "blocked", wrapperExitFile: join(dir, "exit.json"),
       wrapperStartFile: join(blocked, "start.json"), nodeExecutable: process.execPath,
     });
-    assert.throws(() => execFileSync("/bin/bash", ["-c", script], { stdio: "pipe", env: { HC_TERMINAL_ID: "tchild" } }));
+    assert.throws(() => execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", script], { stdio: "pipe", env: { HC_TERMINAL_ID: "tchild" } }));
     assert.throws(() => readFileSync(marker));
   });
 
@@ -154,7 +154,7 @@ describe("visible completion sidecars", () => {
     writeFileSync(fixture, `#!/bin/sh\nprintf done > ${JSON.stringify(marker)}\nexit 143\n`); chmodSync(fixture, 0o700);
     const script = buildVisibleWrapperCommand({ piCommand: JSON.stringify(fixture), runId: "quoted run", wrapperExitFile: paths.wrapperExit, terminalSentinel: "diagnostic only" });
     let status = 0; let output = "";
-    try { output = execFileSync("/bin/bash", ["-e", "-c", script], { encoding: "utf8" }); } catch (error: any) { status = error.status; output = error.stdout; }
+    try { output = execFileSync("/bin/bash", ["--noprofile", "--norc", "-e", "-c", script], { encoding: "utf8" }); } catch (error: any) { status = error.status; output = error.stdout; }
     assert.equal(status, 143); assert.equal(output.trim(), "diagnostic only"); assert.equal(readFileSync(marker, "utf8"), "done");
     const result = readWrapperExitRecord(paths.wrapperExit, "quoted run"); assert.equal(result.ok, true);
     if (result.ok) assert.deepEqual(result.value.exit, { kind: "shell", shellStatus: 143 });

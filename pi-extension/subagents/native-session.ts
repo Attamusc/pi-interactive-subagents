@@ -19,8 +19,11 @@ function validEntry(value: unknown): value is NativeSessionEntry {
   const r = value.record;
   if (!object(r) || !literal(r.callerSessionId) || !literal(r.definitionSha256) || !object(r.reference) || !object(r.bindings) || !object(r.definitionOrigin) || !Array.isArray(r.skills)) return false;
   if (Object.keys(r).some(key => !['callerSessionId', 'definitionSha256', 'reference', 'bindings', 'definitionOrigin', 'skills'].includes(key))) return false;
-  return r.reference.runner === 'copilot' && literal(r.reference.managedSessionId) && literal(r.reference.cwd)
-    && object(r.reference.selector) && r.reference.selector.kind === 'name' && literal(r.reference.selector.value)
+  return literal(r.reference.managedSessionId) && literal(r.reference.cwd)
+    && object(r.reference.selector) && literal(r.reference.selector.value)
+    && ((r.reference.runner === 'copilot' && r.reference.selector.kind === 'name')
+      || (r.reference.runner === 'claude' && r.reference.selector.kind === 'uuid'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.reference.selector.value)))
     && literal(r.bindings.parentCwd) && r.bindings.managedSessionId === r.reference.managedSessionId && typeof r.bindings.todoPathLiteral === 'string'
     && ['global-user', 'installed-package'].includes(String(r.definitionOrigin.kind))
     && literal(r.definitionOrigin.canonicalPath) && literal(r.definitionOrigin.canonicalRoot)

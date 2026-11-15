@@ -1,6 +1,7 @@
-import { accessSync, constants, readFileSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { lstatSync, accessSync, constants, readFileSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { bindNativeMcp, requireTrustedNativeOrigin, type NormalizedAgentDefinition, type NativeScopeBindings } from 'pi-agent-execution';
 import { shellEscape } from './cmux.ts';
 
@@ -88,31 +89,36 @@ export interface NativeHostContext {
   resume?: boolean;
 }
 
-/** No native command is executed here. Authority and supported modes precede even lookup. */
+/** Authority and supported modes precede lookup/version probing; no task is launched here. */
 export function prepareNativeJob(definition: NormalizedAgentDefinition, params: NativeJobParams, context: NativeHostContext) {
   requireTrustedNativeOrigin(definition.origin);
-  if (definition.runner !== 'copilot' || !definition.native) throw new Error('A trusted Copilot native policy is required');
+  if (!['copilot', 'claude'].includes(definition.runner) || !definition.native) throw new Error('A trusted native policy is required');
   const policy = definition.native;
   if (definition.metadata['auto-exit'] !== true || (params.interactive ?? definition.metadata.interactive ?? false) !== false) {
-    throw new Error('Copilot jobs require auto-exit: true and interactive: false');
+    throw new Error('Native jobs require auto-exit: true and interactive: false');
   }
   if (params.fork || (definition.metadata['session-mode'] !== undefined && definition.metadata['session-mode'] !== 'new')) {
-    throw new Error('Copilot jobs support new sessions only; fork and lineage modes require Pi');
+    throw new Error('Native jobs support new sessions only; fork and lineage modes require Pi');
   }
   for (const key of ['tools', 'skills', 'model', 'thinking', 'systemPrompt', 'resumeSessionId'] as const) {
-    if (params[key]?.trim()) throw new Error(`Copilot jobs do not accept ${key} overrides; select a trusted native definition`);
+    if (params[key]?.trim()) throw new Error(`Native jobs do not accept ${key} overrides; select a trusted native definition`);
   }
   if (definition.tools !== undefined || definition.metadata['deny-tools'] !== undefined || definition.metadata.spawning !== undefined) {
-    throw new Error('Copilot jobs cannot enforce Pi tools/deny-tools/spawning controls; use native-allow/native-deny');
+    throw new Error('Native jobs cannot enforce Pi tools/deny-tools/spawning controls; use native-allow/native-deny');
   }
-  if ((definition.skills ?? []).some((name, index) => context.skills?.[index]?.name !== name) || (context.skills?.length ?? 0) !== (definition.skills?.length ?? 0)) throw new Error('Copilot selected skills require trusted host skill bindings');
+  if ((definition.skills ?? []).some((name, index) => context.skills?.[index]?.name !== name) || (context.skills?.length ?? 0) !== (definition.skills?.length ?? 0)) throw new Error('Native selected skills require trusted host skill bindings');
   const bindings = context.bindings ?? { parentCwd: context.parentCwd, managedSessionId: context.managedSessionId, todoPathLiteral: context.env.PI_TODO_PATH ?? '' };
   if (bindings.parentCwd !== context.parentCwd || bindings.managedSessionId !== context.managedSessionId) throw new Error('Native MCP binding scope mismatch');
   const home = context.env.HOME || homedir();
   const mcp = bindNativeMcp(policy, { ...bindings, home, node: process.execPath });
-  if (policy.allow.some(value => value.startsWith('tasks(')) && !mcp.tasks) throw new Error('Required tasks MCP binding is missing');
+  if (policy.allow.some(value => value.startsWith('tasks(') || value.startsWith('mcp__tasks__')) && !mcp.tasks) throw new Error('Required tasks MCP binding is missing');
   if (mcp.tasks) {
     const args = mcp.tasks.args;
+    const actions = args[args.indexOf('--actions') + 1]?.split(',') ?? [];
+    const supportedActions = ['list', 'list-all', 'get', 'create', 'update', 'append', 'delete', 'claim', 'release'];
+    if (args.some(arg => /^--(?:allow-force|force)(?:=|$)/.test(arg)) || !actions.length || actions.some(action => !supportedActions.includes(action))) {
+      throw new Error('Tasks MCP requires declared supported actions and no assignment-force flags');
+    }
     if (mcp.tasks.command !== process.execPath || mcp.tasks.env?.HOME !== home
       || ['--scope-cwd', '--actor', '--actions'].some(flag => args.filter(arg => arg === flag).length !== 1)
       || args[args.indexOf('--scope-cwd') + 1] !== bindings.parentCwd
@@ -121,6 +127,7 @@ export function prepareNativeJob(definition: NormalizedAgentDefinition, params: 
       || args[args.indexOf('--actor') + 1] !== bindings.managedSessionId
       || !args[args.indexOf('--actions') + 1]?.trim()) throw new Error('Tasks MCP binding requires explicit host node/HOME, captured scope, store override, actor and actions');
   }
+  if (definition.runner === 'claude') return prepareClaudeJob(definition, params, context, bindings, home, mcp);
   const mcpConfig = Object.keys(mcp).length ? JSON.stringify({ mcpServers: Object.fromEntries(Object.entries(mcp).map(([name, server]) => [name, { type: 'local', ...server, tools: ['*'] }])) }) : undefined;
   if (definition.systemPrompt?.mode) throw new Error('Copilot cannot materialize Pi system-prompt modes; use the definition body as role instructions');
   if (!definition.model || definition.model.includes('/')) throw new Error('Copilot requires a native model name, not a provider-prefixed Pi model');
@@ -155,4 +162,82 @@ export function prepareNativeJob(definition: NormalizedAgentDefinition, params: 
     context: { parentCwd: bindings.parentCwd, managedSessionId: bindings.managedSessionId, env: { PI_TODO_PATH: bindings.todoPathLiteral } },
     skills: context.skills ?? [],
   };
+}
+
+/** Deliberately narrower than Claude's general ancestor trust: only a verified Git root. */
+function hasExistingClaudeTrust(home: string, cwd: string): boolean {
+  try {
+    const config = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
+    const projects = config?.projects;
+    if (!projects || typeof projects !== 'object' || Array.isArray(projects)) return false;
+    const accepted = (path: string) => Object.hasOwn(projects, path)
+      && projects[path]?.hasTrustDialogAccepted === true;
+    if (accepted(cwd)) return true;
+    for (let candidate = cwd; ; candidate = dirname(candidate)) {
+      let marker;
+      try { marker = lstatSync(join(candidate, '.git')); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false; }
+      if (marker) {
+        // The nearest marker is a boundary even when malformed or unsupported.
+        if ((!marker.isDirectory() && !marker.isFile()) || !accepted(candidate)) return false;
+        const top = execFileSync('/usr/bin/git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
+          env: { HOME: home, PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0' },
+          encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim();
+        return realpathSync(top) === candidate;
+      }
+      if (dirname(candidate) === candidate) return false;
+    }
+  } catch { return false; }
+}
+
+function prepareClaudeJob(definition: NormalizedAgentDefinition, params: NativeJobParams, context: NativeHostContext,
+  bindings: NativeScopeBindings, home: string, mcp: ReturnType<typeof bindNativeMcp>) {
+  const policy = definition.native!;
+  if (context.env.CLAUDE_CONFIG_DIR || context.env.CLAUDE_CODE_IGNORE_PERSISTED_TRUST) throw new Error('Unsupported Claude trust-store or persisted-trust override');
+  if (policy.workspaceTrust !== 'existing') throw new Error('Claude requires verified existing workspace trust');
+  if (definition.systemPrompt?.mode) throw new Error('Claude native jobs do not accept Pi system-prompt modes');
+  if (!definition.model || definition.model.includes('/')) throw new Error('Claude requires a native model name');
+  if (definition.thinking && !['low', 'medium', 'high', 'xhigh', 'max'].includes(definition.thinking)) throw new Error('Unsupported Claude effort');
+  if (!/^\d+\.\d+\.\d+$/.test(policy.runnerVersion)) throw new Error('Claude requires an explicit runner-version');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(context.nativeName)) throw new Error('Claude requires a host-owned UUID');
+  if (!Array.isArray(policy.nativeTools) || !['manual', 'dontAsk', 'plan'].includes(policy.permissionMode ?? '')) throw new Error('Claude requires native-tools and permission-mode');
+  const supportedTools = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'];
+  if (policy.nativeTools.some(tool => !supportedTools.includes(tool))) throw new Error('Unsupported Claude native-tools; this slice supports Read, Glob, Grep, Edit, Write and Bash only');
+  for (const rule of [...policy.allow, ...policy.deny]) {
+    const builtin = [...supportedTools, 'Agent'].some(tool => rule === tool || (rule.startsWith(`${tool}(`) && rule.endsWith(')')));
+    const explicitMcp = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(rule) && Object.keys(mcp).some(name => rule.startsWith(`mcp__${name}__`));
+    if (!builtin && !explicitMcp) throw new Error(`Unsupported Claude native permission rule: ${rule}`);
+  }
+  const cwd = realpathSync(resolve(context.parentCwd, params.cwd?.trim() || definition.cwd || '.'));
+  if (!statSync(cwd).isDirectory()) throw new Error('Claude cwd must be an existing directory');
+  if (!hasExistingClaudeTrust(home, cwd)) throw new Error('Claude print mode requires an existing trusted workspace (canonical cwd or verified repository root); trust was not changed');
+  const instructions = [definition.systemPrompt?.text,
+    mcp.tasks ? 'Binding hint: todo(...) examples refer to MCP server tasks, tool todo. Use only its declared actions.' : undefined,
+    ...(context.skills ?? []).map(skill => `Skill: ${skill.name}\nBase directory: ${skill.baseDir}\n${skill.body}`)].filter(Boolean).join('\n\n');
+  if (Buffer.byteLength(instructions + params.task) > 60 * 1024 || (instructions + params.task).includes('\0')) throw new Error('Claude prompt exceeds 60 KiB or contains NUL; instructions were not truncated');
+  const executable = (context.env.PATH ?? '').split(delimiter).filter(isAbsolute).map(dir => join(dir, 'claude')).find(path => {
+    try { accessSync(path, constants.X_OK); return statSync(path).isFile(); } catch { return false; }
+  });
+  if (!executable) throw new Error('Claude executable is not installed on the host PATH; no installation was attempted');
+  realpathSync(executable);
+  const env = { ...context.env, HOME: home, DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+  const version = execFileSync(executable, ['--version'], { env, encoding: 'utf8', timeout: 10000 }).trim();
+  if (version !== `${policy.runnerVersion} (Claude Code)`) throw new Error('Installed Claude does not match runner-version');
+  const runtimeGuard = 'if [[ -n "${CLAUDE_CONFIG_DIR:-}" || -n "${CLAUDE_CODE_IGNORE_PERSISTED_TRUST:-}" ]]; then printf "%s\\n" "Unsupported Claude runtime trust override" >&2; exit 78; fi\nexec "$@"';
+  const argv = ['/bin/bash', '--noprofile', '--norc', '-c', runtimeGuard, 'native-claude',
+    '/usr/bin/env', `HOME=${home}`, 'DISABLE_AUTOUPDATER=1', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1',
+    'CLAUDE_CODE_DISABLE_CLAUDE_MDS=1', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=1', 'ENABLE_CLAUDEAI_MCP_SERVERS=false', executable,
+    '--print', '--output-format', 'text', '--disable-slash-commands', '--setting-sources', '',
+    '--settings', JSON.stringify({ disableAllHooks: true, autoMemoryEnabled: false, disableClaudeAiConnectors: true }),
+    '--strict-mcp-config', '--mcp-config', JSON.stringify({ mcpServers: Object.fromEntries(Object.entries(mcp).map(([name, server]) => [name, { type: 'stdio', ...server }])) }),
+    '--model', definition.model, ...(definition.thinking ? ['--effort', definition.thinking] : []),
+    '--tools', policy.nativeTools.join(','), '--permission-mode', policy.permissionMode!, '--permission-prompts', 'none',
+    ...policy.allow.flatMap(value => ['--allowedTools', value]), ...policy.deny.flatMap(value => ['--disallowedTools', value]),
+    '--system-prompt-snapshot', 'off', ...(instructions ? ['--append-system-prompt', instructions] : []),
+    context.resume ? '--resume' : '--session-id', context.nativeName, '--', params.task];
+  return { argv, cwd,
+    nativeReference: { runner: 'claude' as const, selector: { kind: 'uuid' as const, value: context.nativeName }, managedSessionId: context.managedSessionId, cwd },
+    context: { parentCwd: bindings.parentCwd, managedSessionId: bindings.managedSessionId, env: { PI_TODO_PATH: bindings.todoPathLiteral } },
+    skills: context.skills ?? [] };
 }
