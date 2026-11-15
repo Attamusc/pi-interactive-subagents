@@ -13,6 +13,7 @@ import { pollForExit, getMuxBackend, muxSetupHint } from "../pi-extension/subage
 import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
 
 it("selects explicit Core without classic fallback and requires inherited identity", () => {
+  const environment = process.env;
   const saved = { ...process.env };
   try {
     process.env.PI_SUBAGENT_MUX = "herdr-core";
@@ -23,7 +24,11 @@ it("selects explicit Core without classic fallback and requires inherited identi
     process.env.HC_TERMINAL_ID = "t1";
     assert.equal(getMuxBackend(), "herdr-core");
     assert.match(muxSetupHint(), /Core/);
-  } finally { process.env = saved; }
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
+  assert.ok(process.env === environment, "fixture cleanup must preserve the native environment binding");
 });
 
 const block = (id: string, terminal: string) => ({ id, type: "block", content: { terminal } });
@@ -125,7 +130,9 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
     assert.equal(existsSync(appLog), false, "desktop herdr-app CLI is forbidden");
     assert.equal(requests.some(request => request.method === "doc.set"), false);
   } finally {
-    process.env = saved; process.argv[1] = originalArgv;
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    process.argv[1] = originalArgv;
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
   }
