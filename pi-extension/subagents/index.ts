@@ -844,7 +844,13 @@ function releaseRunningSubagent(id: string): boolean {
   const running = runningSubagents.get(id);
   if (!running) return false;
 
-  if (running.cli === 'copilot' && running.nativeState?.process.status === 'exited' && !running.coreCleanupError) running.nativeOnClosed?.();
+  if (running.cli === 'copilot' && running.nativeState?.process.status === 'exited' && !running.coreCleanupError) {
+    try { running.nativeOnClosed?.(); }
+    catch (error) {
+      running.nativeDiagnostic = `Native closure record persistence unconfirmed: ${error instanceof Error ? error.message : String(error)}`;
+      console.error(running.nativeDiagnostic);
+    }
+  }
   runningSubagents.delete(id);
   if (running.blockedEventBus) {
     emitHerdrBlocked(running.blockedEventBus, { active: false });
@@ -1762,12 +1768,13 @@ async function launchSubagent(
   options?: { surface?: string; skillCatalog?: ReturnType<ExtensionAPI['getCommands']>;
     nativeResume?: ReturnType<typeof resolveManagedNativeResume>; nativeDefinition?: AgentDefaults;
     nativeLifecycle?: (record: ManagedNativeSessionRecord, agent: string, runId: string) => () => void;
+    nativeNotStarted?: (runId: string) => void;
   },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = options?.nativeDefinition ?? (params.agent ? loadAgentDefaults(params.agent) : null);
+  const agentDefs = options?.nativeDefinition ?? (params.agent ? loadAgentDefaults(params.agent, ctx.cwd) : null);
   const coreSelected = getMuxBackend() === "herdr-core";
   if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
   else if (normalizeOptionalString(params.resumeSessionId)) throw new Error("resumeSessionId requires a Claude review agent");
@@ -1790,32 +1797,49 @@ async function launchSubagent(
       definitionOrigin: agentDefs.definition.origin!, definitionSha256: agentDefs.definitionSha256!,
       bindings: { parentCwd: nativeJob.context.parentCwd, managedSessionId, todoPathLiteral: nativeJob.context.env.PI_TODO_PATH }, skills,
     }, agentDefs.definition.name, id);
-    const prepared = await prepareCoreJobLaunch(params.name);
-    const launchScriptFile = join(artifactDir, "subagent-scripts", `${id}.copilot.sh`);
-    const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.native-start.json`);
-    const nativeCapturePaths = {
-      stdout: join(artifactDir, "subagent-completion", `${id}.native-stdout.txt`),
-      stderr: join(artifactDir, "subagent-completion", `${id}.native-stderr.txt`),
-      status: join(artifactDir, "subagent-completion", `${id}.native-capture.json`),
-    };
-    mkdirSync(dirname(nativeCapturePaths.stdout), { recursive: true, mode: 0o700 });
-    const metadata = {
-      name: params.name, task: params.task, agent: params.agent, sessionFile: "", startTime,
-      canSpawnDirectChildren: false, artifactDir, cli: "copilot", nativeJob, nativeCapturePaths, nativeOnClosed,
-      nativeState: createAgentRunState(id, "native-job"),
-      nativeDefinition: { origin: agentDefs.definition.origin!, sha256: agentDefs.definitionSha256! },
-    };
-    const coreHost = await launchOwnedCoreRun(prepared, {
-      runId: id, scriptPath: launchScriptFile, wrapperStartFile,
-      command: buildNativeCaptureCommand(nativeJob.argv, nativeCapturePaths, id),
-      cwd: nativeJob.cwd, agentDir: getAgentConfigDir(),
-      env: { HOME: process.env.HOME || homedir(), COPILOT_AUTO_UPDATE: "false" },
-    }, metadata);
-    return {
-      ...metadata, id, runId: id, coreHost, surface: coreHost.address, launchScriptFile,
-      transcriptStartLine: 0, interactive: false,
-      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
-    };
+    let launchAttempted = false;
+    try {
+      const prepared = await prepareCoreJobLaunch(params.name);
+      const launchScriptFile = join(artifactDir, "subagent-scripts", `${id}.copilot.sh`);
+      const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.native-start.json`);
+      const nativeCapturePaths = {
+        stdout: join(artifactDir, "subagent-completion", `${id}.native-stdout.txt`),
+        stderr: join(artifactDir, "subagent-completion", `${id}.native-stderr.txt`),
+        status: join(artifactDir, "subagent-completion", `${id}.native-capture.json`),
+      };
+      mkdirSync(dirname(nativeCapturePaths.stdout), { recursive: true, mode: 0o700 });
+      const metadata = {
+        name: params.name, task: params.task, agent: params.agent, sessionFile: "", startTime,
+        canSpawnDirectChildren: false, artifactDir, cli: "copilot", nativeJob, nativeCapturePaths, nativeOnClosed,
+        nativeState: createAgentRunState(id, "native-job"),
+        nativeDefinition: { origin: agentDefs.definition.origin!, sha256: agentDefs.definitionSha256! },
+      };
+      launchAttempted = true;
+      const coreHost = await launchOwnedCoreRun(prepared, {
+        runId: id, scriptPath: launchScriptFile, wrapperStartFile,
+        command: buildNativeCaptureCommand(nativeJob.argv, nativeCapturePaths, id),
+        cwd: nativeJob.cwd, agentDir: getAgentConfigDir(),
+        env: { HOME: process.env.HOME || homedir(), COPILOT_AUTO_UPDATE: "false" },
+      }, metadata);
+      return {
+        ...metadata, id, runId: id, coreHost, surface: coreHost.address, launchScriptFile,
+        transcriptStartLine: 0, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+      };
+    } catch (error) {
+      // startCoreRun exposes a bare run refusal only after a successful
+      // zero-match reconciliation. Sent/uncertain or known-owned runs never
+      // qualify, even if later visibility cleanup already removed the program.
+      const definite = !launchAttempted || (error instanceof CoreRpcError && (
+        ['hello', 'terminal.get'].includes(error.method)
+        || (error.method === 'terminal.run' && ['invalid_params', 'name_taken', 'not_found'].includes(error.kind))
+      )) || (error instanceof Error && ['mkdir', 'open', 'write', 'chmod'].includes((error as NodeJS.ErrnoException).syscall ?? ''));
+      if (definite && !(error instanceof CoreLaunchUnconfirmed) && !(error instanceof CoreSetupCleanupFailure) && !runningSubagents.has(id)) {
+        try { options?.nativeNotStarted?.(id); }
+        catch (failure) { console.error(`Native prior closure restore unconfirmed: ${failure instanceof Error ? failure.message : String(failure)}`); }
+      }
+      throw error;
+    }
   }
   // The legacy Claude review route is separate from the shared runner resolver.
   const launchIntent = resolveVisibleLaunchIntent(params, agentDefs?.cli === "claude"
@@ -2524,8 +2548,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const closed: NativeSessionEntry = { ...entry, state: 'closed' };
       // Do not introduce abandoned-launch authority onto a different branch.
       // A branch without this invocation retains no durable resume authority.
-      if (ctx.sessionManager.getSessionId() === record.callerSessionId
-        && nativeSessionRecords(ctx).get(record.reference.managedSessionId)?.runId === runId) pi.appendEntry(NATIVE_SESSION_ENTRY, closed);
+      if (ctx.sessionManager.getSessionId() !== record.callerSessionId
+        || nativeSessionRecords(ctx).get(record.reference.managedSessionId)?.runId !== runId) throw new Error('Native caller branch changed before closure persistence');
+      pi.appendEntry(NATIVE_SESSION_ENTRY, closed);
       managedNativeSessions.set(record.reference.managedSessionId, closed);
     };
   };
@@ -2536,7 +2561,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ensureModuleAbortController();
     latestCtx = ctx;
     managedNativeSessions.clear();
-    if (typeof ctx.sessionManager.getBranch === 'function') for (const [id, entry] of nativeSessionRecords(ctx)) managedNativeSessions.set(id, entry);
+    try {
+      if (typeof ctx.sessionManager.getBranch === 'function') for (const [id, entry] of nativeSessionRecords(ctx)) managedNativeSessions.set(id, entry);
+    } catch (error) {
+      managedNativeSessions.clear();
+      console.error(`Native record restore unavailable; native resume remains fail-closed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     sessionActive = true;
     setDirectChildCountProvider(() => runningSubagents.size + pendingOwnedLaunches);
   });
@@ -3039,6 +3069,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const active = managedNativeSessions.get(managedSessionId);
           if (captured.state !== 'closed' || active?.state === 'open' || [...runningSubagents.values()].some(run => run.nativeJob?.nativeReference.managedSessionId === managedSessionId)) throw new Error('Managed native session invocation is active or closure/launch remains unconfirmed');
           if (!message) throw new Error('Copilot headless resume requires a nonblank follow-up message before launch');
+          const callerSignal = getModuleAbortSignal();
           const reservation: NativeSessionEntry = { ...captured, state: 'open', runId: randomUUID() };
           managedNativeSessions.set(managedSessionId, reservation);
           try {
@@ -3055,6 +3086,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               running = await launchSubagent({ name: 'Resume', task: message, agent: selected.definition.name }, ctx, {
                 nativeDefinition: selected, nativeResume: resumed,
                 nativeLifecycle: (record, agent, runId) => nativeLifecycle(record, agent, runId, ctx),
+                nativeNotStarted: runId => {
+                  if (callerSignal.aborted) throw new Error('Native caller runtime invalidated before prior closure restore');
+                  if (ctx.sessionManager.getSessionId() !== captured.record.callerSessionId
+                    || nativeSessionRecords(ctx).get(managedSessionId)?.runId !== runId) throw new Error('Native caller branch changed before prior closure restore');
+                  pi.appendEntry(NATIVE_SESSION_ENTRY, captured);
+                  managedNativeSessions.set(managedSessionId, captured);
+                },
               });
               registerRunningSubagent(pi, running);
             } finally { finishOwnedLaunch(); }
