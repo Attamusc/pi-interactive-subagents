@@ -17,6 +17,10 @@ import { readNativeCapture } from '../pi-extension/subagents/native-job.ts';
 import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
 
 for (const scenario of [
+  { name: 'classic default with Core available', mux: 'default', reason: 'exited', disposition: 'completed' },
+  { name: 'blank override with Core available', mux: 'blank', reason: 'exited', disposition: 'completed' },
+  { name: 'explicit classic override', mux: 'herdr', rejected: /Native jobs require the herdr-core backend/ },
+  { name: 'classic default without Core context', mux: 'missing-core', rejected: /HC_TERMINAL_SOCKET and HC_TERMINAL_ID required/ },
   { name: 'natural zero exit', reason: 'exited', disposition: 'completed' },
   { name: 'bounded Unicode output', unicodeOutput: true, reason: 'exited', disposition: 'completed' },
   { name: 'complete private stdout beyond 200 lines', longOutput: true, reason: 'exited', disposition: 'completed' },
@@ -57,7 +61,29 @@ for (const scenario of [
       writeFileSync(join(agents, 'native-worker.md'), parsedBytes.replace('Trusted role', 'Changed after parsing'));
       return ctx.sessionManager.getSessionFile();
     } } };
-    const running: any = await __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ', resumeSessionId: ' ' }, launchCtx);
+    if (scenario.mux) {
+      writeFileSync(join(dir, 'bin/herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+      process.env.HERDR_SOCKET_PATH = join(dir, 'classic.sock');
+      delete process.env.PI_SUBAGENT_MUX;
+      if (scenario.mux === 'blank') process.env.PI_SUBAGENT_MUX = '  ';
+      if (scenario.mux === 'herdr') process.env.PI_SUBAGENT_MUX = 'herdr';
+      if (scenario.mux === 'missing-core') {
+        delete process.env.HC_TERMINAL_SOCKET;
+        delete process.env.HC_TERMINAL_ID;
+      }
+      assert.equal(getMuxBackend(), 'herdr');
+    }
+    const launch = () => __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ', resumeSessionId: ' ' }, launchCtx);
+    if (scenario.rejected) {
+      await assert.rejects(launch, scenario.rejected);
+      assert.equal(requests.length, 0, 'rejected native jobs never launch through Core or fall back');
+      assert.equal(readFileSync(join(dir, 'parent.jsonl'), 'utf8').trim().split('\n').length, 1, 'no Pi transcript seeding');
+      assert.equal(existsSync(proof), false, 'no native executable invocation');
+      assert.equal(getMuxBackend(), 'herdr');
+      return;
+    }
+    const running: any = await launch();
+    if (scenario.mux) assert.equal(getMuxBackend(), 'herdr', 'native launch must not change the global backend');
     try {
       assert.equal(running.cli, 'copilot');
       assert.equal(running.nativeDefinition.sha256, createHash('sha256').update(parsedBytes).digest('hex'));
