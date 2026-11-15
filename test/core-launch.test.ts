@@ -20,6 +20,7 @@ for (const scenario of [
   { name: 'classic default with Core available', mux: 'default', reason: 'exited', disposition: 'completed' },
   { name: 'blank override with Core available', mux: 'blank', reason: 'exited', disposition: 'completed' },
   { name: 'explicit classic override', mux: 'herdr', rejected: /Native jobs require the herdr-core backend/ },
+  { name: 'unknown override with only Core available', mux: 'unknown-core', expectedBackend: 'herdr-core', rejected: /Native jobs require the herdr-core backend/ },
   { name: 'classic default without Core context', mux: 'missing-core', rejected: /HC_TERMINAL_SOCKET and HC_TERMINAL_ID required/ },
   { name: 'natural zero exit', reason: 'exited', disposition: 'completed' },
   { name: 'bounded Unicode output', unicodeOutput: true, reason: 'exited', disposition: 'completed' },
@@ -71,7 +72,11 @@ for (const scenario of [
         delete process.env.HC_TERMINAL_SOCKET;
         delete process.env.HC_TERMINAL_ID;
       }
-      assert.equal(getMuxBackend(), 'herdr');
+      if (scenario.mux === 'unknown-core') {
+        for (const key of ['HERDR_SOCKET_PATH', 'CMUX_SOCKET_PATH', 'TMUX', 'ZELLIJ', 'ZELLIJ_SESSION_NAME', 'WEZTERM_UNIX_SOCKET']) delete process.env[key];
+        process.env.PI_SUBAGENT_MUX = 'unsupported-backend';
+      }
+      assert.equal(getMuxBackend(), scenario.expectedBackend ?? 'herdr');
     }
     const launch = () => __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ', resumeSessionId: ' ' }, launchCtx);
     if (scenario.rejected) {
@@ -79,7 +84,7 @@ for (const scenario of [
       assert.equal(requests.length, 0, 'rejected native jobs never launch through Core or fall back');
       assert.equal(readFileSync(join(dir, 'parent.jsonl'), 'utf8').trim().split('\n').length, 1, 'no Pi transcript seeding');
       assert.equal(existsSync(proof), false, 'no native executable invocation');
-      assert.equal(getMuxBackend(), 'herdr');
+      assert.equal(getMuxBackend(), scenario.expectedBackend ?? 'herdr');
       return;
     }
     const running: any = await launch();

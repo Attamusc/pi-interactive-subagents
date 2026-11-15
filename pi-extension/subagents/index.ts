@@ -1780,7 +1780,8 @@ async function launchSubagent(
   if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
   else if (normalizeOptionalString(params.resumeSessionId)) throw new Error("resumeSessionId requires a Claude review agent");
   if (agentDefs && ['copilot', 'claude'].includes(agentDefs.definition.runner)) {
-    if (!coreSelected && process.env.PI_SUBAGENT_MUX?.trim()) throw new Error("Native jobs require the herdr-core backend; no fallback is available");
+    const nativeBackend = process.env.PI_SUBAGENT_MUX?.trim().toLowerCase();
+    if (nativeBackend && (nativeBackend !== 'herdr-core' || !coreSelected)) throw new Error("Native jobs require the herdr-core backend; no fallback is available");
     if (options?.surface) throw new Error("Native jobs cannot reuse a classic surface");
     const resumed = options?.nativeResume;
     const managedSessionId = resumed?.reference.managedSessionId ?? randomUUID();
