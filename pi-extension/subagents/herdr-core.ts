@@ -94,8 +94,8 @@ function terminal(value: unknown, method: string): CoreTerminal {
     parent: record.parent ?? null, exit_code: record.exit_code ?? null, signal: record.signal ?? null, reason: record.reason ?? null };
 }
 
-async function handshake(endpoint: string): Promise<string> {
-  const result = object(await coreRpcCall(endpoint, "hello", { generation: 1 }));
+async function handshake(endpoint: string, timeout = 5000): Promise<string> {
+  const result = object(await coreRpcCall(endpoint, "hello", { generation: 1 }, timeout));
   if (result?.generation !== 1 || typeof result.core?.id !== "string" || !Array.isArray(result.methods)
     || REQUIRED_METHODS.some(method => !result.methods.includes(method))) {
     throw new CoreRpcError("hello", "unsupported", "generation 1 and terminal run/get/list/read/keys/kill/rm are required");
@@ -162,10 +162,19 @@ export const CORE_AMBIENT_CLEAR_KEYS = [
   "PI_SUBAGENT_LAUNCH_POLICY", "PI_SUBAGENT_RESTORE_POLICY", "PI_SESSION_FILE", "PI_SESSION_ID",
 ] as const;
 
-async function verifyCore(context: Pick<CoreContext, "endpoint" | "coreId">): Promise<void> {
-  if (await handshake(context.endpoint) !== context.coreId) {
+async function verifyCore(context: Pick<CoreContext, "endpoint" | "coreId">, timeout = 5000): Promise<void> {
+  if (await handshake(context.endpoint, timeout) !== context.coreId) {
     throw new CoreRpcError("hello", "owner_mismatch", "the endpoint now belongs to a different Core");
   }
+}
+
+export async function getCoreLayoutDocument(context: Pick<CoreContext, "endpoint" | "coreId">, timeout = 5000): Promise<unknown> {
+  const deadline = Date.now() + timeout;
+  await verifyCore(context, timeout);
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new CoreRpcError("doc.get", "timeout", "layout request deadline exceeded");
+  // No `on`: this is the captured Core's machine-owned local document, not a merged multi-machine view.
+  return coreRpcCall(context.endpoint, "doc.get", { name: "herdr-app" }, remaining);
 }
 
 function hostRef(context: CoreContext, spec: CoreRunSpec, record: CoreTerminal): CoreHostRef {

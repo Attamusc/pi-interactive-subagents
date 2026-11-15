@@ -102,12 +102,12 @@ export function getMuxBackend(): MuxBackend | null {
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
 
+  if (isCoreRuntimeAvailable()) return "herdr-core";
   if (isHerdrRuntimeAvailable()) return "herdr";
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
-  if (isCoreRuntimeAvailable()) return "herdr-core";
   return null;
 }
 
@@ -117,7 +117,7 @@ export function isMuxAvailable(): boolean {
 
 export function muxSetupHint(): string {
   const pref = muxPreference();
-  if (pref === "herdr-core") return "Start Node-hosted Pi inside a local Herdr Core terminal adopted by herdr-app.";
+  if (pref === "herdr-core" || (!pref && isCoreRuntimeAvailable())) return "Start Node-hosted Pi inside a live local Herdr Core terminal; interactive children require its layout in Core's herdr-app document (desktop or mobile client, no desktop CLI).";
   if (pref === "herdr") {
     return "Start pi inside herdr (launch herdr, then run `pi`).";
   }
@@ -133,7 +133,7 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside herdr (launch herdr, then run `pi`), cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  return "Start Node-hosted Pi inside Herdr Core (desktop or mobile), herdr (launch herdr, then run `pi`), cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {

@@ -1,11 +1,7 @@
-import { execFile } from "node:child_process";
-import { promisify, stripVTControlCharacters } from "node:util";
+import { stripVTControlCharacters } from "node:util";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join, resolve, extname } from "node:path";
-import { homedir } from "node:os";
-import { resolveCoreContext, startCoreRun, killCoreTerminal, removeCoreTerminal, type CoreContext, type CoreHostRef } from "./herdr-core.ts";
-
-const exec = promisify(execFile);
+import { resolveCoreContext, getCoreLayoutDocument, startCoreRun, killCoreTerminal, removeCoreTerminal, type CoreContext, type CoreHostRef } from "./herdr-core.ts";
 
 export function resolveParentPiRuntime() {
   const unsupported = () => new Error("Herdr Core requires an identifiable Node-hosted Pi CLI package entrypoint");
@@ -30,29 +26,53 @@ export function resolveParentPiRuntime() {
   throw unsupported();
 }
 
-interface AppContext { home: string; env: NodeJS.ProcessEnv; placement?: { space: string; parentTab: string; parentPane: string } }
-export interface PreparedCoreLaunch { context: CoreContext; runtime: ReturnType<typeof resolveParentPiRuntime>; app: AppContext; title: string }
-
-async function appCall(env: NodeJS.ProcessEnv, args: string[], timeout = 5000): Promise<any> {
-  const { stdout } = await exec("herdr-app", args, { env, timeout, maxBuffer: 1024 * 1024, encoding: "utf8" });
-  const result = JSON.parse(stdout);
-  if (!result || typeof result !== "object" || Array.isArray(result) || result.error) throw new Error("Invalid herdr-app response");
-  return result;
+interface Placement { space: string; tab: string; pane: string }
+export interface PreparedCoreLaunch {
+  context: CoreContext; runtime: ReturnType<typeof resolveParentPiRuntime>; env: NodeJS.ProcessEnv;
+  placement?: Placement; title: string;
 }
 
-function localSpace(list: any, id: string): any {
-  const matches = Array.isArray(list.spaces) ? list.spaces.filter((space: any) => space?.id === id) : [];
-  if (matches.length !== 1 || matches[0].machine !== null || !Array.isArray(matches[0].tabs)) {
-    throw new Error("Herdr app parent space is missing, ambiguous or nonlocal");
+function layoutPlacements(document: unknown, address: string): Placement[] {
+  const object = (value: any): value is Record<string, any> => value !== null && typeof value === "object" && !Array.isArray(value);
+  const id = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+  const invalid = () => { throw new Error("Unsupported or malformed Core layout document"); };
+  if (!object(document) || !Number.isInteger(document.version) || document.version < 0 || document.version >= 2 ** 64
+    || !object(document.value) || !Array.isArray(document.value.spaces)) return invalid();
+  const matches: Placement[] = [];
+  const spaces = new Set<string>();
+  const tabs = new Set<string>();
+  const panes = new Set<string>();
+  for (const space of document.value.spaces) {
+    if (!object(space) || !id(space.id) || spaces.has(space.id) || !Array.isArray(space.tabs)) return invalid();
+    spaces.add(space.id);
+    for (const tab of space.tabs) {
+      if (!object(tab) || !id(tab.id) || tabs.has(tab.id)) return invalid();
+      tabs.add(tab.id);
+      const visit = (node: any): void => {
+        if (!object(node) || (node.id !== undefined && typeof node.id !== "string")) return invalid();
+        if (id(node.id)) {
+          if (panes.has(node.id)) return invalid();
+          panes.add(node.id);
+        }
+        if (node.type === "block") {
+          const content = node.content;
+          if (!object(content)) return invalid();
+          // Only the tagged block's content is authoritative; metadata and mod props are not layout nodes.
+          const kinds = ["terminal", "mod", "tab", "context", "agent"].filter(key => key in content);
+          if (kinds.length !== 1 || !id(content[kinds[0]])) return invalid();
+          if (kinds[0] === "terminal") {
+            if (!id(node.id)) return invalid();
+            if (content.terminal === address) matches.push({ space: space.id, tab: tab.id, pane: node.id });
+          }
+        } else if (["row", "column", "stack"].includes(node.type)) {
+          if (!Array.isArray(node.children)) return invalid();
+          for (const child of node.children) visit(child);
+        } else return invalid();
+      };
+      visit(tab.root);
+    }
   }
-  return matches[0];
-}
-
-function addressMatches(space: any, address: string): { tab: any; terminal: any }[] {
-  return space.tabs.flatMap((tab: any) => {
-    if (typeof tab?.id !== "string" || !Array.isArray(tab.terminals)) throw new Error("Invalid herdr-app tab listing");
-    return tab.terminals.filter((terminal: any) => terminal?.terminal === address).map((terminal: any) => ({ tab, terminal }));
-  });
+  return matches;
 }
 
 export async function prepareCoreLaunch(name: string, interactive: boolean): Promise<PreparedCoreLaunch> {
@@ -63,39 +83,30 @@ export async function prepareCoreLaunch(name: string, interactive: boolean): Pro
   const runtime = resolveParentPiRuntime();
   const context = await resolveCoreContext();
   const env = { ...process.env };
-  // Match herdr-app app_dir(): nonempty override, XDG config root, then ~/.config.
-  const configHome = env.XDG_CONFIG_HOME || join(env.HOME ?? homedir(), ".config");
-  const home = resolve(env.HERDR_APP_HOME || join(configHome, "herdr-app"));
-  env.HERDR_APP_HOME = home;
-  if (!interactive) return { context, runtime, title, app: { home, env } };
-  const spaceId = context.parentTerminal.labels["herdr.space"];
-  const parentTab = context.parentTerminal.labels["herdr.tab"];
-  if (!spaceId || !parentTab) throw new Error("Core parent must be adopted by herdr-app with space/tab labels");
-  const listing = await appCall(env, ["ls"]);
-  const status = await appCall(env, ["status"]);
-  if (typeof status.space !== "string" || typeof status.tab !== "string") throw new Error("Invalid herdr-app status");
-  const space = localSpace(listing, spaceId);
-  const matches = addressMatches(space, context.parent);
-  if (matches.length !== 1 || matches[0].tab.id !== parentTab || typeof matches[0].terminal.pane !== "string") {
-    throw new Error("Herdr app parent address does not match its labeled tab");
+  if (!interactive) return { context, runtime, title, env };
+  const matches = layoutPlacements(await getCoreLayoutDocument(context), context.parent);
+  if (matches.length !== 1) throw new Error("Core parent placement is missing or ambiguous in the layout document");
+  const placement = matches[0];
+  for (const [label, expected] of [["herdr.space", placement.space], ["herdr.tab", placement.tab]]) {
+    const hint = context.parentTerminal.labels[label];
+    if (hint !== undefined && hint !== expected) throw new Error(`Core parent ${label} label does not match its layout placement`);
   }
-  return { context, runtime, title, app: { home, env, placement: { space: spaceId, parentTab, parentPane: matches[0].terminal.pane } } };
+  return { context, runtime, title, env, placement };
 }
 
 async function adoptCoreRun(prepared: PreparedCoreLaunch, host: CoreHostRef): Promise<void> {
-  const { app } = prepared;
-  if (!app.placement) return;
-  const { space, parentTab, parentPane } = app.placement;
+  if (!prepared.placement) return;
+  const { space, tab, pane } = prepared.placement;
   const deadline = Date.now() + 10_000;
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error("Core child adoption timed out");
-    const listing = await appCall(app.env, ["ls"], Math.min(5000, remaining));
-    const matches = addressMatches(localSpace(listing, space), host.address);
+    const document = await getCoreLayoutDocument(host, Math.min(5000, remaining));
+    const matches = layoutPlacements(document, host.address);
     if (matches.length > 1) throw new Error("Ambiguous Core child adoption");
     if (matches.length === 1) {
-      const { tab, terminal } = matches[0];
-      if (tab.id !== parentTab || typeof terminal.pane !== "string" || terminal.pane === parentPane) {
+      const child = matches[0];
+      if (child.space !== space || child.tab !== tab || child.pane === pane) {
         throw new Error("Core child was not adopted into a distinct pane in the parent tab");
       }
       return;
@@ -128,8 +139,8 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   const host = await startCoreRun(prepared.context, {
     name, runId: spec.runId, scriptPath: spec.scriptPath,
     wrapperStartFile: spec.wrapperStartFile, cwd: spec.cwd,
-    env: { PATH: prepared.app.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, HERDR_APP_HOME: prepared.app.home },
-    labels: prepared.app.placement ? { "herdr.space": prepared.app.placement.space, "herdr.tab": prepared.app.placement.parentTab } : {},
+    env: { PATH: prepared.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir },
+    labels: prepared.placement ? { "herdr.space": prepared.placement.space, "herdr.tab": prepared.placement.tab } : {},
   });
   host.runtime = { ...prepared.runtime };
   try { await adoptCoreRun(prepared, host); }

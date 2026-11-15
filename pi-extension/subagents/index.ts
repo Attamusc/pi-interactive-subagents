@@ -1114,13 +1114,14 @@ function buildClaudeCommand(options: {
   resumeSessionId?: string;
   task: string;
   cwd?: string;
+  nodeExecutable?: string;
 }): string {
   const parts = [
     "claude", "--safe-mode", "--restricted", "--strict-mcp-config",
     "--permission-mode", "dontAsk", "--tools", shellEscape("Read,Glob,Grep"),
     "--allowedTools", shellEscape("Read"), shellEscape("Glob"), shellEscape("Grep"),
     "--disallowedTools", shellEscape("mcp__*"),
-    "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--max-turns", "16",
+    "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
   ];
   if (options.model) parts.push("--model", shellEscape(options.model));
   if (options.systemPrompt) parts.push("--append-system-prompt", shellEscape(options.systemPrompt));
@@ -1128,7 +1129,7 @@ function buildClaudeCommand(options: {
   parts.push("--", shellEscape(options.task));
 
   const runner = shellEscape(fileURLToPath(new URL("./claude-run.ts", import.meta.url)));
-  return ["node", runner, shellEscape(options.resultFile), shellEscape(options.processIdFile),
+  return [options.nodeExecutable ? shellEscape(options.nodeExecutable) : "node", runner, shellEscape(options.resultFile), shellEscape(options.processIdFile),
     shellEscape(options.runId), shellEscape(options.cwd ?? ""), ...parts].join(" ");
 }
 
@@ -1643,7 +1644,6 @@ async function launchSubagent(
   if (claudeSystemPrompt && Buffer.byteLength(claudeSystemPrompt, "utf8") > 60 * 1024) {
     throw new Error("Claude review system prompt exceeds 60 KiB");
   }
-  if (coreSelected && agentDefs?.cli === "claude") throw new Error("Claude-on-Core is unsupported; select a classic backend");
   if (coreSelected && options?.surface) throw new Error("Core launches cannot reuse a classic surface");
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
   const coreLaunch = coreSelected ? await prepareCoreLaunch(params.name, effectiveInteractive) : undefined;
@@ -1736,8 +1736,13 @@ async function launchSubagent(
       resumeSessionId: params.resumeSessionId,
       task: params.task,
       cwd: targetCwdForSession,
+      nodeExecutable: coreLaunch?.runtime.node,
     });
-    const command = buildVisibleWrapperCommand({ piCommand: claudeCommand, runId: id, wrapperExitFile });
+    const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.wrapper-start.json`);
+    const command = buildVisibleWrapperCommand({
+      piCommand: claudeCommand, runId: id, wrapperExitFile,
+      ...(coreLaunch ? { wrapperStartFile, nodeExecutable: coreLaunch.runtime.node } : {}),
+    });
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1747,7 +1752,16 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    await sendLongCommand(surface, command, {
+    if (coreLaunch) {
+      coreHost = await launchOwnedCoreRun(coreLaunch, {
+        runId: id, scriptPath: launchScriptFile, wrapperStartFile, command,
+        cwd: targetCwdForSession, agentDir: effectiveAgentDir,
+      }, {
+        name: params.name, task: params.task, agent: params.agent, sessionFile: subagentSessionFile, artifactDir, startTime,
+        canSpawnDirectChildren: false,
+      });
+      surface = coreHost.address;
+    } else await sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
@@ -1768,6 +1782,8 @@ async function launchSubagent(
       transcriptStartLine,
       launchScriptFile,
       cli: "claude",
+      coreHost,
+      artifactDir,
       claudeResultFile: resultFile,
       claudeProcessIdFile: processIdFile,
       wrapperExitFile,
@@ -1996,7 +2012,7 @@ async function watchSubagent(
         const partial = readClaudeFailureResult(running.claudeResultFile!);
         if (partial) summary += `\n\nPartial Claude output:\n${partial}`;
       }
-      try { await close(surface); }
+      try { await closeOwnedSubagent(running, close); }
       catch (error) {
         const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
         summary += `\n\nHerdr pane cleanup failed after verified CLI exit: ${reason}`;

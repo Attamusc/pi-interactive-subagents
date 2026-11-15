@@ -99,7 +99,8 @@ describe("Claude CLI launch", () => {
       cwd: "/tmp/project",
     });
 
-    assert.match(command, /claude --safe-mode --restricted --strict-mcp-config --permission-mode dontAsk --tools 'Read,Glob,Grep' --allowedTools 'Read' 'Glob' 'Grep' --disallowedTools 'mcp__\*' -p --output-format stream-json --verbose --include-partial-messages --max-turns 16/);
+    assert.match(command, /claude --safe-mode --restricted --strict-mcp-config --permission-mode dontAsk --tools 'Read,Glob,Grep' --allowedTools 'Read' 'Glob' 'Grep' --disallowedTools 'mcp__\*' -p --output-format stream-json --verbose --include-partial-messages/);
+    assert.doesNotMatch(command, /--max-turns(?:\s|=)/);
     assert.doesNotMatch(command, /dangerously-skip-permissions|bypassPermissions|--tools '.*Bash|PI_CLAUDE_SENTINEL|--plugin-dir/);
     assert.match(command, /--model 'sonnet'/);
     assert.match(command, /--append-system-prompt 'Review only'/);

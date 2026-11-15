@@ -283,7 +283,7 @@ describe("native Claude stream result integrity", () => {
       const args = readFileSync(join(run.dir, "argv.txt"), "utf8");
       assert.match(args, /--safe-mode\n--restricted\n--strict-mcp-config/);
       assert.match(args, /--permission-mode\ndontAsk\n--tools\nRead,Glob,Grep\n--allowedTools\nRead\nGlob\nGrep\n--disallowedTools\nmcp__\*/);
-      assert.match(args, /--max-turns\n16/);
+      assert.doesNotMatch(args, /--max-turns/);
       assert.match(args, /--output-format\nstream-json/);
       assert.match(args, /--append-system-prompt\nsystem 'quoted'/);
       assert.match(args, /--resume\n2ff3b2c1-d633-4200-b9da-87e1aaefb767/);
