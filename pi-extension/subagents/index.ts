@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
@@ -43,8 +44,6 @@ import {
   createTaskSurface,
   setTaskLabel,
   sendLongCommand,
-  pollForExit,
-  ClaudeExitTimeoutError,
   closeSurface,
   getMuxBackend,
   sendEscape,
@@ -85,8 +84,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, readWrapperExitRecord, readWrapperStartRecord, writeCoreRecoveryDescriptor } from "./completion.ts";
-import { confirmClaudeProcessGone, readClaudeFailureResult, readClaudePrintResult, validateClaudeReviewLaunch } from "./claude-transport.ts";
+import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, readWrapperStartRecord, writeCoreRecoveryDescriptor } from "./completion.ts";
 import {
   confirmOwnedProcessGone,
   createVisibleCompletionState,
@@ -155,6 +153,7 @@ const SubagentParams = Type.Object({
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   agent: Type.Optional(
     Type.String({
+      minLength: 1,
       description:
         "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
     }),
@@ -189,13 +188,7 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
   ),
-  resumeSessionId: Type.Optional(
-    Type.String({
-      description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
-    }),
-  ),
-});
+}, { additionalProperties: false });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
@@ -212,7 +205,6 @@ interface AgentDefaults {
   interactive?: boolean;
   sessionMode?: SubagentSessionMode;
   cwd?: string;
-  cli?: string;
   disableModelInvocation?: boolean;
 }
 
@@ -321,7 +313,6 @@ function parseVisibleAgentDefinition(path: string, content: string, origin?: Def
     interactive: metadataBoolean(metadata, "interactive"),
     sessionMode: parseSessionMode(metadataString(metadata, "session-mode")),
     cwd: definition.cwd,
-    cli: metadataString(metadata, "cli"),
     disableModelInvocation: metadataBoolean(metadata, "disable-model-invocation") ?? false,
   };
 }
@@ -390,11 +381,7 @@ function resolveVisibleLaunchIntent(
   const definition = agentDefs?.definition ?? { name: params.agent ?? params.name, metadata: {} };
   const list = (value: string | undefined): readonly string[] | undefined =>
     normalizeOptionalString(value)?.split(",").map((entry) => entry.trim()).filter(Boolean);
-  // Legacy Claude reviews consume cli metadata in their separate consumer route.
-  const sharedDefinition = agentDefs?.cli === "claude"
-    ? { ...definition, metadata: { ...definition.metadata, cli: undefined } }
-    : definition;
-  return resolveAgentLaunchIntent(sharedDefinition, params.task, callerCwd, {
+  return resolveAgentLaunchIntent(definition, params.task, callerCwd, {
     model: normalizeOptionalString(params.model),
     tools: list(params.tools),
     skills: list(params.skills),
@@ -595,7 +582,6 @@ type PresentableResult = Pick<
   | "summary"
   | "sessionFile"
   | "sessionFileExists"
-  | "claudeSessionId"
   | "error"
   | "errorMessage"
   | "runner"
@@ -664,8 +650,7 @@ function resolveResultPresentation(result: PresentableResult, name: string): str
     );
   }
 
-  const claudeRef = result.claudeSessionId ? `\n\nClaude session ID: ${result.claudeSessionId}` : "";
-  return `${presentation.headline}\n\n${result.summary}${sessionRef}${claudeRef}`;
+  return `${presentation.headline}\n\n${result.summary}${sessionRef}`;
 }
 
 function projectResultDetails(
@@ -683,7 +668,6 @@ function projectResultDetails(
     ...(result.error ? { error: result.error } : {}),
     ...(result.failureContext ?? {}),
     ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-    ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
     ...(result.runner ? {
       runner: result.runner, capabilities: result.runner === 'claude' ? claudeJobCapabilities : copilotJobCapabilities, nativeReference: result.nativeReference,
       hostEvidence: result.hostEvidence, projection: result.projection, completion: result.completion,
@@ -709,7 +693,6 @@ interface SubagentResult {
   summary: string;
   sessionFile?: string;
   sessionFileExists?: boolean;
-  claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -782,10 +765,6 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
-  cli?: string;
-  claudeResultFile?: string;
-  claudeProcessIdFile?: string;
-  claudeExitConfirmed?: boolean;
   statusState: SubagentStatusState;
   interruptCount?: number;
   interruptRequestedAt?: number;
@@ -867,7 +846,7 @@ function releaseRunningSubagent(id: string): boolean {
 async function launchOwnedCoreRun(
   prepared: Parameters<typeof launchPreparedCoreRun>[0],
   spec: Parameters<typeof launchPreparedCoreRun>[1],
-  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren" | "cli" | "nativeJob" | "nativeState" | "nativeDefinition" | "nativeCapturePaths"> & { artifactDir: string },
+  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren" | "nativeJob" | "nativeState" | "nativeDefinition" | "nativeCapturePaths"> & { artifactDir: string },
 ): Promise<CoreHostRef> {
   const ownerSignal = getModuleAbortSignal();
   try { return await launchPreparedCoreRun(prepared, spec); }
@@ -1112,9 +1091,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
-      : agent.cli === "claude"
-        ? " running… "
-        : " starting… ";
+      : agent.nativeJob?.nativeReference.runner === "claude" ? " running… " : " starting… ";
 
     lines.push(borderLine(left, right, width));
   }
@@ -1227,33 +1204,6 @@ function buildPiModelArgs(effectiveModel?: string, effectiveThinking?: string): 
   return ["--model", shellEscape(model)];
 }
 
-function buildClaudeCommand(options: {
-  resultFile: string;
-  processIdFile: string;
-  runId: string;
-  model?: string;
-  systemPrompt?: string;
-  resumeSessionId?: string;
-  task: string;
-  cwd?: string;
-}): string {
-  const parts = [
-    "claude", "--safe-mode", "--restricted", "--strict-mcp-config",
-    "--permission-mode", "dontAsk", "--tools", shellEscape("Read,Glob,Grep"),
-    "--allowedTools", shellEscape("Read"), shellEscape("Glob"), shellEscape("Grep"),
-    "--disallowedTools", shellEscape("mcp__*"),
-    "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--max-turns", "16",
-  ];
-  if (options.model) parts.push("--model", shellEscape(options.model));
-  if (options.systemPrompt) parts.push("--append-system-prompt", shellEscape(options.systemPrompt));
-  if (options.resumeSessionId) parts.push("--resume", shellEscape(options.resumeSessionId));
-  parts.push("--", shellEscape(options.task));
-
-  const runner = shellEscape(fileURLToPath(new URL("./claude-run.ts", import.meta.url)));
-  return ["node", runner, shellEscape(options.resultFile), shellEscape(options.processIdFile),
-    shellEscape(options.runId), shellEscape(options.cwd ?? ""), ...parts].join(" ");
-}
-
 function activityLabel(activity: SubagentActivityState): string | undefined {
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
@@ -1263,7 +1213,7 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude" || running.cli === "copilot") return;
+  if (running.nativeJob) return;
 
   if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
     const completionStatus = observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
@@ -1390,14 +1340,14 @@ function handleSubagentInterrupt(
   if (running.coreLaunchPending && !running.coreHost) {
     return { content: [{ type: "text" as const, text: "Core launch is unconfirmed; its captured run must be reconciled during owned cleanup before controls can target a terminal." }], details: { error: "launch-unconfirmed", id: running.id } };
   }
-  if (running.cli === "claude" || running.cli === "copilot") {
+  if (running.nativeJob) {
     return {
       content: [{
         type: "text" as const,
         text:
           "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Use subagent_terminate for a correlated hard stop of a native job.",
       }],
-      details: { error: `${running.cli} interrupt unsupported`, id: running.id, name: running.name },
+      details: { error: `${running.nativeJob.nativeReference.runner} interrupt unsupported`, id: running.id, name: running.name },
     };
   }
 
@@ -1447,7 +1397,6 @@ async function handleSubagentTerminate(
   params: { id?: string; name?: string },
   close: (surface: string) => Promise<void> = closeSurface,
   read: (surface: string, lines?: number) => string = readScreen,
-  probe: (pid: number, signal: 0) => void = process.kill,
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -1482,13 +1431,6 @@ async function handleSubagentTerminate(
           outputFile: running.nativeCapturePaths?.stdout, outputCapture: (running.nativeCapture ?? running.nativePartialCapture)?.capture } };
     }
   }
-  const claudeGone = () => {
-    if (running.cli !== "claude") return false;
-    if (running.wrapperExitFile && readWrapperExitRecord(running.wrapperExitFile, running.runId).ok) return true;
-    if (!running.claudeProcessIdFile) return false;
-    try { return confirmClaudeProcessGone(running.claudeProcessIdFile, running.runId, probe); }
-    catch { return false; }
-  };
   observeRunningSubagent(running);
   const directChildCount = running.activityRead?.ok ? running.activity?.directChildCount : undefined;
   if (running.canSpawnDirectChildren && directChildCount !== 0) {
@@ -1509,7 +1451,7 @@ async function handleSubagentTerminate(
       },
     };
   }
-  if (running.cli !== "claude" && running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
+  if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
     observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
   }
   try {
@@ -1519,15 +1461,6 @@ async function handleSubagentTerminate(
   } catch {}
 
   if (running.terminationRequestState) {
-    if (claudeGone()) {
-      running.claudeExitConfirmed = true;
-      releaseRunningSubagent(running.id);
-      running.abortController?.abort("terminated_by_parent");
-      return {
-        content: [{ type: "text" as const, text: `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}` }],
-        details: { id: running.id, name: running.name, status: "terminated", surface: running.surface },
-      };
-    }
     return {
       content: [{ type: "text" as const, text: `Termination was already requested for subagent "${running.name}"; process exit remains unconfirmed.` }],
       details: { id: running.id, name: running.name, status: "termination_requested_unconfirmed", surface: running.surface, sessionFile: running.sessionFile },
@@ -1536,7 +1469,7 @@ async function handleSubagentTerminate(
 
   running.terminationRequestState = "pending";
   running.terminationRequestedAt = Date.now();
-  if (running.cli !== "claude" && running.completionState) {
+  if (running.completionState) {
     recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: running.coreHost ? "core-terminal-kill" : "herdr-pane-close" });
   }
   try {
@@ -1559,27 +1492,16 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestState = "accepted";
-  if (running.cli === "claude") running.abortController?.abort("terminated_by_parent");
-  else if (running.completionState && !running.coreHost) confirmOwnedProcessGone(running.completionState);
+  if (running.completionState && !running.coreHost) confirmOwnedProcessGone(running.completionState);
   updateWidget();
 
-  let confirmed: boolean;
-  if (running.cli === "claude") {
-    confirmed = claudeGone();
-    if (confirmed) {
-      running.claudeExitConfirmed = true;
-      releaseRunningSubagent(running.id);
-      running.abortController?.abort("terminated_by_parent");
-    }
-  } else {
-    confirmed = running.completionState?.core.process.status === "exited" ?? false;
-  }
+  const confirmed = running.completionState?.core.process.status === "exited" ?? false;
   return {
     content: [{
       type: "text" as const,
       text: confirmed
-        ? `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}` + (running.cli === "claude" ? "" : `\nSession: ${running.sessionFile}`)
-        : `Termination requested for subagent "${running.name}"; process exit is unconfirmed and the run remains registered.\n\nID: ${running.id}` + (running.cli === "claude" ? "" : `\nSession: ${running.sessionFile}`),
+        ? `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}\nSession: ${running.sessionFile}`
+        : `Termination requested for subagent "${running.name}"; process exit is unconfirmed and the run remains registered.\n\nID: ${running.id}\nSession: ${running.sessionFile}`,
     }],
     details: {
       id: running.id,
@@ -1724,7 +1646,7 @@ export const __test__ = {
   visibleHerdrCoreCapabilities,
   buildSubagentToolAllowlist,
   buildPiModelArgs,
-  buildClaudeCommand,
+  SubagentParams,
   launchSubagent,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1776,13 +1698,15 @@ async function launchSubagent(
     nativeNotStarted?: (runId: string) => void;
   },
 ): Promise<RunningSubagent> {
+  if (!Value.Check(SubagentParams, params)) {
+    throw new Error(`Invalid subagent parameters: ${[...Value.Errors(SubagentParams, params)].map(error => `${error.path}: ${error.message}`).join("; ")}`);
+  }
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = options?.nativeDefinition ?? (params.agent ? loadAgentDefaults(params.agent, ctx.cwd) : null);
+  if (params.agent && !agentDefs) throw new Error(`Unknown agent: ${params.agent}`);
   const coreSelected = getMuxBackend() === "herdr-core";
-  if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
-  else if (normalizeOptionalString(params.resumeSessionId)) throw new Error("resumeSessionId requires a Claude review agent");
   if (agentDefs && ['copilot', 'claude'].includes(agentDefs.definition.runner)) {
     const nativeBackend = process.env.PI_SUBAGENT_MUX?.trim().toLowerCase();
     if (nativeBackend && (nativeBackend !== 'herdr-core' || !coreSelected)) throw new Error("Native jobs require the herdr-core backend; no fallback is available");
@@ -1816,7 +1740,7 @@ async function launchSubagent(
       mkdirSync(dirname(nativeCapturePaths.stdout), { recursive: true, mode: 0o700 });
       const metadata = {
         name: params.name, task: params.task, agent: params.agent, sessionFile: "", startTime,
-        canSpawnDirectChildren: false, artifactDir, cli: agentDefs.definition.runner, nativeJob, nativeCapturePaths, nativeOnClosed,
+        canSpawnDirectChildren: false, artifactDir, nativeJob, nativeCapturePaths, nativeOnClosed,
         nativeState: createAgentRunState(id, "native-job"),
         nativeDefinition: { origin: agentDefs.definition.origin!, sha256: agentDefs.definitionSha256! },
       };
@@ -1848,14 +1772,6 @@ async function launchSubagent(
     }
   }
   const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
-  const claudeSystemPrompt = agentDefs?.cli === "claude"
-    ? [launchIntent.effective.systemPrompt?.text, params.systemPrompt]
-      .filter((text, index, all): text is string => !!text && all.indexOf(text) === index)
-      .join("\n\n") : undefined;
-  if (claudeSystemPrompt && Buffer.byteLength(claudeSystemPrompt, "utf8") > 60 * 1024) {
-    throw new Error("Claude review system prompt exceeds 60 KiB");
-  }
-  if (coreSelected && agentDefs?.cli === "claude") throw new Error("Claude-on-Core is unsupported; select a classic backend");
   if (coreSelected && options?.surface) throw new Error("Core launches cannot reuse a classic surface");
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
   const coreLaunch = coreSelected ? await prepareCoreLaunch(params.name, effectiveInteractive) : undefined;
@@ -1887,7 +1803,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const harness = agentDefs?.cli === "claude" ? "Claude" : "Pi";
+  const harness = "Pi";
   let surface = coreLaunch ? "" : options?.surface ?? (await createTaskSurface(params.name, harness));
   let coreHost: CoreHostRef | undefined;
   if (surfacePreCreated) await setTaskLabel(surface, harness, params.name);
@@ -1933,67 +1849,6 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
-    const resultFile = join(artifactDir, "subagent-completion", `${id}.claude-result.json`);
-    const processIdFile = join(artifactDir, "subagent-completion", `${id}.claude.pid`);
-    const wrapperExitFile = buildVisibleCompletionPaths(artifactDir, id).wrapperExit;
-    mkdirSync(dirname(resultFile), { recursive: true });
-    const claudeCommand = buildClaudeCommand({
-      resultFile,
-      processIdFile,
-      runId: id,
-      model: effectiveModel,
-      systemPrompt: claudeSystemPrompt,
-      resumeSessionId: params.resumeSessionId,
-      task: params.task,
-      cwd: targetCwdForSession,
-    });
-    const command = buildVisibleWrapperCommand({ piCommand: claudeCommand, runId: id, wrapperExitFile });
-
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-    await sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      runId: id,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      startTime,
-      sessionFile: subagentSessionFile,
-      transcriptStartLine,
-      launchScriptFile,
-      cli: "claude",
-      claudeResultFile: resultFile,
-      claudeProcessIdFile: processIdFile,
-      wrapperExitFile,
-      interactive: effectiveInteractive,
-      canSpawnDirectChildren: false,
-      statusState: createStatusState({
-        source: "claude",
-        startTimeMs: startTime,
-      }),
-    };
-
-    return running;
-  }
-
   // ── Pi CLI path ──
 
   // Build pi command
@@ -2337,7 +2192,6 @@ async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
   dependencies: {
-    pollForExit?: typeof pollForExit;
     closeSurface?: typeof closeSurface;
     readScreen?: typeof readScreen;
     visibleInterval?: number;
@@ -2353,68 +2207,31 @@ async function watchSubagent(
   }
   const { name, task, surface, startTime, sessionFile } = running;
   const moduleSignal = getModuleAbortSignal();
-  const waitForExit = dependencies.pollForExit ?? pollForExit;
   const close = dependencies.closeSurface ?? closeSurface;
   const read = dependencies.readScreen ?? readScreen;
   let terminalObserved = false;
 
   try {
     const combinedSignal = AbortSignal.any([signal, moduleSignal]);
-    const result = running.cli === "claude"
-      ? await waitForExit(surface, combinedSignal, {
-          interval: dependencies.visibleInterval ?? 1000,
-          wrapperExitFile: running.wrapperExitFile!,
-          runId: running.runId,
-          onTick() { observeRunningSubagent(running); },
-        })
-      : await waitForVisibleCompletion({
-          state: running.completionState!,
-          childSnapshotFile: running.childSnapshotFile!,
-          wrapperExitFile: running.wrapperExitFile!,
-          sessionFile,
-          transcriptStartLine: running.transcriptStartLine,
-          sessionRef: running.piSessionRef,
-          signal: combinedSignal,
-          interval: dependencies.visibleInterval ?? 1000,
-          onTick() { observeRunningSubagent(running); },
-          processProbe: dependencies.processProbe,
-          coreHost: running.coreHost,
-        });
+    const observed = await waitForVisibleCompletion({
+      state: running.completionState!,
+      childSnapshotFile: running.childSnapshotFile!,
+      wrapperExitFile: running.wrapperExitFile!,
+      sessionFile,
+      transcriptStartLine: running.transcriptStartLine,
+      sessionRef: running.piSessionRef,
+      signal: combinedSignal,
+      interval: dependencies.visibleInterval ?? 1000,
+      onTick() { observeRunningSubagent(running); },
+      processProbe: dependencies.processProbe,
+      coreHost: running.coreHost,
+    });
 
     terminalObserved = true;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    if (running.cli === "claude") {
-      let summary: string;
-      let claudeSessionId: string | undefined;
-      let exitCode = result.exitCode;
-      if (exitCode !== 0) {
-        summary = `Claude Code exited with code ${exitCode}`;
-      } else {
-        try {
-          const output = readClaudePrintResult(running.claudeResultFile!);
-          summary = output.summary;
-          claudeSessionId = output.sessionId;
-        } catch (error) {
-          exitCode = 1;
-          summary = `Claude Code result invalid: ${error instanceof Error ? error.message : String(error)}`;
-        }
-      }
-      if (exitCode !== 0) {
-        const partial = readClaudeFailureResult(running.claudeResultFile!);
-        if (partial) summary += `\n\nPartial Claude output:\n${partial}`;
-      }
-      try { await close(surface); }
-      catch (error) {
-        const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
-        summary += `\n\nHerdr pane cleanup failed after verified CLI exit: ${reason}`;
-      }
-      return { name, task, summary, exitCode, elapsed, ...(claudeSessionId ? { claudeSessionId } : {}) };
-    }
-
     // Pi completion is delivered only after the shared lifecycle reaches a
     // terminal projection backed by correlated process-exit evidence.
-    const observed = result as Awaited<ReturnType<typeof waitForVisibleCompletion>>;
     const completion = observed.completion;
     const exitCode = completionExitCode(completion);
     const controlError = completion.execution === "terminated" ? "terminated"
@@ -2445,33 +2262,13 @@ async function watchSubagent(
     const watcherAborted = signal.aborted;
     const moduleAborted = moduleSignal.aborted;
     let paneCloseError: string | undefined;
-    // A lost Claude watcher cannot supervise a running CLI; close its pane, then confirm exit separately.
-    if ((running.cli === "claude" || watcherAborted || moduleAborted || err instanceof ClaudeExitTimeoutError) && (running.coreHost || running.terminationRequestState !== "accepted")) {
+    if ((watcherAborted || moduleAborted) && (running.coreHost || running.terminationRequestState !== "accepted")) {
       try {
         await closeOwnedSubagent(running, close);
-        if (running.cli === "claude") {
-          running.terminationRequestState = "accepted";
-          running.terminationRequestedAt = Date.now();
-        }
       } catch (error) {
         paneCloseError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
       }
     }
-    const wrapper = running.cli === "claude" && running.wrapperExitFile
-      ? readWrapperExitRecord(running.wrapperExitFile, running.runId) : undefined;
-    if (running.cli === "claude" && (running.claudeExitConfirmed || wrapper?.ok)) terminalObserved = true;
-    if (running.cli === "claude" && !terminalObserved && running.claudeProcessIdFile) {
-      for (let attempt = 0; attempt < 100; attempt++) {
-        try {
-          terminalObserved = confirmClaudeProcessGone(
-            running.claudeProcessIdFile, running.runId, dependencies.processProbe,
-          );
-        } catch {}
-        if (terminalObserved) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-
     const abortDetails = [
       watcherAborted
         ? `watcher=${String(signal.reason ?? "aborted")}`
@@ -2483,32 +2280,15 @@ async function watchSubagent(
     const errorMessage = err?.message ?? String(err);
     const terminatedByParent =
       watcherAborted && String(signal.reason ?? "") === "terminated_by_parent";
-    if (!terminatedByParent && wrapper?.ok && wrapper.value.exit.shellStatus === 0 && running.claudeResultFile) {
-      try {
-        const output = readClaudePrintResult(running.claudeResultFile);
-        const summary = paneCloseError
-          ? `${output.summary}\n\nHerdr pane cleanup failed after verified CLI exit: ${paneCloseError}`
-          : output.summary;
-        return { name, task, summary, exitCode: 0,
-          elapsed: Math.floor((Date.now() - startTime) / 1000), claudeSessionId: output.sessionId };
-      } catch {}
-    }
-    const partial = running.cli === "claude" && running.claudeResultFile
-      ? readClaudeFailureResult(running.claudeResultFile) : undefined;
     const summaryLines = [
-      err instanceof ClaudeExitTimeoutError
-        ? `Claude review deadline exceeded; process exit ${terminalObserved ? "confirmed" : "unconfirmed"}.`
-        : running.cli === "claude" && !terminalObserved
-          ? `Claude process exit unconfirmed; watcher error: ${errorMessage}`
-          : terminatedByParent
-            ? "Subagent terminated by parent request."
-            : `Subagent watcher error: ${errorMessage}`,
+      terminatedByParent
+        ? "Subagent terminated by parent request."
+        : `Subagent watcher error: ${errorMessage}`,
 
       `Abort state: ${abortDetails}`,
       `Surface: ${surface}`,
       running.launchScriptFile ? `Launch script: ${running.launchScriptFile}` : undefined,
       paneCloseError ? `Herdr pane cleanup failed: ${paneCloseError}` : undefined,
-      partial ? `Partial Claude output:\n${partial}` : undefined,
       terminalOutput ? `Terminal output before cleanup:\n${terminalOutput}` : undefined,
     ].filter((line): line is string => line != null);
 
@@ -2518,14 +2298,12 @@ async function watchSubagent(
       summary: summaryLines.join("\n"),
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: running.cli === "claude" && !terminalObserved ? "exit_unconfirmed"
-        : terminatedByParent ? "terminated" : watcherAborted ? "cancelled" : errorMessage,
-      ...(running.cli === "claude" ? {} : { sessionFile, sessionFileExists: existsSync(sessionFile) }),
+      error: terminatedByParent ? "terminated" : watcherAborted ? "cancelled" : errorMessage,
+      sessionFile, sessionFileExists: existsSync(sessionFile),
       failureContext: {
         surface,
         launchScriptFile: running.launchScriptFile,
         activityFile: running.activityFile,
-        ...(running.cli === "claude" ? { claudeResultFile: running.claudeResultFile } : {}),
         terminalOutput,
         watcherAborted,
         watcherAbortReason: signal.reason == null ? undefined : String(signal.reason),
@@ -2534,7 +2312,7 @@ async function watchSubagent(
       },
     };
   } finally {
-    if (!running.coreCleanupError && (terminalObserved || (running.cli !== "claude" && (signal.aborted || moduleSignal.aborted)))) {
+    if (!running.coreCleanupError && (terminalObserved || signal.aborted || moduleSignal.aborted)) {
       releaseRunningSubagent(running.id);
     }
   }
@@ -2761,7 +2539,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.\n\n` +
                 `ID: ${running.id}\nSurface: ${running.surface}` +
-                (running.nativeJob ? `\nRunner: ${running.nativeJob.nativeReference.runner}\nManaged native session: ${running.nativeJob!.nativeReference.managedSessionId}` : running.cli === "claude" ? "\nClaude session ID will be returned on completion." : `\nSession: ${running.sessionFile}`),
+                (running.nativeJob ? `\nRunner: ${running.nativeJob.nativeReference.runner}\nManaged native session: ${running.nativeJob!.nativeReference.managedSessionId}` : `\nSession: ${running.sessionFile}`),
             },
           ],
           details: {
@@ -2770,7 +2548,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: params.task,
             agent: params.agent,
             surface: running.surface,
-            ...(running.nativeJob ? { runner: running.nativeJob.nativeReference.runner, capabilities: running.nativeJob.nativeReference.runner === 'claude' ? claudeJobCapabilities : copilotJobCapabilities, nativeReference: running.nativeJob!.nativeReference, hostEvidence: running.coreHost } : running.cli === "claude" ? {} : { sessionFile: running.sessionFile }),
+            ...(running.nativeJob ? { runner: running.nativeJob.nativeReference.runner, capabilities: running.nativeJob.nativeReference.runner === 'claude' ? claudeJobCapabilities : copilotJobCapabilities, nativeReference: running.nativeJob!.nativeReference, hostEvidence: running.coreHost } : { sessionFile: running.sessionFile }),
             launchScriptFile: running.launchScriptFile,
             status: "started",
           },
@@ -3012,7 +2790,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         managedSessionId: Type.Optional(Type.String({ description: 'Caller-managed native session ID returned by a prior completed invocation' })),
         agent: Type.Optional(Type.String({ description: 'Native-only trusted same-runner resume profile' })),
         name: Type.Optional(
-          Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+          Type.String({ description: "Pi-only display name for the terminal tab. Default: 'Resume'" }),
         ),
         message: Type.Optional(
           Type.String({
@@ -3025,7 +2803,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
-      }),
+      }, { additionalProperties: false }),
 
       renderCall(args, theme) {
         const name = args.name ?? "Resume";

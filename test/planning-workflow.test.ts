@@ -85,18 +85,6 @@ test("real launch resolution and tool ceiling keep review fresh and read-only, w
   assert.equal(helpers.canSpawnDirectChildren(null, new Set()), true);
 });
 
-test("native Claude command keeps its fixed tool restriction and starts fresh without resume", () => {
-  const command = helpers.buildClaudeCommand({ resultFile: "/fixture/result", processIdFile: "/fixture/pid", runId: "review", task: brief });
-  assert.match(command, /--tools 'Read,Glob,Grep'/);
-  assert.match(command, /--allowedTools 'Read' 'Glob' 'Grep'/);
-  assert.match(command, /--disallowedTools 'mcp__\*'/);
-  assert.doesNotMatch(command, /--resume/);
-  assert.ok(command.includes("Evidence-only plan check"));
-  assert.ok(command.includes("Hidden task-only commitment"));
-  const resumed = helpers.buildClaudeCommand({ resultFile: "/fixture/result", processIdFile: "/fixture/pid", runId: "review", task: brief, resumeSessionId: "old" });
-  assert.match(resumed, /--resume/);
-});
-
 test("actual plan command injects candidate skill and support path; iterate remains full fork", async () => {
   const commands = new Map<string, any>();
   const messages: string[] = [];

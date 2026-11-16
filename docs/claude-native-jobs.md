@@ -1,6 +1,6 @@
 # Definition-driven Claude jobs
 
-This route requires the Claude-enabled execution contract pinned by `package.json` and its lockfile. Use the normal locked install; no local dependency overlay is required. It does not change the legacy `cli: claude` review seats or default Pi agents.
+This route requires the Claude-enabled execution contract pinned by `package.json` and its lockfile. Use the normal locked install; no local dependency overlay is required. It does not change default Pi agents. Claude jobs require `runner: claude`; the former print/review transport is not supported.
 
 Stage profiles outside discovery until separately approved. A trusted user/package definition has this shape:
 
@@ -30,7 +30,7 @@ Only Read, Glob, Grep, Edit, Write and Bash are supported built-in selections in
 
 ## Preflight and live checks
 
-Trusted native definitions select the existing owned Core route without changing the default backend for Pi or legacy review seats. A nonblank explicit mux override must select `herdr-core`; unsupported or classic overrides are rejected. Missing Core context fails without falling back to another backend or host.
+Trusted native definitions select the existing owned Core route without changing the default backend for Pi. A nonblank explicit mux override must select `herdr-core`; unsupported or classic overrides are rejected. Missing Core context fails without falling back to another backend or host.
 
 The host verifies the actual `claude --version` against `runner-version`, resolves the executable without installation, and requires `hasTrustDialogAccepted: true` for the canonical cwd or its nearest verified Git repository root in the current HOME's `.claude.json`. Repository-root reuse follows the bounded repository trust lookup observed in the installed 2.1.325 embedded source (`bS`/`M2o`/`SS`), deliberately supporting less than its general ancestor lookup. The adapter walks canonical directories to the nearest `.git` marker and checks `/usr/bin/git rev-parse --show-toplevel` with Git environment overrides removed and global/system config disabled. A nested repository or worktree requires its own trust; malformed markers, unsupported discovery, symlink escapes and trust above that boundary do not inherit approval. Non-repository directories still require exact cwd trust. Git absence or discovery failure blocks inherited trust. Alternate `CLAUDE_CONFIG_DIR` and persisted-trust override environments fail closed both during preparation and in the actual Core terminal before exec. The launch-time guard execs the existing command without adding a supervisor or changing entry PID ownership. HOME is pinned in the actual argv. No trust entry is written and no permission prompt is accepted. Trust-file and executable-version checks remain prepare-time observations, not locks against same-user changes before launch.
 

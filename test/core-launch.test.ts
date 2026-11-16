@@ -78,7 +78,7 @@ for (const scenario of [
       }
       assert.equal(getMuxBackend(), scenario.expectedBackend ?? 'herdr');
     }
-    const launch = () => __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ', resumeSessionId: ' ' }, launchCtx);
+    const launch = () => __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ' }, launchCtx);
     if (scenario.rejected) {
       await assert.rejects(launch, scenario.rejected);
       assert.equal(requests.length, 0, 'rejected native jobs never launch through Core or fall back');
@@ -90,7 +90,7 @@ for (const scenario of [
     const running: any = await launch();
     if (scenario.mux) assert.equal(getMuxBackend(), 'herdr', 'native launch must not change the global backend');
     try {
-      assert.equal(running.cli, 'copilot');
+      assert.equal(running.nativeJob.nativeReference.runner, 'copilot');
       assert.equal(running.nativeDefinition.sha256, createHash('sha256').update(parsedBytes).digest('hex'));
       assert.equal(running.nativeJob.context.env.PI_TODO_PATH, '../explicit-tasks');
       assert.equal(existsSync(running.sessionFile), false, 'no Pi transcript seeding');
@@ -1237,11 +1237,11 @@ for (const defaultHome of ["xdg", "home"] as const) {
   });
 }
 
-it("rejects Claude-on-Core before accessing native context", async () => {
+it("rejects foreign cli metadata before accessing native context", async () => {
   await coreFixture(async ({ dir, ctx, requests }: any) => {
     const agents = join(process.env.PI_CODING_AGENT_DIR!, "agents"); mkdirSync(agents);
     writeFileSync(join(agents, "review.md"), "---\nname: review\ncli: claude\nmodel: sonnet\nauto-exit: true\nspawning: false\nsystem-prompt: append\n---\nReview only.\n");
-    await assert.rejects(__test__.launchSubagent({ name: "Review", agent: "review", task: "inspect" }, ctx), /Claude-on-Core/);
+    await assert.rejects(__test__.launchSubagent({ name: "Review", agent: "review", task: "inspect" }, ctx), /cli/i);
     assert.equal(requests.length, 0);
   });
 });
