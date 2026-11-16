@@ -1036,6 +1036,24 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("resolves legacy Claude review cwd through the same adapter as its launch intent", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      for (const configuredCwd of [undefined, "reviews"]) {
+        const parsed = testApi.parseVisibleAgentDefinition(
+          "/tmp/reviewer.md",
+          `---\nname: reviewer\ncli: claude\nmodel: sonnet\n${configuredCwd ? `cwd: ${configuredCwd}\n` : ""}---\nRead only.`,
+        );
+        const params = { name: "Review", task: "inspect", ...(configuredCwd ? {} : { cwd: globalDir }) };
+        const paths = testApi.resolveSubagentPaths(params, parsed, projectDir);
+        assert.equal(paths.effectiveCwd, configuredCwd ? join(globalDir, configuredCwd) : globalDir);
+        assert.equal(paths.effectiveAgentDir, globalDir);
+        assert.equal(testApi.resolveVisibleLaunchIntent(params, parsed, projectDir).effective.model, "sonnet");
+        assert.equal(parsed.cli, "claude");
+        assert.equal(parsed.definition.metadata.cli, "claude");
+      }
+    });
+  });
+
   it("keeps the configured agent directory when the target cwd matches the caller", async () => {
     await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
       mkdirSync(join(projectDir, ".pi", "agent"), { recursive: true });

@@ -390,7 +390,11 @@ function resolveVisibleLaunchIntent(
   const definition = agentDefs?.definition ?? { name: params.agent ?? params.name, metadata: {} };
   const list = (value: string | undefined): readonly string[] | undefined =>
     normalizeOptionalString(value)?.split(",").map((entry) => entry.trim()).filter(Boolean);
-  return resolveAgentLaunchIntent(definition, params.task, callerCwd, {
+  // Legacy Claude reviews consume cli metadata in their separate consumer route.
+  const sharedDefinition = agentDefs?.cli === "claude"
+    ? { ...definition, metadata: { ...definition.metadata, cli: undefined } }
+    : definition;
+  return resolveAgentLaunchIntent(sharedDefinition, params.task, callerCwd, {
     model: normalizeOptionalString(params.model),
     tools: list(params.tools),
     skills: list(params.skills),
@@ -1843,10 +1847,7 @@ async function launchSubagent(
       throw error;
     }
   }
-  // The legacy Claude review route is separate from the shared runner resolver.
-  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs?.cli === "claude"
-    ? { ...agentDefs, definition: { ...agentDefs.definition, metadata: { ...agentDefs.definition.metadata, cli: undefined } } }
-    : agentDefs, ctx.cwd);
+  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
   const claudeSystemPrompt = agentDefs?.cli === "claude"
     ? [launchIntent.effective.systemPrompt?.text, params.systemPrompt]
       .filter((text, index, all): text is string => !!text && all.indexOf(text) === index)
