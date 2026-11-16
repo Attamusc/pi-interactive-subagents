@@ -4,7 +4,6 @@ import { connect } from "node:net";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { readWrapperExitRecord } from "./completion.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -928,7 +927,7 @@ export function extractHerdrReadText(result: unknown): string {
   return text;
 }
 
-export async function setTaskLabel(surface: string, harness: "Pi" | "Claude", task: string): Promise<void> {
+export async function setTaskLabel(surface: string, harness: "Pi", task: string): Promise<void> {
   const backend = getMuxBackend();
   if (backend === "herdr-core") throw new Error("Core task labels require the captured app adoption context");
   if (backend !== "herdr") return;
@@ -939,12 +938,12 @@ export async function setTaskLabel(surface: string, harness: "Pi" | "Claude", ta
   await herdrSocketCall("pane.report_metadata", {
     pane_id: surface, source: "pi:subagent-task",
     // Metadata's agent field is a presentation guard, not an authority claim.
-    agent: harness === "Claude" ? "claude" : "pi",
+    agent: "pi",
     title, display_agent: Array.from(`${harness} | ${title}`).slice(0, 80).join(""),
   });
 }
 
-export async function createTaskSurface(name: string, harness: "Pi" | "Claude"): Promise<string> {
+export async function createTaskSurface(name: string, harness: "Pi"): Promise<string> {
   const surface = await createSurface(name);
   try { await setTaskLabel(surface, harness, name); }
   catch (error) {
@@ -1488,67 +1487,4 @@ export async function closeSurface(surface: string): Promise<void> {
   }
 
   zellijActionSync(["close-pane"], surface);
-}
-
-export interface PollResult {
-  /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
-  /** Foreground shell exit status, recorded after the child command exits. */
-  exitCode: number;
-  /** Ping data if reason is "ping" */
-  ping?: { name: string; message: string };
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
-  errorMessage?: string;
-}
-
-export class ClaudeExitTimeoutError extends Error {
-  constructor() {
-    super("Claude review deadline exceeded before process exit");
-    this.name = "ClaudeExitTimeoutError";
-  }
-}
-
-/** Wait for a run-correlated wrapper record written after the Claude process exits. */
-export async function pollForExit(
-  _surface: string,
-  signal: AbortSignal,
-  options: {
-    interval: number;
-    wrapperExitFile: string;
-    runId: string;
-    timeoutMs?: number;
-    onTick?: (elapsed: number) => void;
-  },
-): Promise<PollResult> {
-  const start = Date.now();
-
-  for (;;) {
-    if (signal.aborted) {
-      const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
-      throw new Error(`Aborted while waiting for subagent to finish: ${reason}`);
-    }
-
-    const record = readWrapperExitRecord(options.wrapperExitFile, options.runId);
-    if (record.ok) return { reason: "done", exitCode: record.value.exit.shellStatus };
-    if (record.reason === "invalid") throw new Error(`Invalid Claude wrapper record: ${record.error}`);
-    if (Date.now() - start >= (options.timeoutMs ?? 600_000)) throw new ClaudeExitTimeoutError();
-
-    options.onTick?.(Math.floor((Date.now() - start) / 1000));
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) {
-        const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
-        return reject(new Error(`Aborted while waiting for subagent to finish: ${reason}`));
-      }
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        const reason = signal.reason == null ? "no abort reason provided" : String(signal.reason);
-        reject(new Error(`Aborted while waiting for subagent to finish: ${reason}`));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
 }

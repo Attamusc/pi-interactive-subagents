@@ -1,4 +1,7 @@
 import { it } from "node:test";
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { execFileSync } from "node:child_process";
+import { createHash } from 'node:crypto';
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,8 +12,179 @@ import { waitForVisibleCompletion } from "../pi-extension/subagents/completion-w
 import { createChildCompletionRecorder } from "../pi-extension/subagents/completion.ts";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { getDirectChildCount } from "../pi-extension/subagents/ownership.ts";
-import { pollForExit, getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
+import { getMuxBackend, muxSetupHint } from "../pi-extension/subagents/cmux.ts";
+import { readNativeCapture } from '../pi-extension/subagents/native-job.ts';
 import { prepareCoreLaunch, launchPreparedCoreRun } from "../pi-extension/subagents/core-launch.ts";
+
+for (const scenario of [
+  { name: 'inherited Core default with classic available', mux: 'default', expectedBackend: 'herdr-core', reason: 'exited', disposition: 'completed' },
+  { name: 'blank override with Core available', mux: 'blank', expectedBackend: 'herdr-core', reason: 'exited', disposition: 'completed' },
+  { name: 'explicit classic override', mux: 'herdr', rejected: /Native jobs require the herdr-core backend/ },
+  { name: 'unknown override with only Core available', mux: 'unknown-core', expectedBackend: 'herdr-core', rejected: /Native jobs require the herdr-core backend/ },
+  { name: 'classic default without Core context', mux: 'missing-core', rejected: /HC_TERMINAL_SOCKET and HC_TERMINAL_ID required/ },
+  { name: 'natural zero exit', reason: 'exited', disposition: 'completed' },
+  { name: 'bounded Unicode output', unicodeOutput: true, reason: 'exited', disposition: 'completed' },
+  { name: 'complete private stdout beyond 200 lines', longOutput: true, reason: 'exited', disposition: 'completed' },
+  { name: 'observation timeout then natural exit', timeout: true, reason: 'exited', disposition: 'completed' },
+  { name: 'busy once then natural exit', transient: 'busy', reason: 'exited', disposition: 'completed' },
+  { name: 'transport once then natural exit', transient: 'transport', reason: 'exited', disposition: 'completed' },
+  { name: 'invalid reply once then natural exit', transient: 'invalid_reply', reason: 'exited', disposition: 'completed' },
+  { name: 'capture read once then natural exit', readOnce: true, reason: 'exited', disposition: 'completed' },
+  { name: 'five transient capture read failures', readFailures: 5, reason: 'exited', disposition: 'completed' },
+  { name: 'abnormal exit', code: 7, reason: 'exited', disposition: 'abnormal-exit' },
+  { name: 'signal exit', signal: 9, reason: 'exited', disposition: 'abnormal-exit' },
+  { name: 'lost live observation then explicit termination', observationFailure: true, disposition: 'transport-failed', terminal: false },
+  { name: 'missing capture status after exit', outputFailure: true, reason: 'exited', disposition: 'transport-failed', retained: true },
+  { name: 'cancelled parent', cancel: true, disposition: 'aborted' },
+  { name: 'explicit termination', terminate: true, disposition: 'terminated' },
+  { name: 'lost kill reply is not resent', killReplyLost: true, cancel: true, disposition: 'aborted' },
+  { name: 'concurrent abort and shutdown', shutdown: true, disposition: 'aborted' },
+  { name: 'cleanup failure visible', cleanupFailure: true, reason: 'exited', disposition: 'completed', retained: true },
+  { name: 'unknown Core reason', reason: 'unknown', disposition: 'transport-failed' },
+  { name: 'null Core reason', reason: null, disposition: 'transport-failed' },
+  { name: 'Core hard kill reporting zero', reason: 'killed', disposition: 'transport-failed' },
+]) it(`launches a trusted native job before Pi seeding: ${scenario.name}`, async () => {
+  await coreFixture(async ({ dir, ctx, stateFile, requests }: any) => {
+    process.env.HOME = dir;
+    process.env.PI_TODO_PATH = '../explicit-tasks';
+    const cache = join(dir, '.copilot/pkg', `${process.platform}-${process.arch}`, '1.0.106-3');
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' }));
+    writeFileSync(join(cache, 'app.js'), '');
+    const fullOutput = scenario.unicodeOutput ? '€'.repeat(33_334) : scenario.longOutput ? ('x'.repeat(1000) + '\n').repeat(400) : 'partial';
+    const proof = join(dir, 'argv-proof.json');
+    writeFileSync(join(dir, 'bin/copilot'), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify({argv:process.argv.slice(2),autoUpdate:process.env.COPILOT_AUTO_UPDATE}));process.stdout.write(${JSON.stringify(fullOutput)});process.stderr.write('private diagnostic');process.exitCode=${scenario.code ?? 0};\n`, { mode: 0o700 });
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    writeFileSync(join(agents, 'native-worker.md'), '---\nname: native-worker\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: []\nnative-deny: []\nmodel: gpt-6.1-sol\nauto-exit: true\ninteractive: false\n---\nTrusted role');
+    const task = `Do work; $(touch '${join(dir, 'injection')}')`;
+    const parsedBytes = readFileSync(join(agents, 'native-worker.md'), 'utf8');
+    const launchCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionFile() {
+      writeFileSync(join(agents, 'native-worker.md'), parsedBytes.replace('Trusted role', 'Changed after parsing'));
+      return ctx.sessionManager.getSessionFile();
+    } } };
+    if (scenario.mux) {
+      writeFileSync(join(dir, 'bin/herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+      process.env.HERDR_SOCKET_PATH = join(dir, 'classic.sock');
+      delete process.env.PI_SUBAGENT_MUX;
+      if (scenario.mux === 'blank') process.env.PI_SUBAGENT_MUX = '  ';
+      if (scenario.mux === 'herdr') process.env.PI_SUBAGENT_MUX = 'herdr';
+      if (scenario.mux === 'missing-core') {
+        delete process.env.HC_TERMINAL_SOCKET;
+        delete process.env.HC_TERMINAL_ID;
+      }
+      if (scenario.mux === 'unknown-core') {
+        for (const key of ['HERDR_SOCKET_PATH', 'CMUX_SOCKET_PATH', 'TMUX', 'ZELLIJ', 'ZELLIJ_SESSION_NAME', 'WEZTERM_UNIX_SOCKET']) delete process.env[key];
+        process.env.PI_SUBAGENT_MUX = 'unsupported-backend';
+      }
+      assert.equal(getMuxBackend(), scenario.expectedBackend ?? 'herdr');
+    }
+    const launch = () => __test__.launchSubagent({ name: 'Native', task, agent: 'native-worker', tools: ' ', skills: ' ', model: ' ', systemPrompt: ' ' }, launchCtx);
+    if (scenario.rejected) {
+      await assert.rejects(launch, scenario.rejected);
+      assert.equal(requests.length, 0, 'rejected native jobs never launch through Core or fall back');
+      assert.equal(readFileSync(join(dir, 'parent.jsonl'), 'utf8').trim().split('\n').length, 1, 'no Pi transcript seeding');
+      assert.equal(existsSync(proof), false, 'no native executable invocation');
+      assert.equal(getMuxBackend(), scenario.expectedBackend ?? 'herdr');
+      return;
+    }
+    const running: any = await launch();
+    if (scenario.mux) assert.equal(getMuxBackend(), scenario.expectedBackend ?? 'herdr', 'native launch must not change the global backend');
+    try {
+      assert.equal(running.nativeJob.nativeReference.runner, 'copilot');
+      assert.equal(running.nativeDefinition.sha256, createHash('sha256').update(parsedBytes).digest('hex'));
+      assert.equal(running.nativeJob.context.env.PI_TODO_PATH, '../explicit-tasks');
+      assert.equal(existsSync(running.sessionFile), false, 'no Pi transcript seeding');
+      const script = readFileSync(running.launchScriptFile, 'utf8');
+      assert.match(script, /COPILOT_AUTO_UPDATE=false/);
+      assert.match(script, /--prefer-version/);
+      assert.doesNotMatch(script, /PI_SUBAGENT_COMPLETION_FILE|--session /);
+      assert.ok(running.nativeCapturePaths, 'native stdout has an owned current-job capture');
+      try { execFileSync('/bin/bash', [running.launchScriptFile], { encoding: 'utf8', env: { ...process.env, COPILOT_AUTO_UPDATE: 'true' } }); }
+      catch (error) { if (!scenario.code) throw error; }
+      const child = JSON.parse(readFileSync(proof, 'utf8'));
+      assert.equal(child.autoUpdate, 'false');
+      assert.deepEqual(child.argv, running.nativeJob.argv.slice(3));
+      assert.equal(child.argv.at(-1), `Trusted role\n\n${task}`);
+      assert.equal(existsSync(join(dir, 'injection')), false);
+      const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+      writeFileSync(stateFile, JSON.stringify({ ...state,
+        nativeExit: scenario.reason !== undefined || scenario.reason === null ? { exit_code: scenario.code ?? 0, signal: scenario.signal ?? null, reason: scenario.reason } : null,
+        nativeTimeoutOnce: scenario.timeout === true, nativeTransientOnce: scenario.transient,
+        nativeObservationFailure: scenario.observationFailure === true, nativeKillReplyLost: scenario.killReplyLost === true, rmFails: scenario.cleanupFailure === true,
+      }));
+      if (scenario.outputFailure) rmSync(running.nativeCapturePaths.status);
+      __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
+      const controller = new AbortController();
+      running.abortController = controller;
+      if (scenario.cancel) controller.abort('fixture parent cancelled');
+      if (scenario.terminate) {
+        const termination: any = await __test__.handleSubagentTerminate({ id: running.id });
+        assert.equal(termination.details.status, 'terminated');
+      }
+      let reads = 0;
+      const watched = __test__.watchSubagent(running, controller.signal, { visibleInterval: 1, nativeCaptureRead(paths: any, id: string) {
+        if (reads++ < (scenario.readFailures ?? (scenario.readOnce ? 1 : 0))) throw Object.assign(new Error('fixture transient capture read'), { code: 'EIO' });
+        return readNativeCapture(paths, id);
+      } });
+      if (scenario.shutdown) assert.deepEqual(await __test__.shutdownOwnedSubagents('fixture'), []);
+      const result: any = await watched;
+      assert.equal(result.runner, 'copilot');
+      assert.equal(__test__.projectResultDetails(result, { name: 'Native', task }).capabilities.resume, 'managed-native-name');
+      assert.equal(result.projection.taskOutcome, 'unknown');
+      if (scenario.reason === 'exited') assert.equal(result.hostEvidence.terminal.pid, 456, 'finished Core records may retain their original PID');
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.read').length, 0, 'screen completeness is not capture authority');
+      assert.equal(result.completion?.settled ?? false, false);
+      assert.equal(result.projection.disposition, scenario.disposition);
+      assert.equal(result.exitCode, scenario.disposition === 'completed' ? 0 : 1);
+      if (scenario.timeout) assert.deepEqual(result.completion.requestTimeout, { operation: 'terminal.get', timeoutMs: 5000 });
+      assert.equal(result.completion?.completionEvidence, scenario.disposition === 'completed' ? 'native-job-exit-output' : undefined);
+      const captured = !scenario.observationFailure && !scenario.outputFailure;
+      if (captured) assert.ok(Buffer.byteLength(result.summary) <= 65536);
+      assert.equal(result.outputFile, running.nativeCapturePaths.stdout);
+      assert.equal(readFileSync(result.outputFile, 'utf8'), fullOutput);
+      assert.equal(result.projection.terminal, scenario.terminal !== false);
+      assert.equal(__test__.runningSubagents.has(running.id), scenario.terminal === false || scenario.retained === true);
+      assert.equal(result.nativeReference.selector.value, running.nativeJob.nativeReference.selector.value);
+      assert.equal(statSync(result.outputFile).mode & 0o777, 0o600);
+      if (captured) {
+        assert.equal(result.outputCapture.source, 'current-job-stdout');
+        const presentation = __test__.resolveResultPresentation(result, 'Native');
+        assert.ok(presentation.includes(result.outputFile));
+        assert.match(presentation, /private diagnostic/);
+        if (scenario.longOutput || scenario.unicodeOutput) assert.match(presentation, /truncated/i);
+        if (scenario.cleanupFailure) assert.match(presentation, /cleanup|fixture remove failure/i);
+      }
+      if (scenario.outputFailure) assert.notEqual(result.completion?.execution, 'normal-exit');
+      if (scenario.observationFailure) {
+        writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeObservationFailure: false }));
+        const terminated: any = await __test__.handleSubagentTerminate({ id: running.id });
+        assert.equal(terminated.details.status, 'terminated');
+        assert.equal(__test__.runningSubagents.has(running.id), false);
+      }
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.run').length, 1);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, scenario.cancel || scenario.terminate || scenario.shutdown || scenario.observationFailure ? 1 : 0);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, scenario.outputFailure ? 0 : 1);
+      if (scenario.cleanupFailure) {
+        writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), rmFails: false }));
+        assert.deepEqual(await __test__.shutdownOwnedSubagents('retry removal'), []);
+        assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, 0);
+        assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, 2);
+      }
+      const evidenceDir = process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR;
+      if (evidenceDir) {
+        mkdirSync(evidenceDir, { recursive: true });
+        writeFileSync(join(evidenceDir, scenario.name.replace(/[^a-z0-9]+/gi, '-') + '.json'), JSON.stringify({
+          fixtureOnly: true, scenario: scenario.name, invokedExecutable: running.nativeJob.argv[2], child,
+          launchRequest: requests.find((r: any) => r.method === 'terminal.run').params,
+          coreCalls: Object.fromEntries(['terminal.run', 'terminal.kill', 'terminal.rm'].map(method => [method, requests.filter((r: any) => r.method === method).length])),
+          hostEvidence: result.hostEvidence, projection: result.projection, capture: result.outputCapture,
+          rawStdoutBytes: statSync(result.outputFile).size, rawStdoutMode: statSync(result.outputFile).mode & 0o777,
+          registeredBeforeFixtureTeardown: __test__.runningSubagents.has(running.id),
+        }, null, 2));
+      }
+    } finally { __test__.releaseRunningSubagent(running.id); }
+  });
+});
 
 it("selects explicit Core without classic fallback and requires inherited identity", () => {
   const environment = process.env;
@@ -30,6 +204,289 @@ it("selects explicit Core without classic fallback and requires inherited identi
   }
   assert.ok(process.env === environment, "fixture cleanup must preserve the native environment binding");
 });
+
+for (const capturedOverride of ['../captured task store', '']) it(`registered native tools persist caller-branch authority and resume captured data (override=${JSON.stringify(capturedOverride)})`, async () => {
+  await coreFixture(async ({ dir, ctx, stateFile, requests }: any) => {
+    const originalCwd = process.cwd();
+    process.env.HOME = dir;
+    process.env.PI_TODO_PATH = capturedOverride;
+    const cache = join(dir, '.copilot/pkg', `${process.platform}-${process.arch}`, '1.0.106-3'); mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' })); writeFileSync(join(cache, 'app.js'), '');
+    const proof = join(dir, 'native-argv.json');
+    writeFileSync(join(dir, 'bin/copilot'), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.argv.slice(2)));console.log('owned native output');\n`, { mode: 0o700 });
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    const codingPath = join(agents, 'native-worker.md');
+    const policy = (name: string, readonly = false) => `---\nname: ${name}\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: ${readonly ? '["tasks(todo)"]' : '[write, shell, "tasks(todo)"]'}\nnative-deny: ${readonly ? '[write, shell]' : '[]'}\nmodel: gpt-6.1-sol\n${readonly ? '' : 'skills: selected\n'}auto-exit: true\ninteractive: false\nmcp:\n  tasks:\n    command: "{node}"\n    args: ["{home}/.local/bin/pi-agent-tasks-mcp", "--scope-cwd", "{parentCwd}", "--store-override={env.PI_TODO_PATH}", "--actor", "{managedSessionId}", "--actions", "${readonly ? 'get,list,list-all' : 'get,claim,update,append,release'}"]\n    env:\n      HOME: "{home}"\n---\n${readonly ? 'READ ONLY ROLE' : 'CODING ROLE'}`;
+    writeFileSync(codingPath, policy('native-worker'));
+    writeFileSync(join(agents, 'native-reader.md'), policy('native-reader', true));
+    const skillPath = join(process.env.PI_CODING_AGENT_DIR!, 'skills/selected/SKILL.md'); mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, 'ORIGINAL CANONICAL SKILL BYTES');
+    const caller = SessionManager.create(dir, join(dir, 'caller-sessions'));
+    const rootEntry = caller.appendCustomEntry('fixture-root', {});
+    const callerCtx = { ...ctx, sessionManager: caller };
+    const tools: any[] = [];
+    const handlers = new Map<string, any>();
+    const pi = { events: { emit() {} }, on(name: string, fn: any) { handlers.set(name, fn); }, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+      sendMessage() {},
+      appendEntry(type: string, data: unknown) { caller.appendCustomEntry(type, structuredClone(data)); },
+      getCommands() { return [{ name: 'skill:selected', source: 'skill', sourceInfo: { path: skillPath, baseDir: dirname(skillPath), scope: 'user', origin: 'top-level', source: 'auto' } }]; },
+    };
+    subagentsExtension(pi as any);
+    const launch = tools.find(t => t.name === 'subagent');
+    let resume = tools.find(t => t.name === 'subagent_resume');
+    const call = (tool: any, params: any, context = callerCtx) => tool.execute('fixture', params, undefined, undefined, context);
+    const records = () => caller.getBranch().filter((e: any) => e.type === 'custom' && e.customType === 'pi-interactive-subagents.native-session');
+    const complete = async () => {
+      const running: any = [...__test__.runningSubagents.values()][0];
+      assert.ok(running);
+      execFileSync('/bin/bash', [running.launchScriptFile], { env: { ...process.env, HOME: '/contradictory-child-home' } });
+      writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeExit: { exit_code: 0, signal: null, reason: 'exited' } }));
+      const deadline = Date.now() + 4000;
+      while (__test__.runningSubagents.has(running.id) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(__test__.runningSubagents.has(running.id), false);
+      assert.equal((records().at(-1) as any).data.state, 'closed');
+      return { running, argv: JSON.parse(readFileSync(proof, 'utf8')) };
+    };
+    try {
+      const first = await call(launch, { name: 'Native', task: 'First task', agent: 'native-worker' });
+      const managedSessionId = first.details.nativeReference.managedSessionId;
+      assert.equal(first.details.capabilities.resume, 'managed-native-name');
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Concurrent' }), /active|unconfirmed/i);
+      const one = await complete();
+      const closedLeaf = caller.getLeafId()!;
+      const firstRecord = structuredClone((records().at(-1) as any).data);
+      caller.branch(rootEntry);
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Abandoned branch' }), /unknown.*managed/i);
+      caller.branch(closedLeaf);
+      // A replacement extension runtime must restore the current caller branch,
+      // not rely on the original factory's record map.
+      tools.length = 0;
+      subagentsExtension(pi as any);
+      handlers.get('session_start')({}, callerCtx);
+      resume = tools.find(t => t.name === 'subagent_resume');
+      const foreign = { ...callerCtx, sessionManager: { getBranch: () => caller.getBranch(), getSessionId: () => 'another-caller' } };
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Foreign' }, foreign as any), /unknown.*managed/i);
+      await assert.rejects(() => call(resume, { managedSessionId, message: ' ', autoExit: true }), /follow.up message/i);
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'No', autoExit: false }), /autoExit/);
+      writeFileSync(skillPath, 'MUTATED SKILL MUST NOT REPLACE SNAPSHOT');
+      // A worker-controlled sidecar is not an authority source.
+      writeFileSync(join(dir, 'forged-native-snapshot.json'), JSON.stringify({ managedSessionId, command: '/forged', allow: ['*'] }));
+      delete process.env.PI_TODO_PATH;
+      const changedCwd = join(dir, 'other-parent-cwd'); mkdirSync(changedCwd);
+      process.chdir(changedCwd);
+      writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeExit: null }));
+      const next = await call(resume, { managedSessionId, message: 'Follow-up', agent: ' ', sessionPath: ' ' }, { ...callerCtx, cwd: changedCwd });
+      assert.equal(next.details.nativeReference.selector.value, first.details.nativeReference.selector.value);
+      const two = await complete();
+      assert.notEqual(two.running.runId, one.running.runId);
+      assert.ok(two.argv.includes('--resume'));
+      assert.ok(!two.argv.includes('--name'));
+      assert.ok(!two.argv.includes('--trust-folder'));
+      assert.match(two.argv.at(-1), /ORIGINAL CANONICAL SKILL BYTES/);
+      assert.doesNotMatch(two.argv.at(-1), /MUTATED/);
+      const mcp = JSON.parse(two.argv[two.argv.indexOf('--additional-mcp-config') + 1]).mcpServers.tasks;
+      assert.deepEqual(mcp.env, { HOME: dir });
+      assert.equal(mcp.command, process.execPath);
+      assert.ok(mcp.args.includes(`--store-override=${capturedOverride}`));
+      assert.equal(mcp.args.filter((arg: string) => arg.startsWith('--store-override=')).length, 1);
+      assert.equal(mcp.args[mcp.args.indexOf('--scope-cwd') + 1], dir);
+      assert.equal(mcp.args[mcp.args.indexOf('--actor') + 1], managedSessionId);
+      const before = requests.length;
+      writeFileSync(codingPath, policy('native-worker') + '\nChanged definition');
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Changed defaults' }), /definition changed/i);
+      assert.equal(requests.length, before);
+      writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf8')), nativeExit: null }));
+      await call(resume, { managedSessionId, agent: 'native-reader', message: 'Read only follow-up' });
+      const three = await complete();
+      assert.ok(three.argv.includes('--deny-tool=write')); assert.ok(three.argv.includes('--deny-tool=shell'));
+      assert.ok(!three.argv.includes('--allow-tool=write'));
+      assert.match(three.argv.at(-1), /READ ONLY ROLE/); assert.doesNotMatch(three.argv.at(-1), /CODING ROLE|ORIGINAL CANONICAL/);
+      const restricted = JSON.parse(three.argv[three.argv.indexOf('--additional-mcp-config') + 1]).mcpServers.tasks;
+      assert.equal(restricted.args.at(-1), 'get,list,list-all');
+      assert.deepEqual((records()[1] as any).data, firstRecord, 'original closed snapshot is immutable');
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.run').length, 3);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.rm').length, 3);
+      assert.equal(requests.filter((r: any) => r.method === 'terminal.kill').length, 0);
+      const beforeRejectedProfiles = requests.length;
+      const validLeaf = caller.getLeafId()!;
+      const lastRecord = structuredClone((records().at(-1) as any).data);
+      delete lastRecord.record.definitionOrigin;
+      caller.appendCustomEntry('pi-interactive-subagents.native-session', lastRecord);
+      await assert.rejects(() => call(resume, { managedSessionId, agent: 'native-reader', message: 'Missing origin' }), /invalid caller native session/i);
+      caller.branch(validLeaf);
+      rmSync(join(agents, 'native-reader.md'));
+      await assert.rejects(() => call(resume, { managedSessionId, message: 'Missing definition' }), /missing trusted native/i);
+      writeFileSync(join(agents, 'native-reader.md'), policy('native-reader', true));
+      const projectAgents = join(dir, '.pi/agents'); mkdirSync(projectAgents, { recursive: true });
+      writeFileSync(join(projectAgents, 'native-reader.md'), '---\nname: native-reader\n---\nProject shadow');
+      for (const agent of [undefined, 'native-reader']) await assert.rejects(() => call(resume, { managedSessionId, agent, message: 'Shadow must reject' }), /shadow/i);
+      writeFileSync(join(projectAgents, 'project-native.md'), policy('project-native', true));
+      await assert.rejects(() => call(resume, { managedSessionId, agent: 'project-native', message: 'Project policy must reject' }), /origin|trusted|project/i);
+      assert.equal(requests.length, beforeRejectedProfiles);
+      if (process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR) {
+        mkdirSync(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, { recursive: true });
+        writeFileSync(join(process.env.PI_TEST_NATIVE_FIXTURE_EVIDENCE_DIR, capturedOverride ? 'managed-relative.json' : 'managed-empty.json'), JSON.stringify({ fixtureOnly: true, capturedOverride, managedSessionId, nativeName: first.details.nativeReference.selector.value,
+          runs: [one, two, three].map(({ running, argv }) => ({ runId: running.runId, argv, cwd: running.nativeJob.cwd, context: running.nativeJob.context })),
+          coreCalls: Object.fromEntries(['terminal.run', 'terminal.kill', 'terminal.rm'].map(method => [method, requests.filter((r: any) => r.method === method).length])),
+          callerEntries: records(), ownedResourcesRemaining: __test__.runningSubagents.size,
+        }, null, 2));
+      }
+    } finally {
+      process.chdir(originalCwd);
+      await handlers.get('session_shutdown')({ reason: 'fixture' }, callerCtx);
+    }
+  });
+});
+
+it('registered native resume accepts only one caller-owned reference and rejects paths/profiles before Core effects', async () => {
+  await coreFixture(async ({ ctx, requests }: any) => {
+    const tools: any[] = [];
+    subagentsExtension({ events: { emit() {} }, on() {}, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {} } as any);
+    const tool = tools.find(tool => tool.name === 'subagent_resume');
+    const caller = { ...ctx, sessionManager: { ...ctx.sessionManager, getBranch: () => [] } };
+    for (const params of [{}, { managedSessionId: 'unknown', sessionPath: '/also' }, { managedSessionId: 'unknown', command: 'forged' }, { managedSessionId: 'unknown', snapshotPath: '/forged' }, { managedSessionId: 'unknown', selector: 'history' }, { managedSessionId: 'unknown', grants: ['*'] }, { sessionPath: '/pi', agent: 'native' }]) {
+      await assert.rejects(() => tool.execute('invalid', params, undefined, undefined, caller), /exactly one|unknown.*field|native.only|agent.*native/i);
+    }
+    await assert.rejects(() => tool.execute('unknown', { managedSessionId: 'unknown', sessionPath: ' ', agent: ' ' }, undefined, undefined, caller), /unknown.*managed/i);
+    assert.equal(requests.length, 0);
+  });
+});
+
+it('registered native launch rejects a hidden project-package skill shadow before any Core RPC', async () => {
+  await coreFixture(async ({ dir, ctx, requests }: any) => {
+    process.env.HOME = dir;
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    writeFileSync(join(agents, 'native-worker.md'), '---\nname: native-worker\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: []\nnative-deny: []\nmodel: gpt-6.1-sol\nskills: collision\nauto-exit: true\ninteractive: false\n---\nTrusted role');
+    const globalSkill = join(process.env.PI_CODING_AGENT_DIR!, 'skills/collision/SKILL.md');
+    mkdirSync(dirname(globalSkill), { recursive: true });
+    writeFileSync(globalSkill, '---\nname: collision\ndescription: Fixture skill\n---\nTRUSTED BODY');
+    const pkg = join(dir, '.pi/npm/node_modules/shadow-package'); mkdirSync(join(pkg, 'skills/collision'), { recursive: true });
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'shadow-package', version: '1.0.0', pi: { skills: ['./skills'] } }));
+    writeFileSync(join(pkg, 'skills/collision/SKILL.md'), '---\nname: collision\ndescription: Project skill\n---\nPROJECT BODY');
+    writeFileSync(join(dir, '.pi/settings.json'), JSON.stringify({ packages: ['npm:shadow-package'] }));
+    const tools: any[] = [];
+    subagentsExtension({ events: { emit() {} }, on() {}, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+      getCommands() { return [{ name: 'skill:collision', source: 'skill', sourceInfo: { path: globalSkill, baseDir: dirname(globalSkill), scope: 'user', origin: 'top-level', source: 'auto' } }]; },
+    } as any);
+    await assert.rejects(() => tools.find(tool => tool.name === 'subagent').execute('shadow', { name: 'Native', task: 'Work', agent: 'native-worker' }, undefined, undefined, ctx), /project skill shadow/i);
+    assert.equal(requests.length, 0);
+  });
+});
+
+it('native record corruption is isolated from registered session startup and Pi delivery', async () => {
+  await coreFixture(async ({ ctx }: any) => {
+    const handlers = new Map<string, any>(); const tools: any[] = []; const messages: any[] = [];
+    const entries = [{ type: 'custom', customType: 'pi-interactive-subagents.native-session', data: { version: 2 } }];
+    const caller = { ...ctx, sessionManager: { ...ctx.sessionManager, getBranch: () => entries } };
+    subagentsExtension({ events: { emit() {} }, on(n: string, f: any) { handlers.set(n, f); }, registerTool(t: any) { tools.push(t); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage(m: any) { messages.push(m); } } as any);
+    try {
+      assert.doesNotThrow(() => handlers.get('session_start')({}, caller));
+      await assert.rejects(() => tools.find(t => t.name === 'subagent_resume').execute('bad', { managedSessionId: 'unknown', message: 'Never run' }, undefined, undefined, caller), /invalid caller native/i);
+      // Startup must activate the shared delivery channel despite native corruption.
+      const run = await tools.find(t => t.name === 'subagent').execute('pi', { name: 'Pi control', task: 'Fixture' }, undefined, undefined, caller);
+      assert.equal(run.details.status, 'started');
+      const running: any = __test__.runningSubagents.get(run.details.id);
+      running.abortController.abort('fixture');
+      const until = Date.now() + 2000;
+      while (!messages.length && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.ok(messages.some(m => m.customType === 'subagent_result'), 'Pi result delivery remains active');
+    } finally { await handlers.get('session_shutdown')({ reason: 'fixture' }, caller); }
+  });
+});
+
+it('fresh native lookup rejects caller cwd shadow when process cwd differs', async () => {
+  await coreFixture(async f => {
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    writeFileSync(join(agents, 'native-worker.md'), nativeBoundaryDefinition);
+    const shadow = join(f.dir, '.pi/agents'); mkdirSync(shadow, { recursive: true });
+    writeFileSync(join(shadow, 'native-worker.md'), '---\nname: native-worker\n---\nProject Pi shadow');
+    await assert.rejects(() => __test__.launchSubagent({ name: 'Native', task: 'Never run', agent: 'native-worker' }, f.ctx), /shadow/i);
+    assert.equal(f.requests.length, 0);
+  });
+});
+
+const nativeBoundaryDefinition = '---\nname: native-worker\nrunner: copilot\nrunner-version: 1.0.106-3\nworkspace-trust: session\nnative-allow: []\nnative-deny: []\nmodel: gpt-6.1-sol\nauto-exit: true\ninteractive: false\n---\nTrusted boundary fixture';
+async function nativeBoundaryFixture(fn: (f: any) => Promise<void>) {
+  await coreFixture(async f => {
+    process.env.HOME = f.dir;
+    const cache = join(f.dir, '.copilot/pkg', `${process.platform}-${process.arch}`, '1.0.106-3'); mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'package.json'), JSON.stringify({ version: '1.0.106-3' })); writeFileSync(join(cache, 'app.js'), '');
+    writeFileSync(join(f.dir, 'bin/copilot'), `#!${process.execPath}\nconsole.log('owned boundary output');`, { mode: 0o700 });
+    const agents = join(process.env.PI_CODING_AGENT_DIR!, 'agents'); mkdirSync(agents);
+    const definitionPath = join(agents, 'native-worker.md'); writeFileSync(definitionPath, nativeBoundaryDefinition);
+    const manager = SessionManager.create(f.dir, join(f.dir, 'boundary-sessions')); manager.appendCustomEntry('fixture', {});
+    const captured = { version: 1, agent: 'native-worker', runId: 'original-closed-run', state: 'closed', record: {
+      callerSessionId: manager.getSessionId(), reference: { runner: 'copilot', managedSessionId: 'boundary-managed', cwd: f.dir, selector: { kind: 'name', value: 'boundary-native-name' } },
+      definitionOrigin: { kind: 'global-user', canonicalPath: definitionPath, canonicalRoot: agents }, definitionSha256: createHash('sha256').update(nativeBoundaryDefinition).digest('hex'),
+      bindings: { parentCwd: f.dir, managedSessionId: 'boundary-managed', todoPathLiteral: '' }, skills: [],
+    } };
+    manager.appendCustomEntry('pi-interactive-subagents.native-session', structuredClone(captured));
+    const ctx = { ...f.ctx, sessionManager: manager }; let failClosedAppend = false;
+    const bind = () => {
+      const tools: any[] = []; const handlers = new Map<string, any>();
+      subagentsExtension({ events: { emit() {} }, on(n: string, h: any) { handlers.set(n, h); }, registerTool(t: any) { tools.push(t); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getCommands() { return []; },
+        appendEntry(type: string, data: any) { if (failClosedAppend && data.state === 'closed') throw new Error('fixture closed append failure'); manager.appendCustomEntry(type, structuredClone(data)); },
+      } as any);
+      handlers.get('session_start')({}, ctx);
+      return { handlers,
+        launch: () => tools.find(t => t.name === 'subagent').execute('fresh', { name: 'Fresh', task: 'Never run', agent: 'native-worker' }, undefined, undefined, ctx),
+        resume: (managedSessionId = 'boundary-managed') => tools.find(t => t.name === 'subagent_resume').execute('resume', { managedSessionId, message: 'Boundary follow-up' }, undefined, undefined, ctx),
+      };
+    };
+    let bound = bind();
+    const entries = () => manager.getBranch().filter((e: any) => e.type === 'custom' && e.customType === 'pi-interactive-subagents.native-session');
+    const state = (delta: any) => writeFileSync(f.stateFile, JSON.stringify({ ...JSON.parse(readFileSync(f.stateFile, 'utf8')), ...delta }));
+    const complete = async () => {
+      const running: any = [...__test__.runningSubagents.values()][0];
+      execFileSync('/bin/bash', [running.launchScriptFile], { env: process.env });
+      running.nativePollInterval = 1; state({ nativeExit: { exit_code: 0, signal: null, reason: 'exited' } });
+      const until = Date.now() + 1500;
+      while (__test__.runningSubagents.has(running.id) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+      return running;
+    };
+    try { await fn({ ...f, ctx, manager, captured, entries, state, complete, launch: () => bound.launch(), resume: (id?: string) => bound.resume(id), rebind() { bound = bind(); }, failAppend() { failClosedAppend = true; } }); }
+    finally { failClosedAppend = false; if (manager.getBranch().at(-1)?.type === 'custom' && (manager.getBranch().at(-1) as any).data?.version === 2) manager.branch(manager.getBranch().at(-2)!.id); await bound.handlers.get('session_shutdown')({ reason: 'fixture' }, ctx); }
+  });
+}
+for (const failure of ['hello', 'local-file', 'refused', 'ambiguous']) it(`native resume preserves definite versus uncertain launch authority: ${failure}`, async () => nativeBoundaryFixture(async f => {
+  const socket = process.env.HC_TERMINAL_SOCKET;
+  const blocker = join(f.manager.getSessionDir(), 'artifacts', f.manager.getSessionId(), 'subagent-scripts');
+  if (failure === 'hello') process.env.HC_TERMINAL_SOCKET = join(f.dir, 'missing.sock');
+  else if (failure === 'local-file') { mkdirSync(dirname(blocker), { recursive: true }); writeFileSync(blocker, 'owned fixture blocks script directory'); }
+  else f.state(failure === 'refused' ? { refuseRun: true, hideChild: true } : { unconfirmed: true, hideChild: true });
+  await assert.rejects(f.resume);
+  process.env.HC_TERMINAL_SOCKET = socket;
+  if (failure === 'ambiguous') {
+    assert.equal(f.entries().at(-1).data.state, 'open'); f.rebind();
+    const calls = f.requests.length; await assert.rejects(f.resume, /active|unconfirmed/i); assert.equal(f.requests.length, calls);
+  } else {
+    assert.deepEqual(f.entries().at(-1).data, f.captured, 'restore original closure, never fabricate closure for failed new run');
+    assert.equal(f.requests.filter((r: any) => r.method === 'terminal.run').length, failure === 'refused' ? 1 : 0);
+    if (failure === 'local-file') rmSync(blocker);
+    f.state({ refuseRun: false, hideChild: false }); f.rebind(); await f.resume();
+    const running = await f.complete(); assert.equal(__test__.runningSubagents.has(running.id), false);
+  }
+}));
+it('fresh failed native preparation grants no closed resume authority', async () => nativeBoundaryFixture(async f => {
+  process.env.HC_TERMINAL_SOCKET = join(f.dir, 'missing-fresh.sock');
+  await assert.rejects(f.launch);
+  const fresh = f.entries().at(-1).data;
+  assert.notEqual(fresh.record.reference.managedSessionId, 'boundary-managed');
+  assert.equal(fresh.state, 'open');
+  await assert.rejects(() => f.resume(fresh.record.reference.managedSessionId), /active|unconfirmed/i);
+  assert.equal(f.requests.length, 0);
+}));
+
+for (const failure of ['malformed-branch', 'append-failure']) it(`proven native closure releases resources despite ${failure}`, async () => nativeBoundaryFixture(async f => {
+  await f.resume();
+  if (failure === 'malformed-branch') f.manager.appendCustomEntry('pi-interactive-subagents.native-session', { version: 2 });
+  else f.failAppend();
+  const running = await f.complete();
+  assert.equal(__test__.runningSubagents.has(running.id), false, 'closed Core/native resources must release independently of persistence');
+  assert.equal(f.entries().some((e: any) => e.data.runId === running.runId && e.data.state === 'closed'), false);
+  assert.match(running.nativeDiagnostic, /persist|record|append/i);
+  await assert.rejects(f.resume, /invalid caller|active|unconfirmed/i);
+}));
 
 const block = (id: string, terminal: string) => ({ id, type: "block", content: { terminal } });
 const layout = (root: any) => ({ version: 1, value: { spaces: [{ id: "space-test", tabs: [{ id: "parent-tab", root }] }] } });
@@ -75,8 +532,29 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           if (request.params.terminal !== "t1" && JSON.parse(readFileSync(stateFile, "utf8")).missingChild) {
             socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture missing registry record", data: { kind: "not_found" } } }) + "\n"); return;
           }
+          if (request.params.terminal !== "t1") {
+            const state = JSON.parse(readFileSync(stateFile, "utf8"));
+            if (state.nativeObservationFailure) {
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation lost', data: { kind: 'not_found' } } }) + '\n');
+              return;
+            }
+            if (state.nativeTransientOnce) {
+              writeFileSync(stateFile, JSON.stringify({ ...state, nativeTransientOnce: undefined }));
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture transient observation', data: { kind: state.nativeTransientOnce } } }) + '\n');
+              return;
+            }
+            if (state.nativeTimeoutOnce) {
+              writeFileSync(stateFile, JSON.stringify({ ...state, nativeTimeoutOnce: false }));
+              socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture observation timeout', data: { kind: 'timeout' } } }) + '\n');
+              return;
+            }
+            if (state.nativeExit) child = { ...child, state: "finished", ...state.nativeExit };
+          }
           result = request.params.terminal === "t1" ? parent : child; break;
         case "terminal.run":
+          if (JSON.parse(readFileSync(stateFile, 'utf8')).refuseRun) {
+            socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture definite run refusal', data: { kind: 'invalid_params' } } }) + '\n'); return;
+          }
           child = { address: "t2", state: "live", pid: 456, argv: request.params.argv, parent: "t1", labels: request.params.labels };
           const serviceState = JSON.parse(readFileSync(stateFile, "utf8"));
           writeFileSync(stateFile, JSON.stringify({ ...serviceState, child: true, childTab: request.params.labels["herdr.tab"], childSpace: request.params.labels["herdr.space"] }));
@@ -93,6 +571,11 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           break;
         }
         case "terminal.kill":
+          if (JSON.parse(readFileSync(stateFile, 'utf8')).nativeKillReplyLost) {
+            child = { ...child, state: 'finished', exit_code: 143, signal: null, reason: 'killed' };
+            socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture lost kill reply', data: { kind: 'transport' } } }) + '\n');
+            return;
+          }
           if (JSON.parse(readFileSync(stateFile, "utf8")).killFails) {
             socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fixture kill failure", data: { kind: "busy" } } }) + "\n"); return;
           }
@@ -103,7 +586,12 @@ async function coreFixture(run: (fixture: any) => Promise<void>) {
           }
           result = { removed: "t2" }; break;
         case "terminal.keys": result = { turn: 1 }; break;
-        case "terminal.read": result = { text: "partial", complete: true }; break;
+        case "terminal.read":
+          if (JSON.parse(readFileSync(stateFile, 'utf8')).nativeOutputFailure) {
+            socket.end(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'fixture missing output', data: { kind: 'not_found' } } }) + '\n');
+            return;
+          }
+          result = { text: JSON.parse(readFileSync(stateFile, 'utf8')).nativeOutputUnicode ? '€'.repeat(33_334) : JSON.parse(readFileSync(stateFile, 'utf8')).nativeOutputLarge ? 'x'.repeat(100_000) : 'partial', complete: true }; break;
         default: throw new Error(`unexpected RPC ${request.method}`);
       }
       socket.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");
@@ -877,79 +1365,12 @@ it("captures parent PATH and propagates the selected profile without app-home sc
   });
 });
 
-for (const scenario of ["success", "nonzero", "cancel", "timeout", "cleanup-failure", "missing-wrapper"] as const) {
-  it(`observes Core Claude ${scenario} without classic cleanup`, async () => {
-    await coreFixture(async ({ ctx, requests, stateFile }: any) => {
-      const agents = join(process.env.PI_CODING_AGENT_DIR!, "agents"); mkdirSync(agents);
-      writeFileSync(join(agents, "review.md"), "---\nname: review\ncli: claude\nmodel: sonnet\nauto-exit: true\nspawning: false\nsystem-prompt: append\n---\nReview only.\n");
-      const running = await __test__.launchSubagent({ name: "Review", agent: "review", task: "inspect" }, ctx);
-      const uuid = "12345678-1234-4234-8234-123456789abc";
-      writeFileSync(running.claudeResultFile!, JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "review output", session_id: uuid }));
-      if (["success", "nonzero", "cleanup-failure"].includes(scenario)) {
-        writeFileSync(running.wrapperExitFile!, JSON.stringify({ version: 1, runId: running.runId, sourceId: `wrapper:${running.runId}`, sequence: 1, observedAt: new Date().toISOString(), exit: { kind: "shell", shellStatus: scenario === "nonzero" ? 7 : 0 } }));
-      } else {
-        writeFileSync(running.claudeProcessIdFile!, `${running.runId} 4321\n`);
-      }
-      if (scenario === "missing-wrapper") {
-        writeFileSync(join(running.artifactDir!, "subagent-completion", `${running.runId}.recovery.json`), JSON.stringify({ runId: running.runId, stage: "remove" }));
-      }
-      if (scenario === "cleanup-failure") writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), rmFails: true }));
-      __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
-      process.env.PI_SUBAGENT_MUX = "zellij";
-      const controller = new AbortController();
-      if (scenario === "cancel") controller.abort("cancelled");
-      try {
-        const result = await __test__.watchSubagent(running, controller.signal, {
-          visibleInterval: 1,
-          closeSurface: async () => { throw Error("classic cleanup forbidden"); },
-          processProbe: () => { throw Object.assign(Error("gone"), { code: "ESRCH" }); },
-          ...(["timeout", "missing-wrapper"].includes(scenario) ? { pollForExit: async (surface: string, signal: AbortSignal, options: any) => pollForExit(surface, signal, { ...options, timeoutMs: 0 }) } : {}),
-        });
-        assert.equal(result.exitCode, ["success", "cleanup-failure"].includes(scenario) ? 0 : scenario === "nonzero" ? 7 : 1);
-        if (result.exitCode === 0) assert.equal(result.claudeSessionId, uuid);
-        else assert.match(result.summary, /review output/);
-        if (scenario === "timeout" || scenario === "missing-wrapper") assert.match(result.summary, /deadline exceeded/);
-        assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
-        assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 1);
-        assert.equal(__test__.runningSubagents.has(running.id), scenario === "cleanup-failure");
-        if (scenario === "cleanup-failure") {
-          writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), rmFails: false }));
-          assert.deepEqual(await __test__.shutdownOwnedSubagents("retry"), []);
-          assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
-          assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 2);
-        }
-      } finally { __test__.releaseRunningSubagent(running.id); }
-    });
-  });
-}
 
-it("launches read-only Claude through Core once with captured ownership", async () => {
-  await coreFixture(async ({ dir, ctx, requests, appLog }: any) => {
+it("rejects foreign cli metadata before accessing native context", async () => {
+  await coreFixture(async ({ dir, ctx, requests }: any) => {
     const agents = join(process.env.PI_CODING_AGENT_DIR!, "agents"); mkdirSync(agents);
     writeFileSync(join(agents, "review.md"), "---\nname: review\ncli: claude\nmodel: sonnet\nauto-exit: true\nspawning: false\nsystem-prompt: append\n---\nReview only.\n");
-    const running = await __test__.launchSubagent({ name: "Review", agent: "review", task: "inspect", resumeSessionId: "12345678-1234-4234-8234-123456789abc" }, ctx);
-    const launches = requests.filter((request: any) => request.method === "terminal.run");
-    assert.equal(launches.length, 1);
-    assert.equal(running.coreHost?.address, "t2");
-    assert.equal(running.coreHost?.parent, "t1");
-    assert.equal(running.cli, "claude");
-    assert.equal(existsSync(appLog), false);
-    const script = readFileSync(running.launchScriptFile!, "utf8");
-    assert.ok(script.includes(process.execPath));
-    assert.match(script, /--safe-mode --restricted --strict-mcp-config/);
-    assert.match(script, /--permission-mode dontAsk --tools 'Read,Glob,Grep'/);
-    assert.match(script, /--resume '12345678-1234-4234-8234-123456789abc'/);
-    assert.doesNotMatch(script, /--max-turns/);
-    assert.ok(script.includes(running.runId));
-    assert.ok(script.includes(running.coreHost!.wrapperStartFile));
-    __test__.registerRunningSubagent({ events: { emit() {} } } as any, running);
-    process.env.PI_SUBAGENT_MUX = "zellij";
-    try {
-      const failures = await __test__.shutdownOwnedSubagents("test", async () => { throw Error("classic close forbidden"); });
-      assert.deepEqual(failures, []);
-      assert.equal(requests.filter((request: any) => request.method === "terminal.kill").length, 1);
-      assert.equal(requests.filter((request: any) => request.method === "terminal.rm").length, 1);
-    } finally { __test__.releaseRunningSubagent(running.id); }
-
+    await assert.rejects(__test__.launchSubagent({ name: "Review", agent: "review", task: "inspect" }, ctx), /cli/i);
+    assert.equal(requests.length, 0);
   });
 });

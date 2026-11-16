@@ -1,9 +1,22 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { keyHint, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import {
   parseAgentDefinition as parseSharedAgentDefinition,
   resolveAgentLaunchIntent,
+  resolveManagedNativeResume,
+  type ManagedNativeSessionRecord,
+  selectAgentDefinition,
+  copilotJobCapabilities as sharedCopilotJobCapabilities,
+  claudeJobCapabilities,
+  createAgentRunState,
+  reduceAgentRunEvidence,
+  projectAgentRunStatus,
+  projectAgentRunCompletion,
+  type AgentRunState,
+  type AgentRunEvidence,
+  type DefinitionOrigin,
   visibleHerdrCapabilities,
   visibleHerdrCoreCapabilities,
   type AgentRunCompletion,
@@ -11,7 +24,7 @@ import {
   type NormalizedAgentDefinition,
 } from "pi-agent-execution";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -23,6 +36,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { randomUUID, createHash } from "node:crypto";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -30,8 +44,6 @@ import {
   createTaskSurface,
   setTaskLabel,
   sendLongCommand,
-  pollForExit,
-  ClaudeExitTimeoutError,
   closeSurface,
   getMuxBackend,
   sendEscape,
@@ -41,8 +53,12 @@ import {
   readScreen,
 } from "./cmux.ts";
 
-import { prepareCoreLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
-import { killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
+import { prepareCoreLaunch, prepareCoreJobLaunch, launchPreparedCoreRun, CoreSetupCleanupFailure } from "./core-launch.ts";
+import { resolveNativeSkills, assertNoNativeSkillShadows } from './native-skills.ts';
+import { nativeSessionRecords, NATIVE_SESSION_ENTRY, type NativeSessionEntry } from './native-session.ts';
+import { prepareNativeJob, buildNativeCaptureCommand, readNativeCapture, readNativePartialCapture, probeNativeEntry, type NativeEntryProof, type NativeCapturePaths } from "./native-job.ts";
+const copilotJobCapabilities = sharedCopilotJobCapabilities;
+import { getCoreTerminal, CoreRpcError, killCoreTerminal, removeCoreTerminal, sendCoreEscape, readCoreScreen, reconcileCoreRun, CoreLaunchUnconfirmed, type CoreHostRef } from "./herdr-core.ts";
 
 import {
   getNewEntries,
@@ -68,8 +84,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, readWrapperExitRecord, readWrapperStartRecord, writeCoreRecoveryDescriptor } from "./completion.ts";
-import { confirmClaudeProcessGone, readClaudeFailureResult, readClaudePrintResult, validateClaudeReviewLaunch } from "./claude-transport.ts";
+import { buildVisibleCompletionPaths, buildVisibleWrapperCommand, readWrapperStartRecord, writeCoreRecoveryDescriptor } from "./completion.ts";
 import {
   confirmOwnedProcessGone,
   createVisibleCompletionState,
@@ -138,6 +153,7 @@ const SubagentParams = Type.Object({
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   agent: Type.Optional(
     Type.String({
+      minLength: 1,
       description:
         "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
     }),
@@ -172,17 +188,12 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
   ),
-  resumeSessionId: Type.Optional(
-    Type.String({
-      description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
-    }),
-  ),
-});
+}, { additionalProperties: false });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
+  definitionSha256?: string;
   definition: NormalizedAgentDefinition;
   model?: string;
   tools?: string;
@@ -194,7 +205,6 @@ interface AgentDefaults {
   interactive?: boolean;
   sessionMode?: SubagentSessionMode;
   cwd?: string;
-  cli?: string;
   disableModelInvocation?: boolean;
 }
 
@@ -279,9 +289,9 @@ class AgentDefinitionParseError extends Error {
   }
 }
 
-function parseVisibleAgentDefinition(path: string, content: string): AgentDefinition {
+function parseVisibleAgentDefinition(path: string, content: string, origin?: DefinitionOrigin): AgentDefinition {
   const parsed = parseSharedAgentDefinition(
-    { path, content },
+    { path, content, origin },
     { fallbackName: path.split("/").pop()?.replace(/\.md$/, ""), requiredFields: [] },
   );
   if (!parsed.ok) throw new AgentDefinitionParseError(parsed.diagnostics);
@@ -290,6 +300,7 @@ function parseVisibleAgentDefinition(path: string, content: string): AgentDefini
   const metadata = definition.metadata;
   return {
     definition,
+    definitionSha256: createHash("sha256").update(content).digest("hex"),
     name: definition.name,
     description: definition.description,
     model: definition.model,
@@ -302,33 +313,60 @@ function parseVisibleAgentDefinition(path: string, content: string): AgentDefini
     interactive: metadataBoolean(metadata, "interactive"),
     sessionMode: parseSessionMode(metadataString(metadata, "session-mode")),
     cwd: definition.cwd,
-    cli: metadataString(metadata, "cli"),
     disableModelInvocation: metadataBoolean(metadata, "disable-model-invocation") ?? false,
   };
 }
 
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  const agents = new Map<string, ListedAgentDefinition>();
-  const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: getBundledAgentsDir(), source: "package" },
-    { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-  ];
-
+function discoverAgentDefinitions(dirs: Array<{ path: string; source: AgentSource }> = [
+  { path: getBundledAgentsDir(), source: "package" },
+  { path: join(getAgentConfigDir(), "agents"), source: "global" },
+  { path: join(process.cwd(), ".pi", "agents"), source: "project" },
+], requestedName?: string): ListedAgentDefinition[] {
+  const agents = new Map<string, ListedAgentDefinition[]>();
+  const errors = new Map<string, Error>();
+  // Keep the entire inventory until authority/shadow validation has completed.
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
+    const canonicalRoot = realpathSync(dir);
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
       const definitionPath = join(dir, file);
+      const names = [file.replace(/\.md$/, "")];
       try {
-        const parsed = parseVisibleAgentDefinition(definitionPath, readFileSync(definitionPath, "utf8"));
-        agents.set(parsed.name, { ...parsed, source });
+        const canonicalPath = realpathSync(definitionPath);
+        const content = readFileSync(canonicalPath, "utf8");
+        const declared = parseFrontmatter<Record<string, unknown>>(content).frontmatter.name;
+        if (typeof declared === "string" && declared.trim()) names.push(declared.trim());
+        const inside = relative(canonicalRoot, canonicalPath);
+        const escaped = inside === ".." || inside.startsWith("../") || isAbsolute(inside);
+        let parsed: AgentDefinition;
+        try {
+          parsed = parseVisibleAgentDefinition(definitionPath, content, escaped ? undefined : {
+            kind: source === "package" ? "installed-package" : source === "global" ? "global-user" : "project",
+            canonicalPath, canonicalRoot,
+          });
+        } catch (error) {
+          if (escaped) throw new Error(`Agent definition escapes canonical discovery root: ${definitionPath}: ${error}`);
+          throw error;
+        }
+        const candidates = agents.get(parsed.name) ?? [];
+        candidates.push({ ...parsed, source });
+        agents.set(parsed.name, candidates);
       } catch (error) {
-        if (!(error instanceof AgentDefinitionParseError)) throw error;
+        for (const name of names) errors.set(name, error instanceof Error ? error : new Error(String(error)));
       }
     }
   }
-
-  return [...agents.values()];
+  if (requestedName && errors.has(requestedName)) throw errors.get(requestedName)!;
+  const selected: ListedAgentDefinition[] = [];
+  for (const [name, candidates] of agents) {
+    if (requestedName && name !== requestedName) continue;
+    if (errors.has(name)) continue;
+    try {
+      const definition = selectAgentDefinition(candidates.map(candidate => candidate.definition));
+      selected.push(candidates.find(candidate => candidate.definition === definition)!);
+    } catch (error) { if (requestedName) throw error; }
+  }
+  return selected;
 }
 
 function normalizeOptionalString(value?: string): string | undefined {
@@ -460,20 +498,12 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-    join(getBundledAgentsDir(), `${agentName}.md`),
-  ];
-
-  for (const p of paths) {
-    if (!existsSync(p)) continue;
-    return parseVisibleAgentDefinition(p, readFileSync(p, "utf8"));
-  }
-
-  return null;
+function loadAgentDefaults(agentName: string, callerCwd?: string): AgentDefaults | null {
+  return discoverAgentDefinitions(callerCwd === undefined ? undefined : [
+    { path: getBundledAgentsDir(), source: 'package' },
+    { path: join(getAgentConfigDir(), 'agents'), source: 'global' },
+    { path: join(callerCwd, '.pi', 'agents'), source: 'project' },
+  ], agentName)[0] ?? null;
 }
 
 function formatElapsed(seconds: number): string {
@@ -552,9 +582,13 @@ type PresentableResult = Pick<
   | "summary"
   | "sessionFile"
   | "sessionFileExists"
-  | "claudeSessionId"
   | "error"
   | "errorMessage"
+  | "runner"
+  | "projection"
+  | "outputFile"
+  | "outputCapture"
+  | "nativeDiagnostics"
 >;
 
 function describeResultPresentation(result: PresentableResult, name: string) {
@@ -585,6 +619,16 @@ function describeResultPresentation(result: PresentableResult, name: string) {
 }
 
 function resolveResultPresentation(result: PresentableResult, name: string): string {
+  if (result.runner) {
+    const disposition = result.projection?.terminal ? result.projection.disposition : `${result.projection?.disposition ?? "pending"} (closure unconfirmed; owner retained)`;
+    return `${result.runner} job "${name}": ${disposition}. ` +
+      `Task outcome is unknown; process completion is invocation evidence only.\n` +
+      `Capture: current-job-stdout; ${result.outputCapture?.complete ? "complete private file" : "unconfirmed"}; ` +
+      `model view ${result.outputCapture ? result.outputCapture.truncated ? "truncated to 64 KiB" : "not truncated" : "unavailable"}.\n` +
+      `Private stdout: ${result.outputFile ?? "unavailable"}\n` +
+      `Private stderr: ${result.outputCapture?.diagnosticPath ?? "unconfirmed"}; diagnostic view ${result.outputCapture?.diagnosticTruncated ? "truncated to 8 KiB" : "not truncated or unavailable"}.\n` +
+      `Diagnostics: ${result.nativeDiagnostics ?? result.errorMessage ?? "none"}\n\n${result.summary}`;
+  }
   const sessionRef = result.sessionFile
     ? result.sessionFileExists === false
       ? `\n\nPlanned session (not created): ${result.sessionFile}`
@@ -606,8 +650,7 @@ function resolveResultPresentation(result: PresentableResult, name: string): str
     );
   }
 
-  const claudeRef = result.claudeSessionId ? `\n\nClaude session ID: ${result.claudeSessionId}` : "";
-  return `${presentation.headline}\n\n${result.summary}${sessionRef}${claudeRef}`;
+  return `${presentation.headline}\n\n${result.summary}${sessionRef}`;
 }
 
 function projectResultDetails(
@@ -625,7 +668,11 @@ function projectResultDetails(
     ...(result.error ? { error: result.error } : {}),
     ...(result.failureContext ?? {}),
     ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-    ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+    ...(result.runner ? {
+      runner: result.runner, capabilities: result.runner === 'claude' ? claudeJobCapabilities : copilotJobCapabilities, nativeReference: result.nativeReference,
+      hostEvidence: result.hostEvidence, projection: result.projection, completion: result.completion,
+      outputFile: result.outputFile, outputCapture: result.outputCapture, nativeDiagnostics: result.nativeDiagnostics,
+    } : {}),
   };
 }
 
@@ -633,12 +680,19 @@ function projectResultDetails(
  * Result from running a single subagent.
  */
 interface SubagentResult {
+  runner?: "copilot" | "claude";
+  nativeDiagnostics?: string;
+  nativeReference?: ReturnType<typeof prepareNativeJob>["nativeReference"];
+  hostEvidence?: CoreHostRef & { terminal?: Awaited<ReturnType<typeof getCoreTerminal>>; nativeEntry?: NativeEntryProof };
+  outputCapture?: ReturnType<typeof readNativeCapture>["capture"];
+  projection?: ReturnType<typeof projectAgentRunStatus>;
+  completion?: AgentRunCompletion;
+  outputFile?: string;
   name: string;
   task: string;
   summary: string;
   sessionFile?: string;
   sessionFileExists?: boolean;
-  claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -668,6 +722,26 @@ interface RunningSubagent {
   agent?: string;
   surface: string;
   coreHost?: CoreHostRef;
+  nativeJob?: ReturnType<typeof prepareNativeJob>;
+  nativeState?: AgentRunState;
+  nativeSequence?: number;
+  nativeCapturePaths?: NativeCapturePaths;
+  nativeCapture?: ReturnType<typeof readNativeCapture>;
+  nativeObservation?: Promise<void>;
+  nativeControlPromise?: Promise<void>;
+  nativeKillAmbiguous?: boolean;
+  nativeStopDeadline?: number;
+  nativeStopTimeoutMs?: number;
+  nativeObserverDetached?: boolean;
+  nativeEntryProof?: NativeEntryProof;
+  nativeProcessProbe?: (pid: number, signal: 0) => void;
+  nativePartialCapture?: ReturnType<typeof readNativePartialCapture>;
+  nativeHostTerminal?: Awaited<ReturnType<typeof getCoreTerminal>>;
+  nativeDiagnostic?: string;
+  nativeCaptureRead?: typeof readNativeCapture;
+  nativePollInterval?: number;
+  nativeDefinition?: { origin: DefinitionOrigin; sha256: string };
+  nativeOnClosed?: () => void;
   coreLaunchPending?: CoreLaunchUnconfirmed;
   coreCleanupPromise?: Promise<void>;
   coreCleanupError?: string;
@@ -691,10 +765,6 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
-  cli?: string;
-  claudeResultFile?: string;
-  claudeProcessIdFile?: string;
-  claudeExitConfirmed?: boolean;
   statusState: SubagentStatusState;
   interruptCount?: number;
   interruptRequestedAt?: number;
@@ -758,6 +828,13 @@ function releaseRunningSubagent(id: string): boolean {
   const running = runningSubagents.get(id);
   if (!running) return false;
 
+  if (running.nativeJob && running.nativeState?.process.status === 'exited' && !running.coreCleanupError) {
+    try { running.nativeOnClosed?.(); }
+    catch (error) {
+      running.nativeDiagnostic = `Native closure record persistence unconfirmed: ${error instanceof Error ? error.message : String(error)}`;
+      console.error(running.nativeDiagnostic);
+    }
+  }
   runningSubagents.delete(id);
   if (running.blockedEventBus) {
     emitHerdrBlocked(running.blockedEventBus, { active: false });
@@ -769,7 +846,7 @@ function releaseRunningSubagent(id: string): boolean {
 async function launchOwnedCoreRun(
   prepared: Parameters<typeof launchPreparedCoreRun>[0],
   spec: Parameters<typeof launchPreparedCoreRun>[1],
-  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren"> & { artifactDir: string },
+  metadata: Pick<RunningSubagent, "name" | "task" | "agent" | "sessionFile" | "startTime" | "canSpawnDirectChildren" | "nativeJob" | "nativeState" | "nativeDefinition" | "nativeCapturePaths"> & { artifactDir: string },
 ): Promise<CoreHostRef> {
   const ownerSignal = getModuleAbortSignal();
   try { return await launchPreparedCoreRun(prepared, spec); }
@@ -812,6 +889,9 @@ async function launchOwnedCoreRun(
 }
 
 function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): string {
+  if (running.nativeJob && running.nativeCapturePaths) {
+    running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths, running.runId, running.nativeProcessProbe);
+  }
   const message = error instanceof Error ? error.message : String(error);
   let recovery = "";
   if ((running.coreHost || running.coreLaunchPending) && running.artifactDir) {
@@ -829,7 +909,7 @@ function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): str
       writeCoreRecoveryDescriptor(file, {
         runId: running.runId, endpoint: owner.endpoint, coreId: owner.coreId, parent: owner.parent, address: host?.address,
         wrapperPid: host?.wrapperPid ?? (startup?.ok ? startup.value.wrapperPid : undefined),
-        childPid: running.completionState?.childPid, script, wrapperStartFile, session: running.sessionFile,
+        childPid: running.nativeJob ? running.nativeEntryProof?.pid : running.completionState?.childPid, script, wrapperStartFile, session: running.sessionFile,
         stage: running.coreCleanupStage ?? (host ? "kill" : "reconcile"), error: message,
       });
       recovery = `; recovery descriptor: ${file}`;
@@ -841,14 +921,30 @@ function recordCoreCleanupFailure(running: RunningSubagent, error: unknown): str
 async function closeOwnedSubagent(running: RunningSubagent, classic: (surface: string) => Promise<void> = closeSurface): Promise<void> {
   if (!running.coreHost && !running.coreLaunchPending) return classic(running.surface);
   if (!running.coreCleanupPromise) {
+    const nativeDeadline = running.nativeJob ? nativeStopDeadline(running) : undefined;
     running.coreCleanupPromise = (async () => {
       if (!running.coreHost && running.coreLaunchPending) {
         running.coreCleanupStage = "reconcile";
-        running.coreHost = await reconcileCoreRun(running.coreLaunchPending);
+        const reconciliation = reconcileCoreRun(running.coreLaunchPending);
+        running.coreHost = nativeDeadline === undefined ? await reconciliation : await withinNativeStopBudget(reconciliation, nativeDeadline);
         if (!running.coreHost) { running.coreCleanupError = undefined; return; }
         running.surface = running.coreHost.address;
       }
       const host = running.coreHost!;
+      if (running.nativeJob) {
+        const deadline = nativeDeadline!;
+        await withinNativeStopBudget(requestNativeStop(running, "terminate"), deadline);
+        await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+        if (running.nativeState?.process.status !== "exited" && running.nativeHostTerminal?.state === "finished"
+          && (running.coreKillAccepted || running.nativeHostTerminal.reason === "exited") && Date.now() < deadline) {
+          await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+        }
+        if (running.nativeState?.process.status !== "exited") throw new Error("Native entry/Core closure remains unconfirmed; raw capture and owned Core record retained");
+        running.coreCleanupStage = "remove";
+        await withinNativeStopBudget(removeCoreTerminal(host), deadline);
+        running.coreCleanupError = undefined;
+        return;
+      }
       if (running.terminationRequestState !== "accepted" && !running.coreKillAccepted) {
         running.coreCleanupStage = "kill";
         await killCoreTerminal(host);
@@ -872,6 +968,7 @@ async function shutdownOwnedSubagents(
 ): Promise<string[]> {
   const owned = [...runningSubagents.values()];
   for (const running of owned) {
+    if (running.nativeJob) { running.nativeObserverDetached = true; nativeStopDeadline(running); }
     running.abortController?.abort(`session_shutdown:${reason}`);
     if (!running.coreHost && !running.coreLaunchPending) releaseRunningSubagent(running.id);
   }
@@ -882,6 +979,10 @@ async function shutdownOwnedSubagents(
       if (running.coreHost || running.coreLaunchPending) releaseRunningSubagent(running.id);
     } catch (error) {
       failures.push(recordCoreCleanupFailure(running, error));
+    }
+    if (running.nativeJob && running.nativeObservation) {
+      try { await withinNativeStopBudget(running.nativeObservation, running.nativeStopDeadline!); }
+      catch (error) { failures.push(recordCoreCleanupFailure(running, error)); }
     }
   }));
   return failures;
@@ -990,9 +1091,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
-      : agent.cli === "claude"
-        ? " running… "
-        : " starting… ";
+      : agent.nativeJob?.nativeReference.runner === "claude" ? " running… " : " starting… ";
 
     lines.push(borderLine(left, right, width));
   }
@@ -1105,34 +1204,6 @@ function buildPiModelArgs(effectiveModel?: string, effectiveThinking?: string): 
   return ["--model", shellEscape(model)];
 }
 
-function buildClaudeCommand(options: {
-  resultFile: string;
-  processIdFile: string;
-  runId: string;
-  model?: string;
-  systemPrompt?: string;
-  resumeSessionId?: string;
-  task: string;
-  cwd?: string;
-  nodeExecutable?: string;
-}): string {
-  const parts = [
-    "claude", "--safe-mode", "--restricted", "--strict-mcp-config",
-    "--permission-mode", "dontAsk", "--tools", shellEscape("Read,Glob,Grep"),
-    "--allowedTools", shellEscape("Read"), shellEscape("Glob"), shellEscape("Grep"),
-    "--disallowedTools", shellEscape("mcp__*"),
-    "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-  ];
-  if (options.model) parts.push("--model", shellEscape(options.model));
-  if (options.systemPrompt) parts.push("--append-system-prompt", shellEscape(options.systemPrompt));
-  if (options.resumeSessionId) parts.push("--resume", shellEscape(options.resumeSessionId));
-  parts.push("--", shellEscape(options.task));
-
-  const runner = shellEscape(fileURLToPath(new URL("./claude-run.ts", import.meta.url)));
-  return [options.nodeExecutable ? shellEscape(options.nodeExecutable) : "node", runner, shellEscape(options.resultFile), shellEscape(options.processIdFile),
-    shellEscape(options.runId), shellEscape(options.cwd ?? ""), ...parts].join(" ");
-}
-
 function activityLabel(activity: SubagentActivityState): string | undefined {
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
@@ -1142,7 +1213,7 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
+  if (running.nativeJob) return;
 
   if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
     const completionStatus = observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
@@ -1269,14 +1340,14 @@ function handleSubagentInterrupt(
   if (running.coreLaunchPending && !running.coreHost) {
     return { content: [{ type: "text" as const, text: "Core launch is unconfirmed; its captured run must be reconciled during owned cleanup before controls can target a terminal." }], details: { error: "launch-unconfirmed", id: running.id } };
   }
-  if (running.cli === "claude") {
+  if (running.nativeJob) {
     return {
       content: [{
         type: "text" as const,
         text:
-          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
+          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Use subagent_terminate for a correlated hard stop of a native job.",
       }],
-      details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
+      details: { error: `${running.nativeJob.nativeReference.runner} interrupt unsupported`, id: running.id, name: running.name },
     };
   }
 
@@ -1326,7 +1397,6 @@ async function handleSubagentTerminate(
   params: { id?: string; name?: string },
   close: (surface: string) => Promise<void> = closeSurface,
   read: (surface: string, lines?: number) => string = readScreen,
-  probe: (pid: number, signal: 0) => void = process.kill,
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -1340,13 +1410,27 @@ async function handleSubagentTerminate(
   if (running.coreLaunchPending && !running.coreHost) {
     return { content: [{ type: "text" as const, text: "Core launch is unconfirmed; its captured run must be reconciled during owned cleanup before controls can target a terminal." }], details: { error: "launch-unconfirmed", id: running.id } };
   }
-  const claudeGone = () => {
-    if (running.cli !== "claude") return false;
-    if (running.wrapperExitFile && readWrapperExitRecord(running.wrapperExitFile, running.runId).ok) return true;
-    if (!running.claudeProcessIdFile) return false;
-    try { return confirmClaudeProcessGone(running.claudeProcessIdFile, running.runId, probe); }
-    catch { return false; }
-  };
+  if (running.nativeJob) {
+    try {
+      const deadline = nativeStopDeadline(running);
+      await withinNativeStopBudget(requestNativeStop(running, "terminate"), deadline);
+      await withinNativeStopBudget(closeOwnedSubagent(running), deadline);
+      const confirmed = running.nativeState?.process.status === "exited";
+      if (confirmed) releaseRunningSubagent(running.id);
+      const capture = running.nativeCapture ?? running.nativePartialCapture;
+      const captureText = capture?.capture.complete ? "Current-job capture is complete." : `Capture is incomplete/partial; raw stdout retained at ${running.nativeCapturePaths?.stdout}.`;
+      return { content: [{ type: "text" as const, text: confirmed
+        ? `Native entry/pipeline and Core program closure confirmed for "${running.name}". Unrecorded descendants are not certified. ${captureText}`
+        : "Native termination remains unconfirmed." }],
+        details: { id: running.id, status: confirmed ? running.nativeState!.control.status === "none" ? "exited" : "terminated" : "termination_requested_unconfirmed", runner: running.nativeJob!.nativeReference.runner,
+          hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof }, outputFile: running.nativeCapturePaths?.stdout, outputCapture: capture?.capture } };
+    } catch (error) {
+      running.nativeDiagnostic = recordCoreCleanupFailure(running, error);
+      return { content: [{ type: "text" as const, text: `Native termination/cleanup unconfirmed: ${running.nativeDiagnostic}` }],
+        details: { id: running.id, error: "termination-unconfirmed", hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof },
+          outputFile: running.nativeCapturePaths?.stdout, outputCapture: (running.nativeCapture ?? running.nativePartialCapture)?.capture } };
+    }
+  }
   observeRunningSubagent(running);
   const directChildCount = running.activityRead?.ok ? running.activity?.directChildCount : undefined;
   if (running.canSpawnDirectChildren && directChildCount !== 0) {
@@ -1367,7 +1451,7 @@ async function handleSubagentTerminate(
       },
     };
   }
-  if (running.cli !== "claude" && running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
+  if (running.completionState && running.childSnapshotFile && running.wrapperExitFile) {
     observeVisibleCompletion({ state: running.completionState, childSnapshotFile: running.childSnapshotFile, wrapperExitFile: running.wrapperExitFile });
   }
   try {
@@ -1377,15 +1461,6 @@ async function handleSubagentTerminate(
   } catch {}
 
   if (running.terminationRequestState) {
-    if (claudeGone()) {
-      running.claudeExitConfirmed = true;
-      releaseRunningSubagent(running.id);
-      running.abortController?.abort("terminated_by_parent");
-      return {
-        content: [{ type: "text" as const, text: `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}` }],
-        details: { id: running.id, name: running.name, status: "terminated", surface: running.surface },
-      };
-    }
     return {
       content: [{ type: "text" as const, text: `Termination was already requested for subagent "${running.name}"; process exit remains unconfirmed.` }],
       details: { id: running.id, name: running.name, status: "termination_requested_unconfirmed", surface: running.surface, sessionFile: running.sessionFile },
@@ -1394,7 +1469,7 @@ async function handleSubagentTerminate(
 
   running.terminationRequestState = "pending";
   running.terminationRequestedAt = Date.now();
-  if (running.cli !== "claude" && running.completionState) {
+  if (running.completionState) {
     recordVisibleControl(running.completionState, { kind: "terminate-requested", mode: running.coreHost ? "core-terminal-kill" : "herdr-pane-close" });
   }
   try {
@@ -1417,27 +1492,16 @@ async function handleSubagentTerminate(
   }
 
   running.terminationRequestState = "accepted";
-  if (running.cli === "claude") running.abortController?.abort("terminated_by_parent");
-  else if (running.completionState && !running.coreHost) confirmOwnedProcessGone(running.completionState);
+  if (running.completionState && !running.coreHost) confirmOwnedProcessGone(running.completionState);
   updateWidget();
 
-  let confirmed: boolean;
-  if (running.cli === "claude") {
-    confirmed = claudeGone();
-    if (confirmed) {
-      running.claudeExitConfirmed = true;
-      releaseRunningSubagent(running.id);
-      running.abortController?.abort("terminated_by_parent");
-    }
-  } else {
-    confirmed = running.completionState?.core.process.status === "exited" ?? false;
-  }
+  const confirmed = running.completionState?.core.process.status === "exited" ?? false;
   return {
     content: [{
       type: "text" as const,
       text: confirmed
-        ? `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}` + (running.cli === "claude" ? "" : `\nSession: ${running.sessionFile}`)
-        : `Termination requested for subagent "${running.name}"; process exit is unconfirmed and the run remains registered.\n\nID: ${running.id}` + (running.cli === "claude" ? "" : `\nSession: ${running.sessionFile}`),
+        ? `Termination confirmed for subagent "${running.name}".\n\nID: ${running.id}\nSession: ${running.sessionFile}`
+        : `Termination requested for subagent "${running.name}"; process exit is unconfirmed and the run remains registered.\n\nID: ${running.id}\nSession: ${running.sessionFile}`,
     }],
     details: {
       id: running.id,
@@ -1568,6 +1632,7 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  prepareNativeJob,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -1581,7 +1646,7 @@ export const __test__ = {
   visibleHerdrCoreCapabilities,
   buildSubagentToolAllowlist,
   buildPiModelArgs,
-  buildClaudeCommand,
+  SubagentParams,
   launchSubagent,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1627,23 +1692,86 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; skillCatalog?: ReturnType<ExtensionAPI['getCommands']>;
+    nativeResume?: ReturnType<typeof resolveManagedNativeResume>; nativeDefinition?: AgentDefaults;
+    nativeLifecycle?: (record: ManagedNativeSessionRecord, agent: string, runId: string) => () => void;
+    nativeNotStarted?: (runId: string) => void;
+  },
 ): Promise<RunningSubagent> {
+  if (!Value.Check(SubagentParams, params)) {
+    throw new Error(`Invalid subagent parameters: ${[...Value.Errors(SubagentParams, params)].map(error => `${error.path}: ${error.message}`).join("; ")}`);
+  }
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const agentDefs = options?.nativeDefinition ?? (params.agent ? loadAgentDefaults(params.agent, ctx.cwd) : null);
+  if (params.agent && !agentDefs) throw new Error(`Unknown agent: ${params.agent}`);
   const coreSelected = getMuxBackend() === "herdr-core";
-  if (agentDefs?.cli === "claude") validateClaudeReviewLaunch(params, agentDefs);
-  else if (params.resumeSessionId) throw new Error("resumeSessionId requires a Claude review agent");
-  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
-  const claudeSystemPrompt = agentDefs?.cli === "claude"
-    ? [launchIntent.effective.systemPrompt?.text, params.systemPrompt]
-      .filter((text, index, all): text is string => !!text && all.indexOf(text) === index)
-      .join("\n\n") : undefined;
-  if (claudeSystemPrompt && Buffer.byteLength(claudeSystemPrompt, "utf8") > 60 * 1024) {
-    throw new Error("Claude review system prompt exceeds 60 KiB");
+  if (agentDefs && ['copilot', 'claude'].includes(agentDefs.definition.runner)) {
+    const nativeBackend = process.env.PI_SUBAGENT_MUX?.trim().toLowerCase();
+    if (nativeBackend && (nativeBackend !== 'herdr-core' || !coreSelected)) throw new Error("Native jobs require the herdr-core backend; no fallback is available");
+    if (options?.surface) throw new Error("Native jobs cannot reuse a classic surface");
+    const resumed = options?.nativeResume;
+    const managedSessionId = resumed?.reference.managedSessionId ?? randomUUID();
+    const skills = resumed?.skills ?? await resolveNativeSkills(agentDefs.definition.skills ?? [], options?.skillCatalog ?? [], ctx.cwd, getAgentConfigDir());
+    const nativeJob = prepareNativeJob(agentDefs.definition, resumed ? { ...params, cwd: resumed.reference.cwd } : params, {
+      parentCwd: resumed?.bindings.parentCwd ?? ctx.cwd, managedSessionId,
+      nativeName: resumed?.reference.selector.value ?? (agentDefs.definition.runner === 'claude' ? randomUUID() : `pi-${managedSessionId}`), env: { ...process.env }, skills,
+      bindings: resumed?.bindings, resume: !!resumed,
+    });
+    const parentSessionFile = ctx.sessionManager.getSessionFile();
+    if (!parentSessionFile) throw new Error("No session file");
+    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+    const nativeOnClosed = options?.nativeLifecycle?.({
+      callerSessionId: ctx.sessionManager.getSessionId(), reference: nativeJob.nativeReference,
+      definitionOrigin: agentDefs.definition.origin!, definitionSha256: agentDefs.definitionSha256!,
+      bindings: { parentCwd: nativeJob.context.parentCwd, managedSessionId, todoPathLiteral: nativeJob.context.env.PI_TODO_PATH }, skills,
+    }, agentDefs.definition.name, id);
+    let launchAttempted = false;
+    try {
+      const prepared = await prepareCoreJobLaunch(params.name);
+      const launchScriptFile = join(artifactDir, "subagent-scripts", `${id}.${agentDefs.definition.runner}.sh`);
+      const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.native-start.json`);
+      const nativeCapturePaths = {
+        stdout: join(artifactDir, "subagent-completion", `${id}.native-stdout.txt`),
+        stderr: join(artifactDir, "subagent-completion", `${id}.native-stderr.txt`),
+        status: join(artifactDir, "subagent-completion", `${id}.native-capture.json`),
+      };
+      mkdirSync(dirname(nativeCapturePaths.stdout), { recursive: true, mode: 0o700 });
+      const metadata = {
+        name: params.name, task: params.task, agent: params.agent, sessionFile: "", startTime,
+        canSpawnDirectChildren: false, artifactDir, nativeJob, nativeCapturePaths, nativeOnClosed,
+        nativeState: createAgentRunState(id, "native-job"),
+        nativeDefinition: { origin: agentDefs.definition.origin!, sha256: agentDefs.definitionSha256! },
+      };
+      launchAttempted = true;
+      const coreHost = await launchOwnedCoreRun(prepared, {
+        runId: id, scriptPath: launchScriptFile, wrapperStartFile,
+        command: buildNativeCaptureCommand(nativeJob.argv, nativeCapturePaths, id),
+        cwd: nativeJob.cwd, agentDir: getAgentConfigDir(),
+        env: { HOME: process.env.HOME || homedir(), COPILOT_AUTO_UPDATE: "false" },
+      }, metadata);
+      return {
+        ...metadata, id, runId: id, coreHost, surface: coreHost.address, launchScriptFile,
+        transcriptStartLine: 0, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+      };
+    } catch (error) {
+      // startCoreRun exposes a bare run refusal only after a successful
+      // zero-match reconciliation. Sent/uncertain or known-owned runs never
+      // qualify, even if later visibility cleanup already removed the program.
+      const definite = !launchAttempted || (error instanceof CoreRpcError && (
+        ['hello', 'terminal.get'].includes(error.method)
+        || (error.method === 'terminal.run' && ['invalid_params', 'name_taken', 'not_found'].includes(error.kind))
+      )) || (error instanceof Error && ['mkdir', 'open', 'write', 'chmod'].includes((error as NodeJS.ErrnoException).syscall ?? ''));
+      if (definite && !(error instanceof CoreLaunchUnconfirmed) && !(error instanceof CoreSetupCleanupFailure) && !runningSubagents.has(id)) {
+        try { options?.nativeNotStarted?.(id); }
+        catch (failure) { console.error(`Native prior closure restore unconfirmed: ${failure instanceof Error ? failure.message : String(failure)}`); }
+      }
+      throw error;
+    }
   }
+  const launchIntent = resolveVisibleLaunchIntent(params, agentDefs, ctx.cwd);
   if (coreSelected && options?.surface) throw new Error("Core launches cannot reuse a classic surface");
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
   const coreLaunch = coreSelected ? await prepareCoreLaunch(params.name, effectiveInteractive) : undefined;
@@ -1675,7 +1803,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const harness = agentDefs?.cli === "claude" ? "Claude" : "Pi";
+  const harness = "Pi";
   let surface = coreLaunch ? "" : options?.surface ?? (await createTaskSurface(params.name, harness));
   let coreHost: CoreHostRef | undefined;
   if (surfacePreCreated) await setTaskLabel(surface, harness, params.name);
@@ -1721,83 +1849,6 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
-    const resultFile = join(artifactDir, "subagent-completion", `${id}.claude-result.json`);
-    const processIdFile = join(artifactDir, "subagent-completion", `${id}.claude.pid`);
-    const wrapperExitFile = buildVisibleCompletionPaths(artifactDir, id).wrapperExit;
-    mkdirSync(dirname(resultFile), { recursive: true });
-    const claudeCommand = buildClaudeCommand({
-      resultFile,
-      processIdFile,
-      runId: id,
-      model: effectiveModel,
-      systemPrompt: claudeSystemPrompt,
-      resumeSessionId: params.resumeSessionId,
-      task: params.task,
-      cwd: targetCwdForSession,
-      nodeExecutable: coreLaunch?.runtime.node,
-    });
-    const wrapperStartFile = join(artifactDir, "subagent-completion", `${id}.wrapper-start.json`);
-    const command = buildVisibleWrapperCommand({
-      piCommand: claudeCommand, runId: id, wrapperExitFile,
-      ...(coreLaunch ? { wrapperStartFile, nodeExecutable: coreLaunch.runtime.node } : {}),
-    });
-
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-    if (coreLaunch) {
-      coreHost = await launchOwnedCoreRun(coreLaunch, {
-        runId: id, scriptPath: launchScriptFile, wrapperStartFile, command,
-        cwd: targetCwdForSession, agentDir: effectiveAgentDir,
-      }, {
-        name: params.name, task: params.task, agent: params.agent, sessionFile: subagentSessionFile, artifactDir, startTime,
-        canSpawnDirectChildren: false,
-      });
-      surface = coreHost.address;
-    } else await sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      runId: id,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      startTime,
-      sessionFile: subagentSessionFile,
-      transcriptStartLine,
-      launchScriptFile,
-      cli: "claude",
-      coreHost,
-      artifactDir,
-      claudeResultFile: resultFile,
-      claudeProcessIdFile: processIdFile,
-      wrapperExitFile,
-      interactive: effectiveInteractive,
-      canSpawnDirectChildren: false,
-      statusState: createStatusState({
-        source: "claude",
-        startTimeMs: startTime,
-      }),
-    };
-
-    return running;
-  }
-
   // ── Pi CLI path ──
 
   // Build pi command
@@ -1946,83 +1997,241 @@ async function launchSubagent(
   return running;
 }
 
+function recordNativeEvidence(running: RunningSubagent, data: Record<string, unknown> & { kind: AgentRunEvidence["kind"] }) {
+  running.nativeState = reduceAgentRunEvidence(running.nativeState!, {
+    ...data, runId: running.runId, sourceId: "core-native-job", sequence: running.nativeSequence = (running.nativeSequence ?? 0) + 1,
+    observedAt: new Date().toISOString(),
+  } as AgentRunEvidence);
+}
+
+function recordNativeExit(running: RunningSubagent, terminal: Awaited<ReturnType<typeof getCoreTerminal>>) {
+  if (running.nativeHostTerminal?.state !== "finished" || terminal.state === "finished") running.nativeHostTerminal = terminal;
+}
+
+function recordNativeClosure(running: RunningSubagent, terminal: Awaited<ReturnType<typeof getCoreTerminal>>) {
+  recordNativeEvidence(running, { kind: "process-exited", exit: { kind: "native", code: terminal.exit_code, signal: terminal.signal === null ? null : `SIG${terminal.signal}` } });
+  if (terminal.reason !== "exited" && running.nativeState!.control.status === "none") {
+    recordNativeEvidence(running, { kind: "transport-failed", message: `Core finished with unconfirmed exit reason: ${terminal.reason ?? "null"}` });
+  }
+}
+
+function nativeStopDeadline(running: RunningSubagent): number {
+  if (!running.nativeStopDeadline || running.nativeStopDeadline <= Date.now()) {
+    running.nativeStopDeadline = Date.now() + (running.nativeStopTimeoutMs ?? 10_000);
+  }
+  return running.nativeStopDeadline;
+}
+
+async function withinNativeStopBudget<T>(operation: Promise<T>, deadline: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([operation, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Native stop observation budget expired; closure is unconfirmed")), Math.max(0, deadline - Date.now()));
+    })]);
+  } finally { clearTimeout(timer!); }
+}
+
+function requestNativeStop(running: RunningSubagent, cause: "abort" | "terminate"): Promise<void> {
+  if (running.nativeState?.process.status === "exited" || running.nativeKillAmbiguous) return Promise.resolve();
+  const deadline = nativeStopDeadline(running);
+  if (!running.nativeControlPromise) {
+    const control = () => recordNativeEvidence(running, cause === "abort" ? { kind: "interrupt-requested", mode: "process-abort" } : { kind: "terminate-requested", mode: "core-terminal-kill" });
+    running.nativeControlPromise = (async () => {
+      try {
+        const current = await getCoreTerminal(running.coreHost!);
+        if (current.state === "finished") { recordNativeExit(running, current); return; }
+        if (running.coreKillAccepted) return;
+        const killed = await killCoreTerminal(running.coreHost!, { skipFinished: true, beforeSend() {
+          if (Date.now() >= deadline) throw new CoreRpcError("terminal.kill", "not_sent", "stop deadline expired before kill submission");
+        } });
+        // A natural exit observed by the kill precheck is not a new control cause.
+        if (killed.reason !== "exited") {
+          control();
+          running.coreKillAccepted = true;
+          running.terminationRequestState = "accepted";
+        }
+        recordNativeExit(running, killed);
+      } catch (error) {
+        const ambiguousSentKill = error instanceof CoreRpcError && error.method === "terminal.kill" && error.requestSent
+          && !["busy", "rpc_error", "invalid_params", "not_found", "unsupported"].includes(error.kind);
+        if (ambiguousSentKill) { running.nativeKillAmbiguous = true; control(); }
+        else {
+          running.nativeControlPromise = undefined;
+          if (!running.nativeObserverDetached) running.nativeStopDeadline = undefined;
+        }
+        throw error;
+      }
+    })();
+  }
+  return running.nativeControlPromise;
+}
+
+function ensureNativeObservation(running: RunningSubagent): Promise<void> {
+  if (!running.nativeObservation) {
+    running.nativeObservation = (async () => {
+      let captureFailures = 0;
+      let observations = 0;
+      if (running.nativeState!.process.status !== "exited") recordNativeEvidence(running, { kind: "host-started", hostRef: running.coreHost!.address });
+      for (;;) {
+        if ((running.nativeObserverDetached && observations > 0) || (running.nativeStopDeadline !== undefined && Date.now() >= running.nativeStopDeadline)) {
+          running.nativeDiagnostic = recordCoreCleanupFailure(running, new Error("Native stop/observer teardown ended with unconfirmed entry/Core closure"));
+          return;
+        }
+        observations++;
+        try {
+          const detachedAtStart = running.nativeObserverDetached === true;
+          const terminal = running.nativeHostTerminal?.state === "finished" ? running.nativeHostTerminal : await getCoreTerminal(running.coreHost!, { beforeRead() {
+            if ((!detachedAtStart && running.nativeObserverDetached) || (running.nativeStopDeadline !== undefined && Date.now() >= running.nativeStopDeadline)) {
+              throw new CoreRpcError("terminal.get", "observer_stopped", "old native observer stopped before its next read");
+            }
+          } });
+          recordNativeExit(running, terminal);
+          if (terminal.state === "finished") {
+            try {
+              running.nativeCapture = (running.nativeCaptureRead ?? readNativeCapture)(running.nativeCapturePaths!, running.runId);
+              if (terminal.reason === "exited" && terminal.signal === null && terminal.exit_code !== running.nativeCapture.nativeExit) {
+                throw new Error("Core exit and native capture status disagree");
+              }
+              running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+              if (running.nativeState!.control.status !== "none" && running.nativeEntryProof.state !== "absent") {
+                running.nativeDiagnostic = recordCoreCleanupFailure(running, new Error(`Core wrapper finished but native entry ${running.nativeEntryProof.pid ?? "unknown"} remains ${running.nativeEntryProof.state}; closure unconfirmed`));
+                return;
+              }
+              recordNativeClosure(running, terminal);
+              recordNativeEvidence(running, { kind: "job-output-captured", output: running.nativeCapture.output });
+              return;
+            } catch (error) {
+              running.nativeCapture = undefined;
+              const transientRead = ["EIO", "EBUSY", "EAGAIN", "EINTR"].includes((error as NodeJS.ErrnoException).code ?? "");
+              const missingStoppedStatus = running.coreKillAccepted && running.nativeState!.control.status !== "none"
+                && (error as NodeJS.ErrnoException).code === "ENOENT"
+                && (error as NodeJS.ErrnoException).path === running.nativeCapturePaths!.status;
+              if (missingStoppedStatus || (!transientRead && ++captureFailures >= 3)) {
+                running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+                const probeDeadline = running.nativeStopDeadline ?? Date.now();
+                // Reaping can lag the Core reply: at most two 25ms re-probes of a known alive entry.
+                for (let retry = 0; missingStoppedStatus && running.nativeEntryProof.state === "alive" && retry < 2; retry++) {
+                  const remaining = probeDeadline - Date.now();
+                  if (remaining <= 0) break;
+                  await new Promise(resolve => setTimeout(resolve, Math.min(25, remaining)));
+                  if (Date.now() >= probeDeadline) break;
+                  running.nativeEntryProof = probeNativeEntry(running.nativeCapturePaths!, running.runId, running.nativeProcessProbe);
+                }
+                try { running.nativePartialCapture = readNativePartialCapture(running.nativeCapturePaths!); } catch {}
+                if (running.nativeEntryProof.state === "absent") recordNativeClosure(running, terminal);
+                const message = `Capture status unconfirmed; native entry ${running.nativeEntryProof.pid ?? "unknown"} is ${running.nativeEntryProof.state}. Raw files retained: ${error instanceof Error ? error.message : String(error)}`;
+                running.nativeDiagnostic = recordCoreCleanupFailure(running, new Error(message));
+                recordNativeEvidence(running, { kind: "transport-failed", message });
+                if (running.nativePartialCapture) recordNativeEvidence(running, { kind: "job-output-captured", output: running.nativePartialCapture.output });
+                return;
+              }
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof CoreRpcError && ["owner_mismatch", "not_found", "unsupported"].includes(error.kind)) {
+            running.nativeDiagnostic = message;
+            recordNativeEvidence(running, { kind: "transport-failed", message });
+            return;
+          }
+          if (error instanceof CoreRpcError && error.kind === "timeout") recordNativeEvidence(running, { kind: "request-timeout", operation: error.method, timeoutMs: 5000 });
+          // Busy, transport and malformed replies are observation loss, not process exit.
+        }
+        if (!running.nativeObserverDetached) {
+          const remaining = running.nativeStopDeadline === undefined ? Infinity : Math.max(0, running.nativeStopDeadline - Date.now());
+          await new Promise(resolve => setTimeout(resolve, Math.min(running.nativePollInterval ?? 1000, remaining)));
+        }
+      }
+    })().finally(() => {
+      if (running.nativeState!.process.status !== "exited") running.nativeObservation = undefined;
+    });
+  }
+  return running.nativeObservation;
+}
+
+async function watchNativeSubagent(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult> {
+  const combined = AbortSignal.any([signal, getModuleAbortSignal()]);
+  const stop = () => {
+    if (getModuleAbortSignal().aborted) running.nativeObserverDetached = true;
+    void requestNativeStop(running, "abort").catch(error => { running.nativeDiagnostic = recordCoreCleanupFailure(running, error); });
+  };
+  if (combined.aborted) stop(); else combined.addEventListener("abort", stop, { once: true });
+  try {
+    await ensureNativeObservation(running);
+    if (running.nativeObserverDetached && running.nativeControlPromise && running.nativeState!.process.status !== "exited") {
+      try {
+        const deadline = running.nativeStopDeadline!;
+        await withinNativeStopBudget(running.nativeControlPromise, deadline);
+        await withinNativeStopBudget(ensureNativeObservation(running), deadline);
+      } catch (error) { running.nativeDiagnostic = recordCoreCleanupFailure(running, error); }
+    }
+  } finally { combined.removeEventListener("abort", stop); }
+  const projection = projectAgentRunStatus(running.nativeState!);
+  const captured = running.nativeCapture ?? running.nativePartialCapture;
+  const output = captured?.output ?? "";
+  const completion = projectAgentRunCompletion(running.nativeState!, { output });
+  if (projection.terminal && projection.disposition !== "pending" && (running.nativeCapture || (running.nativeEntryProof?.state === "absent" && running.nativeState!.control.status !== "none"))) {
+    try { await closeOwnedSubagent(running); releaseRunningSubagent(running.id); }
+    catch (error) { running.nativeDiagnostic = recordCoreCleanupFailure(running, error); }
+  }
+  return {
+    name: running.name, task: running.task, runner: running.nativeJob!.nativeReference.runner, nativeReference: running.nativeJob!.nativeReference,
+    hostEvidence: { ...running.coreHost!, terminal: running.nativeHostTerminal, nativeEntry: running.nativeEntryProof }, projection, completion,
+    outputCapture: captured?.capture, outputFile: running.nativeCapturePaths!.stdout,
+    summary: output || (projection.terminal ? `Native job ${projection.disposition}` : "Native observation unconfirmed; the owned run remains registered. Do not retry its launch."),
+    exitCode: completion?.execution === "normal-exit" ? 0 : 1, elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+    errorMessage: running.nativeDiagnostic || completion?.errorMessage,
+    nativeDiagnostics: [running.nativeDiagnostic, captured?.diagnostic ? `Native stderr: ${captured.diagnostic}` : undefined, completion?.errorMessage].filter(Boolean).join("\n") || undefined,
+    ...(completion?.execution === "terminated" ? { error: "terminated" } : completion?.execution === "aborted" ? { error: "cancelled" } : {}),
+  };
+}
+
 /** Watch a launched subagent until its foreground child has exited. */
 
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
   dependencies: {
-    pollForExit?: typeof pollForExit;
     closeSurface?: typeof closeSurface;
     readScreen?: typeof readScreen;
     visibleInterval?: number;
     processProbe?: (pid: number, signal: 0) => void;
+    nativeCaptureRead?: typeof readNativeCapture;
   } = {},
 ): Promise<SubagentResult> {
+  if (running.nativeJob) {
+    running.nativeCaptureRead = dependencies.nativeCaptureRead;
+    running.nativeProcessProbe = dependencies.processProbe;
+    running.nativePollInterval = dependencies.visibleInterval ?? 1000;
+    return watchNativeSubagent(running, signal);
+  }
   const { name, task, surface, startTime, sessionFile } = running;
   const moduleSignal = getModuleAbortSignal();
-  const waitForExit = dependencies.pollForExit ?? pollForExit;
   const close = dependencies.closeSurface ?? closeSurface;
   const read = dependencies.readScreen ?? readScreen;
   let terminalObserved = false;
 
   try {
     const combinedSignal = AbortSignal.any([signal, moduleSignal]);
-    const result = running.cli === "claude"
-      ? await waitForExit(surface, combinedSignal, {
-          interval: dependencies.visibleInterval ?? 1000,
-          wrapperExitFile: running.wrapperExitFile!,
-          runId: running.runId,
-          onTick() { observeRunningSubagent(running); },
-        })
-      : await waitForVisibleCompletion({
-          state: running.completionState!,
-          childSnapshotFile: running.childSnapshotFile!,
-          wrapperExitFile: running.wrapperExitFile!,
-          sessionFile,
-          transcriptStartLine: running.transcriptStartLine,
-          sessionRef: running.piSessionRef,
-          signal: combinedSignal,
-          interval: dependencies.visibleInterval ?? 1000,
-          onTick() { observeRunningSubagent(running); },
-          processProbe: dependencies.processProbe,
-          coreHost: running.coreHost,
-        });
+    const observed = await waitForVisibleCompletion({
+      state: running.completionState!,
+      childSnapshotFile: running.childSnapshotFile!,
+      wrapperExitFile: running.wrapperExitFile!,
+      sessionFile,
+      transcriptStartLine: running.transcriptStartLine,
+      sessionRef: running.piSessionRef,
+      signal: combinedSignal,
+      interval: dependencies.visibleInterval ?? 1000,
+      onTick() { observeRunningSubagent(running); },
+      processProbe: dependencies.processProbe,
+      coreHost: running.coreHost,
+    });
 
     terminalObserved = true;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    if (running.cli === "claude") {
-      let summary: string;
-      let claudeSessionId: string | undefined;
-      let exitCode = result.exitCode;
-      if (exitCode !== 0) {
-        summary = `Claude Code exited with code ${exitCode}`;
-      } else {
-        try {
-          const output = readClaudePrintResult(running.claudeResultFile!);
-          summary = output.summary;
-          claudeSessionId = output.sessionId;
-        } catch (error) {
-          exitCode = 1;
-          summary = `Claude Code result invalid: ${error instanceof Error ? error.message : String(error)}`;
-        }
-      }
-      if (exitCode !== 0) {
-        const partial = readClaudeFailureResult(running.claudeResultFile!);
-        if (partial) summary += `\n\nPartial Claude output:\n${partial}`;
-      }
-      try { await closeOwnedSubagent(running, close); }
-      catch (error) {
-        const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
-        summary += `\n\nHerdr pane cleanup failed after verified CLI exit: ${reason}`;
-      }
-      return { name, task, summary, exitCode, elapsed, ...(claudeSessionId ? { claudeSessionId } : {}) };
-    }
-
     // Pi completion is delivered only after the shared lifecycle reaches a
     // terminal projection backed by correlated process-exit evidence.
-    const observed = result as Awaited<ReturnType<typeof waitForVisibleCompletion>>;
     const completion = observed.completion;
     const exitCode = completionExitCode(completion);
     const controlError = completion.execution === "terminated" ? "terminated"
@@ -2053,33 +2262,13 @@ async function watchSubagent(
     const watcherAborted = signal.aborted;
     const moduleAborted = moduleSignal.aborted;
     let paneCloseError: string | undefined;
-    // A lost Claude watcher cannot supervise a running CLI; close its pane, then confirm exit separately.
-    if ((running.cli === "claude" || watcherAborted || moduleAborted || err instanceof ClaudeExitTimeoutError) && (running.coreHost || running.terminationRequestState !== "accepted")) {
+    if ((watcherAborted || moduleAborted) && (running.coreHost || running.terminationRequestState !== "accepted")) {
       try {
         await closeOwnedSubagent(running, close);
-        if (running.cli === "claude") {
-          running.terminationRequestState = "accepted";
-          running.terminationRequestedAt = Date.now();
-        }
       } catch (error) {
         paneCloseError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
       }
     }
-    const wrapper = running.cli === "claude" && running.wrapperExitFile
-      ? readWrapperExitRecord(running.wrapperExitFile, running.runId) : undefined;
-    if (running.cli === "claude" && (running.claudeExitConfirmed || wrapper?.ok)) terminalObserved = true;
-    if (running.cli === "claude" && !terminalObserved && running.claudeProcessIdFile) {
-      for (let attempt = 0; attempt < 100; attempt++) {
-        try {
-          terminalObserved = confirmClaudeProcessGone(
-            running.claudeProcessIdFile, running.runId, dependencies.processProbe,
-          );
-        } catch {}
-        if (terminalObserved) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-
     const abortDetails = [
       watcherAborted
         ? `watcher=${String(signal.reason ?? "aborted")}`
@@ -2091,32 +2280,15 @@ async function watchSubagent(
     const errorMessage = err?.message ?? String(err);
     const terminatedByParent =
       watcherAborted && String(signal.reason ?? "") === "terminated_by_parent";
-    if (!terminatedByParent && wrapper?.ok && wrapper.value.exit.shellStatus === 0 && running.claudeResultFile) {
-      try {
-        const output = readClaudePrintResult(running.claudeResultFile);
-        const summary = paneCloseError
-          ? `${output.summary}\n\nHerdr pane cleanup failed after verified CLI exit: ${paneCloseError}`
-          : output.summary;
-        return { name, task, summary, exitCode: 0,
-          elapsed: Math.floor((Date.now() - startTime) / 1000), claudeSessionId: output.sessionId };
-      } catch {}
-    }
-    const partial = running.cli === "claude" && running.claudeResultFile
-      ? readClaudeFailureResult(running.claudeResultFile) : undefined;
     const summaryLines = [
-      err instanceof ClaudeExitTimeoutError
-        ? `Claude review deadline exceeded; process exit ${terminalObserved ? "confirmed" : "unconfirmed"}.`
-        : running.cli === "claude" && !terminalObserved
-          ? `Claude process exit unconfirmed; watcher error: ${errorMessage}`
-          : terminatedByParent
-            ? "Subagent terminated by parent request."
-            : `Subagent watcher error: ${errorMessage}`,
+      terminatedByParent
+        ? "Subagent terminated by parent request."
+        : `Subagent watcher error: ${errorMessage}`,
 
       `Abort state: ${abortDetails}`,
       `Surface: ${surface}`,
       running.launchScriptFile ? `Launch script: ${running.launchScriptFile}` : undefined,
       paneCloseError ? `Herdr pane cleanup failed: ${paneCloseError}` : undefined,
-      partial ? `Partial Claude output:\n${partial}` : undefined,
       terminalOutput ? `Terminal output before cleanup:\n${terminalOutput}` : undefined,
     ].filter((line): line is string => line != null);
 
@@ -2126,14 +2298,12 @@ async function watchSubagent(
       summary: summaryLines.join("\n"),
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: running.cli === "claude" && !terminalObserved ? "exit_unconfirmed"
-        : terminatedByParent ? "terminated" : watcherAborted ? "cancelled" : errorMessage,
-      ...(running.cli === "claude" ? {} : { sessionFile, sessionFileExists: existsSync(sessionFile) }),
+      error: terminatedByParent ? "terminated" : watcherAborted ? "cancelled" : errorMessage,
+      sessionFile, sessionFileExists: existsSync(sessionFile),
       failureContext: {
         surface,
         launchScriptFile: running.launchScriptFile,
         activityFile: running.activityFile,
-        ...(running.cli === "claude" ? { claudeResultFile: running.claudeResultFile } : {}),
         terminalOutput,
         watcherAborted,
         watcherAbortReason: signal.reason == null ? undefined : String(signal.reason),
@@ -2142,19 +2312,42 @@ async function watchSubagent(
       },
     };
   } finally {
-    if (!running.coreCleanupError && (terminalObserved || (running.cli !== "claude" && (signal.aborted || moduleSignal.aborted)))) {
+    if (!running.coreCleanupError && (terminalObserved || signal.aborted || moduleSignal.aborted)) {
       releaseRunningSubagent(running.id);
     }
   }
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  const managedNativeSessions = new Map<string, NativeSessionEntry>();
+  const nativeLifecycle = (record: ManagedNativeSessionRecord, agent: string, runId: string, ctx: ExtensionContext) => {
+    const entry: NativeSessionEntry = { version: 1, record: structuredClone(record), agent, runId, state: 'open' };
+    pi.appendEntry(NATIVE_SESSION_ENTRY, entry);
+    managedNativeSessions.set(record.reference.managedSessionId, entry);
+    return () => {
+      if (managedNativeSessions.get(record.reference.managedSessionId)?.runId !== runId) throw new Error('Native caller record changed during invocation');
+      const closed: NativeSessionEntry = { ...entry, state: 'closed' };
+      // Do not introduce abandoned-launch authority onto a different branch.
+      // A branch without this invocation retains no durable resume authority.
+      if (ctx.sessionManager.getSessionId() !== record.callerSessionId
+        || nativeSessionRecords(ctx).get(record.reference.managedSessionId)?.runId !== runId) throw new Error('Native caller branch changed before closure persistence');
+      pi.appendEntry(NATIVE_SESSION_ENTRY, closed);
+      managedNativeSessions.set(record.reference.managedSessionId, closed);
+    };
+  };
   // Cached extension modules are instantiated again after /new, /resume, and
   // /fork. The old runtime aborts its poll controller during session_shutdown;
   // re-arm it before the replacement runtime starts accepting tool calls.
   pi.on("session_start", (_event, ctx) => {
     ensureModuleAbortController();
     latestCtx = ctx;
+    managedNativeSessions.clear();
+    try {
+      if (typeof ctx.sessionManager.getBranch === 'function') for (const [id, entry] of nativeSessionRecords(ctx)) managedNativeSessions.set(id, entry);
+    } catch (error) {
+      managedNativeSessions.clear();
+      console.error(`Native record restore unavailable; native resume remains fail-closed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     sessionActive = true;
     setDirectChildCountProvider(() => runningSubagents.size + pendingOwnedLaunches);
   });
@@ -2254,7 +2447,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const finishOwnedLaunch = beginOwnedLaunch();
         let running: RunningSubagent;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchSubagent(params, ctx, { skillCatalog: pi.getCommands?.() ?? [], nativeLifecycle: (record, agent, runId) => nativeLifecycle(record, agent, runId, ctx) });
           registerRunningSubagent(pi, running);
         } finally {
           finishOwnedLaunch();
@@ -2346,7 +2539,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.\n\n` +
                 `ID: ${running.id}\nSurface: ${running.surface}` +
-                (running.cli === "claude" ? "\nClaude session ID will be returned on completion." : `\nSession: ${running.sessionFile}`),
+                (running.nativeJob ? `\nRunner: ${running.nativeJob.nativeReference.runner}\nManaged native session: ${running.nativeJob!.nativeReference.managedSessionId}` : `\nSession: ${running.sessionFile}`),
             },
           ],
           details: {
@@ -2355,7 +2548,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: params.task,
             agent: params.agent,
             surface: running.surface,
-            ...(running.cli === "claude" ? {} : { sessionFile: running.sessionFile }),
+            ...(running.nativeJob ? { runner: running.nativeJob.nativeReference.runner, capabilities: running.nativeJob.nativeReference.runner === 'claude' ? claudeJobCapabilities : copilotJobCapabilities, nativeReference: running.nativeJob!.nativeReference, hostEvidence: running.coreHost } : { sessionFile: running.sessionFile }),
             launchScriptFile: running.launchScriptFile,
             status: "started",
           },
@@ -2579,23 +2772,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume Pi by sessionPath, or a closed caller-owned native conversation by managedSessionId (never a snapshot/history path). Native jobs require message and autoExit:true; agent selects a trusted native profile only. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume Pi by sessionPath, or a closed caller-owned native conversation by managedSessionId. Native requires a follow-up message; optional agent selects a trusted native profile, never grants or snapshot paths. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       parameters: Type.Object({
-        sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
+        sessionPath: Type.Optional(Type.String({ description: "Pi-only session .jsonl path; mutually exclusive with managedSessionId" })),
+        managedSessionId: Type.Optional(Type.String({ description: 'Caller-managed native session ID returned by a prior completed invocation' })),
+        agent: Type.Optional(Type.String({ description: 'Native-only trusted same-runner resume profile' })),
         name: Type.Optional(
-          Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+          Type.String({ description: "Pi-only display name for the terminal tab. Default: 'Resume'" }),
         ),
         message: Type.Optional(
           Type.String({
@@ -2608,7 +2803,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
-      }),
+      }, { additionalProperties: false }),
 
       renderCall(args, theme) {
         const name = args.name ?? "Resume";
@@ -2640,6 +2835,63 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        for (const key of Object.keys(params)) if (!['sessionPath', 'managedSessionId', 'agent', 'name', 'message', 'autoExit'].includes(key)) throw new Error(`Unknown resume field '${key}'`);
+        const managedSessionId = normalizeOptionalString(params.managedSessionId);
+        const sessionPath = normalizeOptionalString(params.sessionPath);
+        const agent = normalizeOptionalString(params.agent);
+        const message = normalizeOptionalString(params.message) ? params.message : undefined;
+        if (!!managedSessionId === !!sessionPath) throw new Error('Resume requires exactly one of managedSessionId or Pi sessionPath');
+        if (sessionPath && agent) throw new Error('agent is native-only; Pi file resumes retain their recorded policy');
+        if (managedSessionId) {
+          if (normalizeOptionalString(params.name)) throw new Error('Native resume accepts managedSessionId, agent, message and autoExit only');
+          if (params.autoExit === false) throw new Error('Copilot native resume requires autoExit:true');
+          const captured = nativeSessionRecords(ctx).get(managedSessionId);
+          if (!captured) throw new Error('Unknown caller-owned managed native session');
+          const active = managedNativeSessions.get(managedSessionId);
+          if (captured.state !== 'closed' || active?.state === 'open' || [...runningSubagents.values()].some(run => run.nativeJob?.nativeReference.managedSessionId === managedSessionId)) throw new Error('Managed native session invocation is active or closure/launch remains unconfirmed');
+          if (!message) throw new Error('Copilot headless resume requires a nonblank follow-up message before launch');
+          const callerSignal = getModuleAbortSignal();
+          const reservation: NativeSessionEntry = { ...captured, state: 'open', runId: randomUUID() };
+          managedNativeSessions.set(managedSessionId, reservation);
+          try {
+            const selected = loadAgentDefaults(agent ?? captured.agent, ctx.cwd);
+            if (!selected || !['copilot', 'claude'].includes(selected.definition.runner) || !selected.definitionSha256) throw new Error('Missing trusted native resume definition; select an explicit trusted profile');
+            const skills = agent ? await resolveNativeSkills(selected.definition.skills ?? [], pi.getCommands(), ctx.cwd, getAgentConfigDir()) : undefined;
+            if (!agent) await assertNoNativeSkillShadows(captured.record.skills.map(skill => skill.name), ctx.cwd, getAgentConfigDir());
+            const resumed = resolveManagedNativeResume({ managedSessionId, ...(agent ? { agent } : {}), message, autoExit: true }, ctx.sessionManager.getSessionId(), [captured.record], {
+              definition: selected.definition, sha256: selected.definitionSha256, runtime: { home: process.env.HOME || homedir(), node: process.execPath }, skills,
+            });
+            const finishOwnedLaunch = beginOwnedLaunch();
+            let running: RunningSubagent;
+            try {
+              running = await launchSubagent({ name: 'Resume', task: message, agent: selected.definition.name }, ctx, {
+                nativeDefinition: selected, nativeResume: resumed,
+                nativeLifecycle: (record, agent, runId) => nativeLifecycle(record, agent, runId, ctx),
+                nativeNotStarted: runId => {
+                  if (callerSignal.aborted) throw new Error('Native caller runtime invalidated before prior closure restore');
+                  if (ctx.sessionManager.getSessionId() !== captured.record.callerSessionId
+                    || nativeSessionRecords(ctx).get(managedSessionId)?.runId !== runId) throw new Error('Native caller branch changed before prior closure restore');
+                  pi.appendEntry(NATIVE_SESSION_ENTRY, captured);
+                  managedNativeSessions.set(managedSessionId, captured);
+                },
+              });
+              registerRunningSubagent(pi, running);
+            } finally { finishOwnedLaunch(); }
+            const watcher = new AbortController(); running.abortController = watcher;
+            watchSubagent(running, watcher.signal).then(result => sendIfActive(pi, {
+              customType: 'subagent_result', content: resolveResultPresentation(result, running.name), display: true,
+              details: projectResultDetails(result, { name: running.name, task: running.task, agent: running.agent }),
+            }, { triggerTurn: true, deliverAs: 'steer' })).catch(error => {
+              console.error(`Native resume observation failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
+            return { content: [{ type: 'text', text: `Native follow-up launched. Managed native session: ${managedSessionId}. Results will be delivered automatically; do not poll.` }],
+              details: { id: running.id, status: 'started', runner: running.nativeJob!.nativeReference.runner, capabilities: running.nativeJob!.nativeReference.runner === 'claude' ? claudeJobCapabilities : copilotJobCapabilities, nativeReference: running.nativeJob!.nativeReference, hostEvidence: running.coreHost } };
+          } finally {
+            if (managedNativeSessions.get(managedSessionId) === reservation) managedNativeSessions.set(managedSessionId, captured);
+          }
+        }
+        if (!sessionPath) throw new Error('Pi resume requires a sessionPath');
+        params = { ...params, message };
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -2649,10 +2901,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return muxUnavailableResult();
         }
 
-        if (!existsSync(params.sessionPath)) {
+        if (!existsSync(sessionPath)) {
           return {
             content: [
-              { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
+              { type: "text", text: `Error: session file not found: ${sessionPath}` },
             ],
             details: { error: "session not found" },
           };
@@ -2660,7 +2912,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         let resumePolicy: ResumePolicy;
         try {
-          resumePolicy = readResumePolicy(params.sessionPath);
+          resumePolicy = readResumePolicy(sessionPath);
         } catch (error) {
           return {
             content: [{
@@ -2684,7 +2936,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Record the raw nonempty-line offset before resuming so extraction only
         // sees transcript entries appended by this run.
-        const transcriptStartLine = countNonemptyLines(params.sessionPath);
+        const transcriptStartLine = countNonemptyLines(sessionPath);
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -2693,7 +2945,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build pi resume command from the immutable authority captured by the
         // original child process. Display name and auto-exit are run-local only.
-        const parts = [...(coreLaunch ? [shellEscape(coreLaunch.runtime.node), shellEscape(coreLaunch.runtime.script)] : ["pi"]), "--session", shellEscape(params.sessionPath)];
+        const parts = [...(coreLaunch ? [shellEscape(coreLaunch.runtime.node), shellEscape(coreLaunch.runtime.script)] : ["pi"]), "--session", shellEscape(sessionPath)];
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
         parts.push("--tools", shellEscape(resumePolicy.activeTools.join(",")));
@@ -2730,7 +2982,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumeEnvParts: string[] = [
           `PI_CODING_AGENT_DIR=${shellEscape(resumePolicy.agentDir)}`,
           `PI_SUBAGENT_NAME=${shellEscape(name)}`,
-          `PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`,
+          `PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`,
           `PI_SUBAGENT_ID=${shellEscape(id)}`,
           `PI_SUBAGENT_COMPLETION_FILE=${shellEscape(completionPaths.childSnapshot)}`,
           `PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`,
@@ -2774,7 +3026,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               cwd: resumePolicy.cwd, agentDir: resumePolicy.agentDir,
             }, {
               name, task: params.message ?? "resumed session", agent: resumePolicy.agent ?? undefined,
-              sessionFile: params.sessionPath, artifactDir, startTime, canSpawnDirectChildren: resumePolicyCanSpawn(resumePolicy),
+              sessionFile: sessionPath, artifactDir, startTime, canSpawnDirectChildren: resumePolicyCanSpawn(resumePolicy),
             });
             surface = coreHost.address;
           } else await sendLongCommand(surface, command, {
@@ -2782,7 +3034,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             scriptPreamble: [
               `# Subagent resume script for ${name}`,
               `# Generated: ${new Date().toISOString()}`,
-              `# Session: ${params.sessionPath}`,
+              `# Session: ${sessionPath}`,
               `# Surface: ${surface}`,
               `# Agent: ${resumePolicy.agent ?? "unnamed"}`,
               `# Working directory: ${resumePolicy.cwd}`,
@@ -2804,8 +3056,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           agent: resumePolicy.agent ?? undefined,
           surface,
           startTime,
-          sessionFile: params.sessionPath,
-          piSessionRef: params.sessionPath,
+          sessionFile: sessionPath,
+          piSessionRef: sessionPath,
           coreHost,
           artifactDir,
           transcriptStartLine,
@@ -2846,7 +3098,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             updateWidget();
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              const sessionRef = `\n\nSession: ${sessionPath}\nResume: pi --session ${sessionPath}`;
               sendIfActive(pi,
                 {
                   customType: "subagent_ping",
@@ -2855,7 +3107,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   details: {
                     name: result.ping.name,
                     message: result.ping.message,
-                    sessionFile: params.sessionPath,
+                    sessionFile: sessionPath,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -2873,7 +3125,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: projectResultDetails(result, {
                   name,
                   task: params.message ?? "resumed session",
-                  sessionFile: params.sessionPath,
+                  sessionFile: sessionPath,
                 }),
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2897,7 +3149,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: {
             id,
             name,
-            sessionPath: params.sessionPath,
+            sessionPath,
             agent: resumePolicy.agent ?? undefined,
             launchScriptFile,
             status: "started",

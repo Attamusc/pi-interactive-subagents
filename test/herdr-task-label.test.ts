@@ -38,12 +38,12 @@ it("publishes a guarded harness-plus-task label through Herdr's presentation-onl
     process.env.HERDR_SOCKET_PATH = join(dir, "api.sock");
     server.listen(process.env.HERDR_SOCKET_PATH);
     await once(server, "listening");
-    await (mux as any).setTaskLabel("w1:pTEST", "Claude", "UX check");
+    await (mux as any).setTaskLabel("w1:pTEST", "Pi", "UX check");
     assert.deepEqual(requests.map(({ method, params }) => ({ method, params })), [{
       method: "pane.report_metadata",
       params: {
-        pane_id: "w1:pTEST", source: "pi:subagent-task", agent: "claude",
-        title: "UX check", display_agent: "Claude | UX check",
+        pane_id: "w1:pTEST", source: "pi:subagent-task", agent: "pi",
+        title: "UX check", display_agent: "Pi | UX check",
       },
     }]);
     await (mux as any).setTaskLabel("w1:pTEST", "Pi", "Plan\n\u001b]52;c;SECRET\u0007\u202e task");
@@ -51,10 +51,10 @@ it("publishes a guarded harness-plus-task label through Herdr's presentation-onl
       pane_id: "w1:pTEST", source: "pi:subagent-task", agent: "pi",
       title: "Plan task", display_agent: "Pi | Plan task",
     });
-    await (mux as any).setTaskLabel("w1:pTEST", "Claude", "☃".repeat(100));
+    await (mux as any).setTaskLabel("w1:pTEST", "Pi", "☃".repeat(100));
     assert.equal(Array.from(requests[2].params.title).length, 80);
     assert.equal(Array.from(requests[2].params.display_agent).length, 80);
-    assert.ok(requests[2].params.display_agent.startsWith("Claude | ☃"));
+    assert.ok(requests[2].params.display_agent.startsWith("Pi | ☃"));
     await assert.rejects((mux as any).setTaskLabel("w1:pTEST", "Pi", "\u001b[31m\u0000"), /empty after sanitization/);
     assert.equal(requests.length, 3);
     rejectMetadata = true;
@@ -68,7 +68,7 @@ it("publishes a guarded harness-plus-task label through Herdr's presentation-onl
     ]);
     assert.equal(requests.at(-1).params.pane_id, "w1:pCHILD");
     rejectClose = true;
-    await assert.rejects(mux.createTaskSurface("Review", "Claude"), /pane w1:pCHILD could not be closed/);
+    await assert.rejects(mux.createTaskSurface("Review", "Pi"), /pane w1:pCHILD could not be closed/);
     rejectClose = false;
     rejectMetadata = false;
     assert.equal(await mux.createTaskSurface("Resume", "Pi"), "w1:pCHILD");

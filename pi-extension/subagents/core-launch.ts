@@ -27,10 +27,11 @@ export function resolveParentPiRuntime() {
 }
 
 interface Placement { space: string; tab: string; pane: string }
-export interface PreparedCoreLaunch {
-  context: CoreContext; runtime: ReturnType<typeof resolveParentPiRuntime>; env: NodeJS.ProcessEnv;
+export interface PreparedCoreJobLaunch {
+  context: CoreContext; runtime?: ReturnType<typeof resolveParentPiRuntime>; env: NodeJS.ProcessEnv;
   placement?: Placement; title: string;
 }
+export interface PreparedCoreLaunch extends PreparedCoreJobLaunch { runtime: ReturnType<typeof resolveParentPiRuntime> }
 
 function layoutPlacements(document: unknown, address: string): Placement[] {
   const object = (value: any): value is Record<string, any> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -76,14 +77,18 @@ function layoutPlacements(document: unknown, address: string): Placement[] {
 }
 
 export async function prepareCoreLaunch(name: string, interactive: boolean): Promise<PreparedCoreLaunch> {
+  const runtime = resolveParentPiRuntime();
+  return { ...await prepareCoreJobLaunch(name, interactive), runtime };
+}
+
+export async function prepareCoreJobLaunch(name: string, interactive = false): Promise<PreparedCoreJobLaunch> {
   const title = Array.from(stripVTControlCharacters(name)
     .replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
     .replace(/\s+/g, " ").trim()).slice(0, 80).join("");
   if (!title) throw new Error("Core task title is empty after sanitization");
-  const runtime = resolveParentPiRuntime();
   const context = await resolveCoreContext();
   const env = { ...process.env };
-  if (!interactive) return { context, runtime, title, env };
+  if (!interactive) return { context, title, env };
   const matches = layoutPlacements(await getCoreLayoutDocument(context), context.parent);
   if (matches.length !== 1) throw new Error("Core parent placement is missing or ambiguous in the layout document");
   const placement = matches[0];
@@ -91,10 +96,10 @@ export async function prepareCoreLaunch(name: string, interactive: boolean): Pro
     const hint = context.parentTerminal.labels[label];
     if (hint !== undefined && hint !== expected) throw new Error(`Core parent ${label} label does not match its layout placement`);
   }
-  return { context, runtime, title, env, placement };
+  return { context, title, env, placement };
 }
 
-async function adoptCoreRun(prepared: PreparedCoreLaunch, host: CoreHostRef): Promise<void> {
+async function adoptCoreRun(prepared: PreparedCoreJobLaunch, host: CoreHostRef): Promise<void> {
   if (!prepared.placement) return;
   const { space, tab, pane } = prepared.placement;
   const deadline = Date.now() + 10_000;
@@ -128,8 +133,9 @@ export class CoreSetupCleanupFailure extends Error {
   }
 }
 
-export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: {
+export async function launchPreparedCoreRun(prepared: PreparedCoreJobLaunch, spec: {
   runId: string; scriptPath: string; wrapperStartFile: string; command: string; cwd: string; agentDir: string;
+  env?: Record<string, string>;
 }): Promise<CoreHostRef> {
   mkdirSync(dirname(spec.scriptPath), { recursive: true });
   writeFileSync(spec.scriptPath, `#!/bin/bash\n${spec.command}\n`, { mode: 0o600, flag: "wx" });
@@ -139,10 +145,10 @@ export async function launchPreparedCoreRun(prepared: PreparedCoreLaunch, spec: 
   const host = await startCoreRun(prepared.context, {
     name, runId: spec.runId, scriptPath: spec.scriptPath,
     wrapperStartFile: spec.wrapperStartFile, cwd: spec.cwd,
-    env: { PATH: prepared.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir },
+    env: { PATH: prepared.env.PATH ?? "", PI_CODING_AGENT_DIR: spec.agentDir, ...spec.env },
     labels: prepared.placement ? { "herdr.space": prepared.placement.space, "herdr.tab": prepared.placement.tab } : {},
   });
-  host.runtime = { ...prepared.runtime };
+  if (prepared.runtime) host.runtime = { ...prepared.runtime };
   try { await adoptCoreRun(prepared, host); }
   catch (error) {
     let killAccepted = false;
